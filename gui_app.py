@@ -3,17 +3,19 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import os
 import sys
+import zipfile
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyvista as pv
 import trimesh
-from PyQt5.QtCore import QEvent, Qt
-from PyQt5.QtGui import QKeySequence
+from PyQt5.QtCore import QEvent, QRect, QSize, Qt
+from PyQt5.QtGui import QKeySequence, QPainter
 from PyQt5.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -21,6 +23,7 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -29,6 +32,7 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -39,12 +43,15 @@ from PyQt5.QtWidgets import (
     QStackedWidget,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 from pyvistaqt import QtInteractor
+from vtkmodules.vtkCommonCore import vtkIdList, vtkPoints
+from vtkmodules.vtkFiltersCore import vtkImplicitPolyDataDistance
 from vtkmodules.vtkCommonTransforms import vtkTransform
 
 try:
@@ -59,6 +66,7 @@ except ImportError:
 
 from placement_fit import (
     Measurement,
+    Transform,
     fit_from_measurements,
     infer_stage_point_from_readout,
     pretty_vector,
@@ -92,7 +100,52 @@ PREDICTION_TABLE_HEADERS = [
     "Stage Z",
     "Path 1",
     "Path 2",
+    "UAmp1",
+    "UAmp2",
 ]
+
+STRESS_TABLE_HEADERS = [
+    "Run",
+    "Point ID",
+    "Lattice parameter 1",
+    "uncert 1",
+    "D0 1",
+    "D0 uncert 1",
+    "Lattice parameter 2",
+    "uncert 2",
+    "D0 2",
+    "D0 uncert 2",
+    "Lattice parameter 3",
+    "uncert 3",
+    "D0 3",
+    "D0 uncert 3",
+    "Strain 1",
+    "Strain 1 uncert",
+    "Strain 2",
+    "Strain 2 uncert",
+    "Strain 3",
+    "Strain 3 uncert",
+    "Stress 1",
+    "Stress 1 uncert",
+    "Stress 2",
+    "Stress 2 uncert",
+    "Stress 3",
+    "Stress 3 uncert",
+]
+
+PROJECT_ARCHIVE_VERSION = 1
+PROJECT_MANIFEST_NAME = "project.json"
+PROJECT_EMBEDDED_MESH_NAME = "mesh.stl"
+PROJECT_FILE_FILTER = "SimSetup project (*.simsetup);;All files (*.*)"
+MICROSTRAIN_SCALE = 1_000_000.0
+
+RIETVELD_COUNT_TIME_LAWS = {
+    "Al": np.array([0.8, 0.9, 1.1, 1.2], dtype=float),
+    "Fe, FCC": np.array([0.1, 0.8, 7.4, 22.5], dtype=float),
+    "Fe, BCC": np.array([0.1, 0.8, 6.8, 20.4], dtype=float),
+    "Ni": np.array([0.2, 3.9, 216.2, 1602.9], dtype=float),
+}
+COUNT_TIME_REFERENCE_PATHS_MM = np.array([4.0, 20.0, 40.0, 50.0], dtype=float)
 
 DIRECT_DETECTOR_CENTER_WORLD = np.array([700.0, 0.0, 0.0], dtype=float)
 DIFFRACTION_BANK_1_CENTER_WORLD = np.array([0.0, 1000.0, 0.0], dtype=float)
@@ -105,6 +158,21 @@ DETECTOR_THICKNESS = 10.0
 
 def format_decimal(value: float) -> str:
     return f"{value:.3f}"
+
+
+def format_trimmed_decimal(value: float, decimals: int = 6) -> str:
+    if decimals <= 0:
+        return str(int(round(float(value))))
+    text = f"{float(value):.{decimals}f}".rstrip("0").rstrip(".")
+    if text in {"", "-0"}:
+        return "0"
+    return text
+
+
+def format_fixed_decimal(value: float, decimals: int = 6) -> str:
+    if decimals <= 0:
+        return str(int(round(float(value))))
+    return f"{float(value):.{decimals}f}"
 
 
 def make_spin_box(value: float, minimum: float, maximum: float, step: float = 1.0) -> QDoubleSpinBox:
@@ -318,6 +386,59 @@ def compute_line_beam_path(
     return total_length, segments
 
 
+def build_line_path_length_evaluator(
+    mesh: pv.PolyData,
+    direction: np.ndarray,
+    max_distance: float,
+    tolerance: float = 1e-6,
+) -> Callable[[np.ndarray], float]:
+    unit_direction = normalized(np.asarray(direction, dtype=float))
+    if np.linalg.norm(unit_direction) < 1e-12:
+        return lambda origin: 0.0
+
+    obb_tree = mesh.obbTree
+    points = vtkPoints()
+    cell_ids = vtkIdList()
+    trace_distance = float(max_distance)
+
+    def evaluator(origin: np.ndarray) -> float:
+        origin = np.asarray(origin, dtype=float)
+        end = origin + unit_direction * trace_distance
+        points.Reset()
+        cell_ids.Reset()
+        obb_tree.IntersectWithLine(origin.tolist(), end.tolist(), points, cell_ids)
+        point_count = points.GetNumberOfPoints()
+        if point_count < 2:
+            return 0.0
+
+        distances: List[float] = []
+        for point_index in range(point_count):
+            point = np.asarray(points.GetPoint(point_index), dtype=float)
+            distance = float(np.dot(point - origin, unit_direction))
+            if 0.0 <= distance <= trace_distance:
+                distances.append(distance)
+        if len(distances) < 2:
+            return 0.0
+
+        distances.sort()
+        merged_distances: List[float] = []
+        for distance in distances:
+            if not merged_distances or abs(distance - merged_distances[-1]) > tolerance:
+                merged_distances.append(distance)
+        if len(merged_distances) < 2:
+            return 0.0
+
+        total_length = 0.0
+        for idx in range(0, len(merged_distances) - 1, 2):
+            entry_distance = merged_distances[idx]
+            exit_distance = merged_distances[idx + 1]
+            if exit_distance > entry_distance + tolerance:
+                total_length += exit_distance - entry_distance
+        return total_length
+
+    return evaluator
+
+
 def compute_collimated_beam_map(
     mesh: pv.PolyData,
     slit_center: np.ndarray,
@@ -333,11 +454,11 @@ def compute_collimated_beam_map(
     z_coords = np.linspace(slit_center[2] - slit_height / 2.0, slit_center[2] + slit_height / 2.0, resolution_z)
     path_map = np.zeros((resolution_y, resolution_z), dtype=float)
     beam_direction = np.array([1.0, 0.0, 0.0], dtype=float)
+    line_path_length = build_line_path_length_evaluator(mesh, beam_direction, max_distance)
     for y_index, y_value in enumerate(y_coords):
         for z_index, z_value in enumerate(z_coords):
             origin = np.array([slit_center[0], y_value, z_value], dtype=float)
-            path_length, _segments = compute_line_beam_path(mesh, origin, beam_direction, max_distance)
-            path_map[y_index, z_index] = path_length
+            path_map[y_index, z_index] = line_path_length(origin)
     return y_coords, z_coords, path_map
 
 
@@ -362,9 +483,124 @@ def compute_incoming_beam_average_map(
     return y_coords, z_coords, path_map
 
 
-def point_inside_closed_mesh(mesh: pv.PolyData, point: np.ndarray, tolerance: float = 1e-6) -> bool:
+def compute_incoming_beam_path_to_point(
+    mesh: pv.PolyData,
+    slit_center: np.ndarray,
+    point: np.ndarray,
+) -> float:
+    origin = np.array([slit_center[0], point[1], point[2]], dtype=float)
+    path_length, _segments = compute_segment_path_length(mesh, origin, np.asarray(point, dtype=float))
+    return path_length
+
+
+def enginx_rietveld_count_time_minutes(path_length_mm: float, gauge_volume_mm3: float, material: str) -> float:
+    if material not in RIETVELD_COUNT_TIME_LAWS:
+        raise KeyError(f"Unsupported ENGIN-X count-time material: {material}")
+    if gauge_volume_mm3 <= 0.0:
+        raise ValueError("Gauge volume must be positive.")
+
+    count_times = RIETVELD_COUNT_TIME_LAWS[material]
+    reference_paths = COUNT_TIME_REFERENCE_PATHS_MM
+    mu = float(np.log(count_times[3] / count_times[2]) / (reference_paths[3] - reference_paths[2]))
+    reference_time = float(count_times[2])
+    reference_path = float(reference_paths[2])
+    volume_factor = 64.0 / float(gauge_volume_mm3)
+    return reference_time * float(np.exp(mu * (float(path_length_mm) - reference_path))) * volume_factor
+
+
+def format_scan_numeric(value: float, decimals: int = 3) -> str:
+    rounded = round(float(value))
+    if abs(float(value) - rounded) < 1e-9:
+        return str(int(rounded))
+    return f"{float(value):.{decimals}f}"
+
+
+def compute_lattice_strain(
+    lattice_parameter: float,
+    d0: float,
+) -> float:
+    if abs(float(d0)) < 1e-12:
+        raise ValueError("D0 must be non-zero.")
+    return (float(lattice_parameter) - float(d0)) / float(d0)
+
+
+def compute_lattice_strain_uncertainty(
+    lattice_parameter: float,
+    lattice_uncertainty: Optional[float],
+    d0: float,
+    d0_uncertainty: Optional[float],
+) -> Optional[float]:
+    if lattice_uncertainty is None or d0_uncertainty is None:
+        return None
+    if abs(float(d0)) < 1e-12:
+        raise ValueError("D0 must be non-zero.")
+    lattice_term = float(lattice_uncertainty) / float(d0)
+    d0_term = float(lattice_parameter) * float(d0_uncertainty) / (float(d0) * float(d0))
+    return float(np.sqrt(lattice_term * lattice_term + d0_term * d0_term))
+
+
+def compute_three_dimensional_stress_mpa(
+    strains: Sequence[float],
+    youngs_modulus_mpa: float,
+    poissons_ratio: float,
+) -> np.ndarray:
+    if len(strains) != 3:
+        raise ValueError("Three principal strains are required for 3D stress.")
+    denominator = (1.0 + float(poissons_ratio)) * (1.0 - 2.0 * float(poissons_ratio))
+    if abs(denominator) < 1e-12:
+        raise ValueError("Poisson's ratio is too close to 0.5 for the 3D isotropic stress model.")
+    scale = float(youngs_modulus_mpa) / denominator
+    strain_array = np.asarray(strains, dtype=float)
+    trace = float(np.sum(strain_array))
+    return scale * ((1.0 - float(poissons_ratio)) * strain_array + float(poissons_ratio) * (trace - strain_array))
+
+
+def compute_three_dimensional_stress_uncertainty_mpa(
+    strain_uncertainties: Sequence[Optional[float]],
+    youngs_modulus_mpa: float,
+    poissons_ratio: float,
+) -> Optional[np.ndarray]:
+    if any(value is None for value in strain_uncertainties):
+        return None
+    denominator = (1.0 + float(poissons_ratio)) * (1.0 - 2.0 * float(poissons_ratio))
+    if abs(denominator) < 1e-12:
+        raise ValueError("Poisson's ratio is too close to 0.5 for the 3D isotropic stress model.")
+    scale = float(youngs_modulus_mpa) / denominator
+    strain_uncertainty_array = np.asarray(strain_uncertainties, dtype=float)
+    output = np.zeros(3, dtype=float)
+    for stress_index in range(3):
+        coefficients = np.full(3, float(poissons_ratio), dtype=float)
+        coefficients[stress_index] = 1.0 - float(poissons_ratio)
+        output[stress_index] = abs(scale) * float(
+            np.sqrt(np.sum((coefficients * strain_uncertainty_array) ** 2))
+        )
+    return output
+
+
+def build_mesh_signed_distance_evaluator(mesh: pv.PolyData) -> Callable[[np.ndarray], float]:
+    implicit_distance = vtkImplicitPolyDataDistance()
+    implicit_distance.SetInput(mesh)
+
+    def evaluator(point: np.ndarray) -> float:
+        return float(implicit_distance.EvaluateFunction(np.asarray(point, dtype=float)))
+
+    return evaluator
+
+
+def point_inside_closed_mesh(
+    mesh: pv.PolyData,
+    point: np.ndarray,
+    tolerance: float = 1e-6,
+    signed_distance_evaluator: Optional[Callable[[np.ndarray], float]] = None,
+) -> bool:
     if mesh is None or mesh.n_points == 0:
         return False
+    if signed_distance_evaluator is not None:
+        signed_distance = signed_distance_evaluator(point)
+        if signed_distance < -tolerance:
+            return True
+        if signed_distance > tolerance:
+            return False
     probe = pv.PolyData(np.asarray([point], dtype=float))
     selected = probe.select_interior_points(
         mesh,
@@ -385,11 +621,12 @@ def point_on_or_inside_mesh(
     point: np.ndarray,
     probe_direction: Optional[np.ndarray] = None,
     tolerance: float = 1e-6,
+    signed_distance_evaluator: Optional[Callable[[np.ndarray], float]] = None,
 ) -> bool:
     if mesh is None or mesh.n_points == 0:
         return False
     point = np.asarray(point, dtype=float)
-    if point_inside_closed_mesh(mesh, point, tolerance=tolerance):
+    if point_inside_closed_mesh(mesh, point, tolerance=tolerance, signed_distance_evaluator=signed_distance_evaluator):
         return True
 
     bounds = np.array(mesh.bounds, dtype=float)
@@ -417,10 +654,33 @@ def point_on_or_inside_mesh(
             point - unit_direction * epsilon,
             point + unit_direction * epsilon,
             tolerance=tolerance,
+            signed_distance_evaluator=signed_distance_evaluator,
+            collect_segments=False,
         )
         if path_length > epsilon * 0.15:
             return True
     return False
+
+
+def interval_midpoint_inside_mesh(
+    mesh: pv.PolyData,
+    origin: np.ndarray,
+    unit_direction: np.ndarray,
+    start_distance: float,
+    end_distance: float,
+    tolerance: float = 1e-6,
+    signed_distance_evaluator: Optional[Callable[[np.ndarray], float]] = None,
+) -> bool:
+    midpoint_distance = (float(start_distance) + float(end_distance)) * 0.5
+    midpoint = np.asarray(origin, dtype=float) + np.asarray(unit_direction, dtype=float) * midpoint_distance
+    if signed_distance_evaluator is not None:
+        signed_distance = signed_distance_evaluator(midpoint)
+        if signed_distance < -tolerance:
+            return True
+        if signed_distance > tolerance:
+            return False
+        return False
+    return point_inside_closed_mesh(mesh, midpoint, tolerance=tolerance)
 
 
 def compute_segment_path_length(
@@ -428,6 +688,8 @@ def compute_segment_path_length(
     origin: np.ndarray,
     end: np.ndarray,
     tolerance: float = 1e-6,
+    signed_distance_evaluator: Optional[Callable[[np.ndarray], float]] = None,
+    collect_segments: bool = True,
 ) -> Tuple[float, List[Tuple[np.ndarray, np.ndarray]]]:
     if mesh is None or mesh.n_points == 0:
         return 0.0, []
@@ -451,37 +713,213 @@ def compute_segment_path_length(
             continue
         if not merged_distances or abs(distance - merged_distances[-1]) > tolerance:
             merged_distances.append(distance)
-
-    epsilon = min(max(max_distance * 1e-6, 1e-4), max_distance * 0.25)
-    start_inside = point_inside_closed_mesh(mesh, origin + unit_direction * epsilon, tolerance=tolerance)
-    if not start_inside:
-        start_inside = point_inside_closed_mesh(mesh, origin, tolerance=tolerance)
+    merged_distances = [
+        distance for distance in merged_distances if tolerance < distance < max_distance - tolerance
+    ]
 
     segments: List[Tuple[np.ndarray, np.ndarray]] = []
     total_length = 0.0
-    inside = start_inside
-    current_distance = 0.0 if start_inside else None
-    for distance in merged_distances:
-        if inside:
-            start_distance = 0.0 if current_distance is None else current_distance
-            if distance > start_distance + tolerance:
-                entry_point = origin + unit_direction * start_distance
-                exit_point = origin + unit_direction * distance
-                segments.append((entry_point, exit_point))
-                total_length += distance - start_distance
-            inside = False
-            current_distance = None
-        else:
-            current_distance = distance
-            inside = True
-
-    if inside and current_distance is not None and max_distance > current_distance + tolerance:
-        entry_point = origin + unit_direction * current_distance
-        exit_point = end
-        segments.append((entry_point, exit_point))
-        total_length += max_distance - current_distance
+    interval_boundaries = [0.0, *merged_distances, max_distance]
+    for start_distance, end_distance in zip(interval_boundaries[:-1], interval_boundaries[1:]):
+        if end_distance <= start_distance + tolerance:
+            continue
+        if not interval_midpoint_inside_mesh(
+            mesh,
+            origin,
+            unit_direction,
+            start_distance,
+            end_distance,
+            tolerance=tolerance,
+            signed_distance_evaluator=signed_distance_evaluator,
+        ):
+            continue
+        if collect_segments:
+            entry_point = origin + unit_direction * start_distance
+            exit_point = origin + unit_direction * end_distance
+            segments.append((entry_point, exit_point))
+        total_length += end_distance - start_distance
 
     return total_length, segments
+
+
+def remove_scalar_bar_if_present(plotter: pv.Plotter, title: str) -> None:
+    if title in plotter.scalar_bars:
+        plotter.remove_scalar_bar(title=title, render=False)
+
+
+class SpreadsheetTableWidget(QTableWidget):
+    def __init__(self, rows: int, columns: int, parent: Optional[QWidget] = None) -> None:
+        super().__init__(rows, columns, parent)
+        self.read_only_columns: set[int] = set()
+        self.after_paste: Optional[Callable[[], None]] = None
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.Copy):
+            self.copy_selection_to_clipboard()
+            event.accept()
+            return
+        if event.matches(QKeySequence.Paste):
+            self.paste_from_clipboard()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def copy_selection_to_clipboard(self) -> None:
+        indexes = self.selectedIndexes()
+        if not indexes:
+            return
+        rows = sorted({index.row() for index in indexes})
+        columns = sorted({index.column() for index in indexes})
+        copied_lines = []
+        for row in range(rows[0], rows[-1] + 1):
+            values = []
+            for column in range(columns[0], columns[-1] + 1):
+                item = self.item(row, column)
+                values.append("" if item is None else item.text())
+            copied_lines.append("\t".join(values))
+        QApplication.clipboard().setText("\n".join(copied_lines))
+
+    def paste_from_clipboard(self) -> None:
+        clipboard_text = QApplication.clipboard().text()
+        if clipboard_text == "":
+            return
+
+        lines = clipboard_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if lines and lines[-1] == "":
+            lines = lines[:-1]
+        grid = [line.split("\t") for line in lines]
+        if not grid:
+            return
+
+        was_blocked = self.blockSignals(True)
+        try:
+            selected_indexes = self.selectedIndexes()
+            if len(grid) == 1 and len(grid[0]) == 1 and len(selected_indexes) > 1:
+                self._paste_single_value_to_selection(grid[0][0], selected_indexes)
+            else:
+                self._paste_grid(grid)
+        finally:
+            self.blockSignals(was_blocked)
+
+        if self.after_paste is not None:
+            self.after_paste()
+
+    def _paste_single_value_to_selection(self, value: str, indexes) -> None:
+        for index in indexes:
+            self._set_cell_text(index.row(), index.column(), value)
+
+    def _paste_grid(self, grid: List[List[str]]) -> None:
+        current_row = self.currentRow()
+        current_column = self.currentColumn()
+        if current_row < 0:
+            current_row = 0
+        if current_column < 0:
+            current_column = 0
+
+        while self.rowCount() < current_row + len(grid):
+            self.insertRow(self.rowCount())
+
+        for row_offset, row_values in enumerate(grid):
+            for column_offset, value in enumerate(row_values):
+                target_column = current_column + column_offset
+                if target_column >= self.columnCount():
+                    continue
+                self._set_cell_text(current_row + row_offset, target_column, value)
+
+    def _set_cell_text(self, row: int, column: int, value: str) -> None:
+        if column in self.read_only_columns:
+            return
+        item = self.item(row, column)
+        if item is None:
+            item = QTableWidgetItem()
+            self.setItem(row, column, item)
+        if not (item.flags() & Qt.ItemIsEditable):
+            return
+        item.setText(value)
+
+
+class StressTableHeaderView(QHeaderView):
+    def __init__(self, orientation: Qt.Orientation, parent: Optional[QWidget] = None) -> None:
+        super().__init__(orientation, parent)
+        self.single_headers = {
+            0: "Run",
+            1: "Point ID",
+        }
+        self.grouped_headers = [
+            (2, "lattice parameter 1", ["a", "\u0394a", "a0", "\u0394a0"]),
+            (6, "lattice parameter 2", ["a", "\u0394a", "a0", "\u0394a0"]),
+            (10, "lattice parameter 3", ["a", "\u0394a", "a0", "\u0394a0"]),
+            (14, "Strain 1 (\u00b5\u03b5)", ["\u03b5", "\u0394\u03b5"]),
+            (16, "Strain 2 (\u00b5\u03b5)", ["\u03b5", "\u0394\u03b5"]),
+            (18, "Strain 3 (\u00b5\u03b5)", ["\u03b5", "\u0394\u03b5"]),
+            (20, "Stress 1 (MPA)", ["\u03c3", "\u0394\u03c3"]),
+            (22, "Stress 2 (MPA)", ["\u03c3", "\u0394\u03c3"]),
+            (24, "Stress 3 (MPA)", ["\u03c3", "\u0394\u03c3"]),
+        ]
+        self.setDefaultAlignment(Qt.AlignCenter)
+        self.setMinimumHeight(48)
+
+    def sizeHint(self) -> QSize:
+        hint = super().sizeHint()
+        return QSize(hint.width(), max(hint.height() * 2, 48))
+
+    def sectionSizeFromContents(self, logical_index: int) -> QSize:
+        size = super().sectionSizeFromContents(logical_index)
+        return QSize(size.width(), max(size.height() * 2, 48))
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        background_color = self.palette().color(self.backgroundRole())
+        border_color = self.palette().color(self.foregroundRole()).darker(130)
+        text_color = self.palette().color(self.foregroundRole())
+        painter.fillRect(event.rect(), background_color)
+
+        total_height = self.height()
+        top_height = total_height // 2
+        bottom_height = total_height - top_height
+
+        for logical_index, text in self.single_headers.items():
+            if self.isSectionHidden(logical_index):
+                continue
+            rect = QRect(
+                self.sectionViewportPosition(logical_index),
+                0,
+                self.sectionSize(logical_index),
+                total_height,
+            )
+            if rect.right() < event.rect().left() or rect.left() > event.rect().right():
+                continue
+            self._draw_header_cell(painter, rect, text, border_color, text_color)
+
+        for start_column, title, sublabels in self.grouped_headers:
+            end_column = start_column + len(sublabels) - 1
+            if any(self.isSectionHidden(column) for column in range(start_column, end_column + 1)):
+                continue
+            left = self.sectionViewportPosition(start_column)
+            right = self.sectionViewportPosition(end_column) + self.sectionSize(end_column)
+            title_rect = QRect(left, 0, right - left, top_height)
+            if not (title_rect.right() < event.rect().left() or title_rect.left() > event.rect().right()):
+                self._draw_header_cell(painter, title_rect, title, border_color, text_color)
+            for offset, label in enumerate(sublabels):
+                logical_index = start_column + offset
+                rect = QRect(
+                    self.sectionViewportPosition(logical_index),
+                    top_height,
+                    self.sectionSize(logical_index),
+                    bottom_height,
+                )
+                if rect.right() < event.rect().left() or rect.left() > event.rect().right():
+                    continue
+                self._draw_header_cell(painter, rect, label, border_color, text_color)
+
+    def _draw_header_cell(self, painter: QPainter, rect: QRect, text: str, border_color, text_color) -> None:
+        painter.save()
+        painter.setPen(border_color)
+        painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        painter.setPen(text_color)
+        painter.drawText(rect.adjusted(4, 2, -4, -2), Qt.AlignCenter, text)
+        painter.restore()
 
 
 class CursorZoomQtInteractor(QtInteractor):
@@ -545,21 +983,88 @@ def combine_scene_meshes(meshes: Sequence[trimesh.Trimesh]) -> trimesh.Trimesh:
     return trimesh.util.concatenate(non_empty)
 
 
-def load_mesh_as_polydata(path: Path) -> pv.PolyData:
-    loaded = trimesh.load(path, force="scene")
+def trimesh_loaded_to_polydata(loaded, source_name: str) -> pv.PolyData:
     if isinstance(loaded, trimesh.Scene):
         mesh = combine_scene_meshes(tuple(loaded.geometry.values()))
     elif isinstance(loaded, trimesh.Trimesh):
         mesh = loaded
     else:
-        raise ValueError(f"Unsupported model type returned for {path.name}.")
+        raise ValueError(f"Unsupported model type returned for {source_name}.")
 
     vertices = np.asarray(mesh.vertices, dtype=float)
     faces = np.asarray(mesh.faces, dtype=np.int64)
     if vertices.size == 0 or faces.size == 0:
-        raise ValueError(f"{path.name} did not contain triangle faces.")
+        raise ValueError(f"{source_name} did not contain triangle faces.")
     faces_with_size = np.hstack([np.full((len(faces), 1), 3, dtype=np.int64), faces]).ravel()
     return pv.PolyData(vertices, faces_with_size).clean()
+
+
+def load_mesh_as_polydata(path: Path) -> pv.PolyData:
+    loaded = trimesh.load(path, force="scene")
+    return trimesh_loaded_to_polydata(loaded, path.name)
+
+
+def load_mesh_bytes_as_polydata(data: bytes, source_name: str, file_type: str = "stl") -> pv.PolyData:
+    loaded = trimesh.load(io.BytesIO(data), file_type=file_type, force="scene")
+    return trimesh_loaded_to_polydata(loaded, source_name)
+
+
+def polydata_to_stl_bytes(mesh: pv.PolyData) -> bytes:
+    if mesh is None or mesh.n_points == 0:
+        raise ValueError("No mesh is available to save.")
+    triangle_mesh = mesh.triangulate().clean()
+    faces = np.asarray(triangle_mesh.faces, dtype=np.int64)
+    if faces.size == 0:
+        raise ValueError("The mesh did not contain any triangle faces to save.")
+    triangle_faces = faces.reshape((-1, 4))[:, 1:4]
+    export_mesh = trimesh.Trimesh(
+        vertices=np.asarray(triangle_mesh.points, dtype=float),
+        faces=triangle_faces,
+        process=False,
+    )
+    exported = export_mesh.export(file_type="stl")
+    if isinstance(exported, str):
+        return exported.encode("utf-8")
+    return bytes(exported)
+
+
+def table_to_serializable_rows(table: QTableWidget, headers: Sequence[str]) -> List[dict]:
+    rows: List[dict] = []
+    for row_index in range(table.rowCount()):
+        row_data = {}
+        has_value = False
+        for column_index, header in enumerate(headers):
+            item = table.item(row_index, column_index)
+            text = "" if item is None else item.text().strip()
+            row_data[header] = text
+            if text != "":
+                has_value = True
+        if has_value:
+            rows.append(row_data)
+    return rows
+
+
+def populate_table_from_serialized_rows(
+    table: QTableWidget,
+    headers: Sequence[str],
+    rows: Sequence[dict],
+    read_only_columns: Optional[Sequence[int]] = None,
+) -> None:
+    read_only = set(read_only_columns or [])
+    previous_state = table.blockSignals(True)
+    table.setRowCount(0)
+    try:
+        for row_data in rows:
+            row_index = table.rowCount()
+            table.insertRow(row_index)
+            for column_index, header in enumerate(headers):
+                value = row_data.get(header, "")
+                item = QTableWidgetItem("" if value is None else str(value))
+                if column_index in read_only:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                table.setItem(row_index, column_index, item)
+    finally:
+        table.blockSignals(previous_state)
 
 
 class PointPickerDialog(QDialog):
@@ -1252,6 +1757,7 @@ class MainWindow(QMainWindow):
         self.resize(1600, 960)
 
         self.enable_3d = enable_3d
+        self.project_path: Optional[Path] = None
         self.mesh_path: Optional[Path] = None
         self.model_mesh: Optional[pv.PolyData] = None
         self.fit_transform = None
@@ -1261,6 +1767,7 @@ class MainWindow(QMainWindow):
         self.lower_splitter = None
         self.tables_splitter = None
         self.controls_scroll = None
+        self.main_tabs = None
         self.instrument_setup_dialog = None
         self.point_picker_dialog = None
         self._initial_sizes_applied = False
@@ -1321,10 +1828,17 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(8)
+        self.main_tabs = QTabWidget()
+        main_layout.addWidget(self.main_tabs)
+
+        placement_tab = QWidget()
+        placement_layout = QVBoxLayout(placement_tab)
+        placement_layout.setContentsMargins(0, 0, 0, 0)
+        placement_layout.setSpacing(0)
 
         self.top_splitter = QSplitter(Qt.Horizontal)
         self.bottom_splitter = QSplitter(Qt.Vertical)
-        main_layout.addWidget(self.bottom_splitter)
+        placement_layout.addWidget(self.bottom_splitter)
         self.bottom_splitter.addWidget(self.top_splitter)
 
         self.viewer_font_increase_shortcut = QShortcut(QKeySequence("Shift+>"), self)
@@ -1396,6 +1910,9 @@ class MainWindow(QMainWindow):
         self.bottom_splitter.setStretchFactor(0, 3)
         self.bottom_splitter.setStretchFactor(1, 2)
 
+        self.main_tabs.addTab(placement_tab, "Placement")
+        self.main_tabs.addTab(self._build_stress_tab(), "Residual Stress")
+
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Load a mesh, then use Fit placement or Manual Sample Placement.")
 
@@ -1423,39 +1940,148 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Files")
         layout = QVBoxLayout(group)
 
+        self.project_path_label = QLabel("No project saved or loaded")
+        self.project_path_label.setWordWrap(True)
         self.mesh_path_label = QLabel("No mesh loaded")
         self.mesh_path_label.setWordWrap(True)
         self.csv_path_label = QLabel("Measurements can be loaded from CSV or edited directly.")
         self.csv_path_label.setWordWrap(True)
 
         row1 = QHBoxLayout()
+        save_project_button = QPushButton("Save project")
+        save_project_button.clicked.connect(self.save_project_dialog)
+        load_project_button = QPushButton("Load project")
+        load_project_button.clicked.connect(self.load_project_dialog)
+        row1.addWidget(save_project_button)
+        row1.addWidget(load_project_button)
+
+        row2 = QHBoxLayout()
         load_mesh_button = QPushButton("Load STL/mesh")
         load_mesh_button.clicked.connect(self.load_mesh_dialog)
         clear_mesh_button = QPushButton("Clear mesh")
         clear_mesh_button.clicked.connect(self.clear_mesh)
-        row1.addWidget(load_mesh_button)
-        row1.addWidget(clear_mesh_button)
+        row2.addWidget(load_mesh_button)
+        row2.addWidget(clear_mesh_button)
 
-        row2 = QHBoxLayout()
+        row3 = QHBoxLayout()
         fit_button = QPushButton("Fit placement")
         fit_button.clicked.connect(self.fit_placement)
         export_button = QPushButton("Export fit JSON")
         export_button.clicked.connect(self.export_json_dialog)
-        row2.addWidget(fit_button)
-        row2.addWidget(export_button)
+        row3.addWidget(fit_button)
+        row3.addWidget(export_button)
 
-        row3 = QHBoxLayout()
+        row4 = QHBoxLayout()
         pick_point_button = QPushButton("Pick point")
         pick_point_button.clicked.connect(self.open_point_picker_dialog)
-        row3.addWidget(pick_point_button)
-        row3.addStretch(1)
+        row4.addWidget(pick_point_button)
+        row4.addStretch(1)
 
+        layout.addWidget(self.project_path_label)
         layout.addWidget(self.mesh_path_label)
         layout.addWidget(self.csv_path_label)
         layout.addLayout(row1)
         layout.addLayout(row2)
         layout.addLayout(row3)
+        layout.addLayout(row4)
         return group
+
+    def _build_stress_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        metadata_group = QGroupBox("Stress Metadata")
+        metadata_layout = QVBoxLayout(metadata_group)
+        self.stress_title_edit = QLineEdit()
+        self.stress_sample_name_edit = QLineEdit()
+        self.stress_sample_material_edit = QLineEdit()
+        self.stress_youngs_modulus_mpa = make_spin_box(210000.0, 0.001, 1_000_000_000.0, step=1000.0)
+        self.stress_youngs_modulus_mpa.setDecimals(0)
+        self.stress_poissons_ratio = make_spin_box(0.300, -0.999, 0.499, step=0.01)
+        self.stress_poissons_ratio.setDecimals(3)
+
+        title_layout = QFormLayout()
+        title_layout.addRow("Title", self.stress_title_edit)
+        metadata_layout.addLayout(title_layout)
+
+        sample_row = QHBoxLayout()
+        sample_row.addWidget(QLabel("Sample name"))
+        sample_row.addWidget(self.stress_sample_name_edit, stretch=1)
+        sample_row.addWidget(QLabel("Sample material"))
+        sample_row.addWidget(self.stress_sample_material_edit, stretch=1)
+        metadata_layout.addLayout(sample_row)
+
+        elastic_row = QHBoxLayout()
+        elastic_row.addWidget(QLabel("Young's modulus (MPa)"))
+        elastic_row.addWidget(self.stress_youngs_modulus_mpa)
+        elastic_row.addWidget(QLabel("Poisson's ratio"))
+        elastic_row.addWidget(self.stress_poissons_ratio)
+        elastic_row.addStretch(1)
+        metadata_layout.addLayout(elastic_row)
+
+        layout.addWidget(metadata_group)
+
+        layout.addWidget(self._build_stress_toolbar())
+        self.stress_table = self._build_stress_table()
+        layout.addWidget(self.stress_table, stretch=1)
+
+        self.stress_status_label = QLabel(
+            "Paste lattice parameters and D0 values into the table, then calculate 3D microstrain and stress in MPa."
+        )
+        self.stress_status_label.setWordWrap(True)
+        layout.addWidget(self.stress_status_label)
+        return tab
+
+    def _build_stress_toolbar(self) -> QWidget:
+        toolbar = QWidget()
+        layout = QHBoxLayout(toolbar)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        add_row_button = QPushButton("Add row")
+        add_row_button.clicked.connect(lambda: self.add_stress_row())
+        remove_row_button = QPushButton("Remove row")
+        remove_row_button.clicked.connect(self.remove_selected_stress_rows)
+        clear_outputs_button = QPushButton("Clear outputs")
+        clear_outputs_button.clicked.connect(self.clear_stress_outputs)
+        calculate_button = QPushButton("Calculate")
+        calculate_button.clicked.connect(self.calculate_residual_stress)
+        equations_button = QPushButton("Equations")
+        equations_button.clicked.connect(self.show_stress_equations_dialog)
+        save_csv_button = QPushButton("Save CSV")
+        save_csv_button.clicked.connect(self.save_stress_csv_dialog)
+
+        layout.addWidget(add_row_button)
+        layout.addWidget(remove_row_button)
+        layout.addWidget(clear_outputs_button)
+        layout.addWidget(calculate_button)
+        layout.addWidget(equations_button)
+        layout.addWidget(save_csv_button)
+        layout.addStretch(1)
+        return toolbar
+
+    def _build_stress_table(self) -> QTableWidget:
+        table = SpreadsheetTableWidget(20, len(STRESS_TABLE_HEADERS))
+        table.setHorizontalHeader(StressTableHeaderView(Qt.Horizontal, table))
+        table.setHorizontalHeaderLabels(STRESS_TABLE_HEADERS)
+        table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        table.setAlternatingRowColors(True)
+        table.setWordWrap(False)
+        table.setMinimumHeight(320)
+        table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        table.verticalHeader().setDefaultSectionSize(28)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Fixed)
+        header.setStretchLastSection(False)
+        header.setDefaultSectionSize(140)
+        table.read_only_columns = set(range(14, len(STRESS_TABLE_HEADERS)))
+        table.after_paste = self.normalize_stress_input_cells
+        table.itemChanged.connect(self.on_stress_item_changed)
+        for column in range(14, len(STRESS_TABLE_HEADERS)):
+            table.setColumnWidth(column, 120)
+        return table
 
     def _build_setup_group(self) -> QGroupBox:
         group = QGroupBox("Setup Geometry")
@@ -1470,8 +2096,13 @@ class MainWindow(QMainWindow):
         self.slit_x = make_spin_box(-300.0, -100000.0, 100000.0)
         self.slit_y = make_spin_box(0.0, -100000.0, 100000.0)
         self.slit_z = make_spin_box(0.0, -100000.0, 100000.0)
-        self.slit_width = make_spin_box(20.0, 0.001, 100000.0)
-        self.slit_height = make_spin_box(20.0, 0.001, 100000.0)
+        self.slit_width = make_spin_box(4.0, 0.001, 100000.0)
+        self.slit_height = make_spin_box(4.0, 0.001, 100000.0)
+        self.collimator = QComboBox()
+        self.collimator.addItems(["0.5", "1", "2", "3", "4"])
+        self.collimator.setCurrentText("4")
+        self.count_time_material = QComboBox()
+        self.count_time_material.addItems(list(RIETVELD_COUNT_TIME_LAWS.keys()))
         self.beam_length = make_spin_box(700.0, 1.0, 100000.0)
         self.detector_width_y = make_spin_box(100.0, 10.0, 200.0)
         self.detector_height_z = make_spin_box(100.0, 10.0, 200.0)
@@ -1519,7 +2150,8 @@ class MainWindow(QMainWindow):
         layout.addRow(self._separator())
         layout.addRow("Slit width", self.slit_width)
         layout.addRow("Slit height", self.slit_height)
-        layout.addRow("Beam length", self.beam_length)
+        layout.addRow("Collimator", self.collimator)
+        layout.addRow("Material", self.count_time_material)
         self.instrument_setup_dialog = self._build_instrument_setup_dialog()
         return group
 
@@ -1542,6 +2174,7 @@ class MainWindow(QMainWindow):
         form.addRow("Slit X", self.slit_x)
         form.addRow("Slit Y", self.slit_y)
         form.addRow("Slit Z", self.slit_z)
+        form.addRow("Beam length", self.beam_length)
         form.addRow(self._separator())
         form.addRow("Detector width Y", self.detector_width_y)
         form.addRow("Detector height Z", self.detector_height_z)
@@ -1823,6 +2456,10 @@ class MainWindow(QMainWindow):
         generate_button.clicked.connect(self.generate_prediction_stage_readouts)
         generate_paths_button = QPushButton("Generate paths")
         generate_paths_button.clicked.connect(self.generate_prediction_diffraction_paths)
+        estimate_time_button = QPushButton("Estimate time")
+        estimate_time_button.clicked.connect(self.generate_prediction_estimated_times)
+        create_scan_file_button = QPushButton("Create scan file")
+        create_scan_file_button.clicked.connect(self.create_prediction_scan_file)
 
         layout.addWidget(add_row_button)
         layout.addWidget(remove_row_button)
@@ -1830,6 +2467,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(save_csv_button)
         layout.addWidget(generate_button)
         layout.addWidget(generate_paths_button)
+        layout.addWidget(estimate_time_button)
+        layout.addWidget(create_scan_file_button)
         layout.addStretch(1)
         return toolbar
 
@@ -1845,10 +2484,10 @@ class MainWindow(QMainWindow):
         return section
 
     def _build_measurement_table(self) -> QTableWidget:
-        table = QTableWidget(0, len(TABLE_HEADERS))
+        table = SpreadsheetTableWidget(0, len(TABLE_HEADERS))
         table.setHorizontalHeaderLabels(TABLE_HEADERS)
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         table.setAlternatingRowColors(True)
         table.setWordWrap(False)
         table.setMinimumHeight(220)
@@ -1862,10 +2501,10 @@ class MainWindow(QMainWindow):
         return table
 
     def _build_prediction_table(self) -> QTableWidget:
-        table = QTableWidget(0, len(PREDICTION_TABLE_HEADERS))
+        table = SpreadsheetTableWidget(0, len(PREDICTION_TABLE_HEADERS))
         table.setHorizontalHeaderLabels(PREDICTION_TABLE_HEADERS)
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         table.setAlternatingRowColors(True)
         table.setWordWrap(False)
         table.setMinimumHeight(180)
@@ -1874,6 +2513,8 @@ class MainWindow(QMainWindow):
         header = table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
         header.setStretchLastSection(True)
+        table.read_only_columns = {7, 8, 9, 10}
+        table.after_paste = lambda: self.update_scene(reset_camera=False)
         table.itemSelectionChanged.connect(self.on_prediction_selection_changed)
         table.itemChanged.connect(self.on_prediction_item_changed)
         return table
@@ -1932,11 +2573,7 @@ class MainWindow(QMainWindow):
             was_blocked = self.measurement_table.blockSignals(True)
             self.measurement_table.clearSelection()
             self.measurement_table.blockSignals(was_blocked)
-        if (
-            hasattr(self, "auto_move_to_pivot_checkbox")
-            and self.auto_move_to_pivot_checkbox.isChecked()
-            and (self.fit_transform is not None or self.manual_placement_enabled_checkbox.isChecked())
-        ):
+        if hasattr(self, "auto_move_to_pivot_checkbox") and self.auto_move_to_pivot_checkbox.isChecked():
             self.move_selected_prediction_point_to_pivot(show_error=False)
         self.update_scene(reset_camera=False)
 
@@ -2165,6 +2802,7 @@ class MainWindow(QMainWindow):
         model_point: Optional[Sequence[float]] = None,
         stage_readout: Optional[Sequence[float]] = None,
         path_values: Optional[Sequence[float]] = None,
+        uamp_values: Optional[Sequence[float]] = None,
     ) -> None:
         row = self.prediction_table.rowCount()
         self.prediction_table.insertRow(row)
@@ -2172,6 +2810,7 @@ class MainWindow(QMainWindow):
         model_point = model_point if model_point is not None else (0.0, 0.0, 0.0)
         stage_readout = stage_readout if stage_readout is not None else ("", "", "")
         path_values = path_values if path_values is not None else ("", "")
+        uamp_values = uamp_values if uamp_values is not None else ("", "")
         values = (
             default_label,
             model_point[0],
@@ -2182,6 +2821,8 @@ class MainWindow(QMainWindow):
             stage_readout[2],
             path_values[0],
             path_values[1],
+            uamp_values[0],
+            uamp_values[1],
         )
         for column, value in enumerate(values):
             if column == 0:
@@ -2231,6 +2872,719 @@ class MainWindow(QMainWindow):
         item.setText(normalized)
         self.prediction_table.blockSignals(was_blocked)
         self.update_scene(reset_camera=False)
+
+    def add_stress_row(self) -> None:
+        row = self.stress_table.rowCount()
+        self.stress_table.insertRow(row)
+        for column in range(self.stress_table.columnCount()):
+            item = QTableWidgetItem("")
+            if column in self.stress_table.read_only_columns:
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.stress_table.setItem(row, column, item)
+
+    def remove_selected_stress_rows(self) -> None:
+        rows = sorted({index.row() for index in self.stress_table.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
+        for row in rows:
+            self.stress_table.removeRow(row)
+        self.stress_status_label.setText(f"Removed {len(rows)} residual-stress row(s).")
+
+    def clear_stress_outputs(self) -> None:
+        was_blocked = self.stress_table.blockSignals(True)
+        try:
+            for row in range(self.stress_table.rowCount()):
+                self.clear_stress_outputs_for_row(row)
+        finally:
+            self.stress_table.blockSignals(was_blocked)
+        self.stress_status_label.setText("Cleared calculated strain/stress outputs.")
+
+    def clear_stress_outputs_for_row(self, row: int) -> None:
+        for column in range(14, len(STRESS_TABLE_HEADERS)):
+            item = self.stress_table.item(row, column)
+            if item is None:
+                item = QTableWidgetItem("")
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.stress_table.setItem(row, column, item)
+            else:
+                item.setText("")
+
+    def on_stress_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() in {0, 1} or item.column() in self.stress_table.read_only_columns:
+            return
+        text = item.text().strip()
+        if text == "":
+            return
+        try:
+            normalized = format_fixed_decimal(float(text), decimals=6)
+        except ValueError:
+            return
+        if text == normalized:
+            return
+        was_blocked = self.stress_table.blockSignals(True)
+        try:
+            item.setText(normalized)
+        finally:
+            self.stress_table.blockSignals(was_blocked)
+
+    def normalize_stress_input_cells(self) -> None:
+        was_blocked = self.stress_table.blockSignals(True)
+        try:
+            for row in range(self.stress_table.rowCount()):
+                for column in range(self.stress_table.columnCount()):
+                    if column in {0, 1} or column in self.stress_table.read_only_columns:
+                        continue
+                    item = self.stress_table.item(row, column)
+                    if item is None:
+                        continue
+                    text = item.text().strip()
+                    if text == "":
+                        continue
+                    try:
+                        item.setText(format_fixed_decimal(float(text), decimals=6))
+                    except ValueError:
+                        continue
+        finally:
+            self.stress_table.blockSignals(was_blocked)
+
+    def _stress_cell_text(self, row: int, column: int) -> str:
+        item = self.stress_table.item(row, column)
+        return "" if item is None else item.text().strip()
+
+    def _stress_optional_float(self, row: int, column: int) -> Optional[float]:
+        text = self._stress_cell_text(row, column)
+        if text == "":
+            return None
+        return float(text)
+
+    def _set_stress_output_value(self, row: int, column: int, value: Optional[float], decimals: int) -> None:
+        item = self.stress_table.item(row, column)
+        if item is None:
+            item = QTableWidgetItem("")
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.stress_table.setItem(row, column, item)
+        item.setText("" if value is None else format_trimmed_decimal(value, decimals=decimals))
+
+    def calculate_residual_stress(self) -> None:
+        youngs_modulus_mpa = float(self.stress_youngs_modulus_mpa.value())
+        poissons_ratio = float(self.stress_poissons_ratio.value())
+        calculated_strain_rows = 0
+        calculated_stress_rows = 0
+        incomplete_rows = 0
+
+        was_blocked = self.stress_table.blockSignals(True)
+        try:
+            for row in range(self.stress_table.rowCount()):
+                self.clear_stress_outputs_for_row(row)
+                input_texts = [self._stress_cell_text(row, column) for column in range(14)]
+                if not any(input_texts):
+                    continue
+
+                strain_values: List[Optional[float]] = []
+                strain_uncertainties: List[Optional[float]] = []
+                row_has_strain = False
+
+                for direction in range(3):
+                    lattice_column = 2 + direction * 4
+                    lattice_uncert_column = lattice_column + 1
+                    d0_column = lattice_column + 2
+                    d0_uncert_column = lattice_column + 3
+
+                    lattice_value = self._stress_optional_float(row, lattice_column)
+                    lattice_uncertainty = self._stress_optional_float(row, lattice_uncert_column)
+                    d0_value = self._stress_optional_float(row, d0_column)
+                    d0_uncertainty = self._stress_optional_float(row, d0_uncert_column)
+
+                    direction_texts = [self._stress_cell_text(row, lattice_column + offset) for offset in range(4)]
+                    if not any(direction_texts):
+                        strain_values.append(None)
+                        strain_uncertainties.append(None)
+                        continue
+                    if lattice_value is None or d0_value is None:
+                        strain_values.append(None)
+                        strain_uncertainties.append(None)
+                        continue
+
+                    strain_value = compute_lattice_strain(lattice_value, d0_value)
+                    strain_uncertainty = compute_lattice_strain_uncertainty(
+                        lattice_value,
+                        lattice_uncertainty,
+                        d0_value,
+                        d0_uncertainty,
+                    )
+                    displayed_strain_value = strain_value * MICROSTRAIN_SCALE
+                    displayed_strain_uncertainty = None
+                    if strain_uncertainty is not None:
+                        displayed_strain_uncertainty = strain_uncertainty * MICROSTRAIN_SCALE
+                    self._set_stress_output_value(row, 14 + direction * 2, displayed_strain_value, decimals=0)
+                    self._set_stress_output_value(row, 15 + direction * 2, displayed_strain_uncertainty, decimals=0)
+                    strain_values.append(strain_value)
+                    strain_uncertainties.append(strain_uncertainty)
+                    row_has_strain = True
+
+                if row_has_strain:
+                    calculated_strain_rows += 1
+
+                if any(value is None for value in strain_values):
+                    incomplete_rows += 1
+                    continue
+
+                stress_values = compute_three_dimensional_stress_mpa(
+                    [float(value) for value in strain_values],
+                    youngs_modulus_mpa,
+                    poissons_ratio,
+                )
+                stress_uncertainties = compute_three_dimensional_stress_uncertainty_mpa(
+                    strain_uncertainties,
+                    youngs_modulus_mpa,
+                    poissons_ratio,
+                )
+                for direction in range(3):
+                    self._set_stress_output_value(row, 20 + direction * 2, float(stress_values[direction]), decimals=0)
+                    stress_uncertainty = None
+                    if stress_uncertainties is not None:
+                        stress_uncertainty = float(stress_uncertainties[direction])
+                    self._set_stress_output_value(row, 21 + direction * 2, stress_uncertainty, decimals=0)
+                calculated_stress_rows += 1
+        except Exception as exc:
+            self.show_error("Residual stress calculation failed", str(exc))
+            return
+        finally:
+            self.stress_table.blockSignals(was_blocked)
+
+        self.stress_status_label.setText(
+            f"Calculated strain for {calculated_strain_rows} row(s), 3D stress for {calculated_stress_rows} row(s)."
+            + (f" {incomplete_rows} row(s) were left without full stress because one or more directions were missing." if incomplete_rows else "")
+        )
+
+    def save_stress_csv_dialog(self) -> None:
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save residual stress CSV",
+            str(Path.cwd() / "residual_stress.csv"),
+            "CSV files (*.csv)",
+        )
+        if not path_str:
+            return
+        try:
+            with Path(path_str).open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(STRESS_TABLE_HEADERS)
+                for row in range(self.stress_table.rowCount()):
+                    values = []
+                    has_value = False
+                    for column in range(self.stress_table.columnCount()):
+                        item = self.stress_table.item(row, column)
+                        text = "" if item is None else item.text().strip()
+                        values.append(text)
+                        if text != "":
+                            has_value = True
+                    if not has_value:
+                        continue
+                    writer.writerow(values)
+            self.statusBar().showMessage(f"Saved residual stress table to {path_str}", 5000)
+            self.stress_status_label.setText(f"Saved residual stress table to {path_str}")
+        except Exception as exc:
+            self.show_error("Failed to save residual stress CSV", str(exc))
+
+    def show_stress_equations_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Residual Stress Equations")
+        dialog.setModal(False)
+        dialog.resize(980, 760)
+
+        layout = QVBoxLayout(dialog)
+        scroll = QScrollArea(dialog)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        layout.addWidget(scroll)
+
+        content = QWidget()
+        content.setStyleSheet("background-color: white;")
+        scroll.setWidget(content)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(18, 18, 18, 18)
+        content_layout.setSpacing(14)
+
+        intro_label = QLabel(
+            "The residual-stress tab uses the following equations.",
+            content,
+        )
+        intro_label.setWordWrap(True)
+        intro_label.setStyleSheet(
+            "color: black; font-size: 16px; font-family: 'Times New Roman', Georgia, serif;"
+        )
+        content_layout.addWidget(intro_label)
+
+        equation_cards = [
+            (
+                "Lattice strain",
+                "<span style='font-style: italic;'>"
+                "&epsilon;<sub>i</sub> = "
+                "<span style='font-size: 120%;'>(</span>a<sub>i</sub> - a0<sub>i</sub><span style='font-size: 120%;'>)</span>"
+                " / a0<sub>i</sub>"
+                "</span>",
+            ),
+            (
+                "Strain uncertainty",
+                "<span style='font-style: italic;'>"
+                "u(&epsilon;<sub>i</sub>) = "
+                "&radic;<span style='font-size: 115%;'>(</span>"
+                "<span>(u(a<sub>i</sub>) / a0<sub>i</sub>)<sup>2</sup></span>"
+                " + "
+                "<span>(a<sub>i</sub>u(a0<sub>i</sub>) / a0<sub>i</sub><sup>2</sup>)<sup>2</sup></span>"
+                "<span style='font-size: 115%;'>)</span>"
+                "</span>",
+            ),
+            (
+                "Microstrain display",
+                "<span style='font-style: italic;'>"
+                "&epsilon;<sub>&micro;&epsilon;,i</sub> = &epsilon;<sub>i</sub> &times; 10<sup>6</sup>"
+                "<br/>"
+                "u(&epsilon;<sub>&micro;&epsilon;,i</sub>) = u(&epsilon;<sub>i</sub>) &times; 10<sup>6</sup>"
+                "</span>",
+            ),
+            (
+                "3D isotropic stress scale",
+                "<span style='font-style: italic;'>"
+                "C = E / <span style='font-size: 120%;'>(</span>(1 + &nu;)(1 - 2&nu;)<span style='font-size: 120%;'>)</span>"
+                "</span>",
+            ),
+            (
+                "Stress 1 (MPa)",
+                "<span style='font-style: italic;'>"
+                "&sigma;<sub>1</sub> = C"
+                "<span style='font-size: 120%;'>(</span>"
+                "(1 - &nu;)&epsilon;<sub>1</sub> + &nu;&epsilon;<sub>2</sub> + &nu;&epsilon;<sub>3</sub>"
+                "<span style='font-size: 120%;'>)</span>"
+                "</span>",
+            ),
+            (
+                "Stress 2 (MPa)",
+                "<span style='font-style: italic;'>"
+                "&sigma;<sub>2</sub> = C"
+                "<span style='font-size: 120%;'>(</span>"
+                "&nu;&epsilon;<sub>1</sub> + (1 - &nu;)&epsilon;<sub>2</sub> + &nu;&epsilon;<sub>3</sub>"
+                "<span style='font-size: 120%;'>)</span>"
+                "</span>",
+            ),
+            (
+                "Stress 3 (MPa)",
+                "<span style='font-style: italic;'>"
+                "&sigma;<sub>3</sub> = C"
+                "<span style='font-size: 120%;'>(</span>"
+                "&nu;&epsilon;<sub>1</sub> + &nu;&epsilon;<sub>2</sub> + (1 - &nu;)&epsilon;<sub>3</sub>"
+                "<span style='font-size: 120%;'>)</span>"
+                "</span>",
+            ),
+            (
+                "Stress uncertainty",
+                "<span style='font-style: italic;'>"
+                "u(&sigma;<sub>1</sub>) = |C| &radic;<span style='font-size: 115%;'>(</span>"
+                "((1 - &nu;)u(&epsilon;<sub>1</sub>))<sup>2</sup> + "
+                "(&nu;u(&epsilon;<sub>2</sub>))<sup>2</sup> + "
+                "(&nu;u(&epsilon;<sub>3</sub>))<sup>2</sup>"
+                "<span style='font-size: 115%;'>)</span>"
+                "<br/>"
+                "u(&sigma;<sub>2</sub>) = |C| &radic;<span style='font-size: 115%;'>(</span>"
+                "(&nu;u(&epsilon;<sub>1</sub>))<sup>2</sup> + "
+                "((1 - &nu;)u(&epsilon;<sub>2</sub>))<sup>2</sup> + "
+                "(&nu;u(&epsilon;<sub>3</sub>))<sup>2</sup>"
+                "<span style='font-size: 115%;'>)</span>"
+                "<br/>"
+                "u(&sigma;<sub>3</sub>) = |C| &radic;<span style='font-size: 115%;'>(</span>"
+                "(&nu;u(&epsilon;<sub>1</sub>))<sup>2</sup> + "
+                "(&nu;u(&epsilon;<sub>2</sub>))<sup>2</sup> + "
+                "((1 - &nu;)u(&epsilon;<sub>3</sub>))<sup>2</sup>"
+                "<span style='font-size: 115%;'>)</span>"
+                "</span>",
+            ),
+        ]
+
+        for title, html in equation_cards:
+            card = QFrame(content)
+            card.setStyleSheet(
+                "QFrame { background-color: white; border: 1px solid #d9d9d9; border-radius: 6px; }"
+            )
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(16, 14, 16, 14)
+            card_layout.setSpacing(8)
+
+            title_label = QLabel(title, card)
+            title_label.setStyleSheet(
+                "color: #444444; font-size: 15px; font-weight: 600; font-family: 'Segoe UI', sans-serif;"
+            )
+            card_layout.addWidget(title_label)
+
+            equation_label = QLabel(card)
+            equation_label.setTextFormat(Qt.RichText)
+            equation_label.setWordWrap(True)
+            equation_label.setText(html)
+            equation_label.setStyleSheet(
+                "color: black; font-size: 42px; font-family: 'Times New Roman', Georgia, serif;"
+            )
+            card_layout.addWidget(equation_label)
+            content_layout.addWidget(card)
+
+        notes_label = QLabel(
+            "E is Young's modulus in MPa. ν is Poisson's ratio. Stress uncertainties are only computed when all three strain uncertainties are available.",
+            content,
+        )
+        notes_label.setWordWrap(True)
+        notes_label.setStyleSheet(
+            "color: #444444; font-size: 14px; font-family: 'Segoe UI', sans-serif;"
+        )
+        content_layout.addWidget(notes_label)
+        content_layout.addStretch(1)
+
+        close_button = QPushButton("Close", dialog)
+        close_button.clicked.connect(dialog.close)
+        layout.addWidget(close_button, alignment=Qt.AlignRight)
+
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def set_project_path_label(self, path: Optional[Path]) -> None:
+        self.project_path = path
+        if path is None:
+            self.project_path_label.setText("No project saved or loaded")
+        else:
+            self.project_path_label.setText(f"Project: {path}")
+
+    def default_project_path(self) -> Path:
+        if self.project_path is not None:
+            return self.project_path
+        if self.mesh_path is not None:
+            return Path.cwd() / f"{self.mesh_path.stem}.simsetup"
+        return Path.cwd() / "sample_setup.simsetup"
+
+    def build_fit_state_payload(self) -> Optional[dict]:
+        if self.fit_transform is None:
+            return None
+        residual_rows = []
+        for measurement, stage_point, fit_error in self.residual_rows:
+            residual_rows.append(
+                {
+                    "measurement": {
+                        "label": measurement.label,
+                        "model_point": list(measurement.model_point),
+                        "stage_readout": list(measurement.stage_readout),
+                    },
+                    "stage_point": list(stage_point),
+                    "fit_error": float(fit_error),
+                }
+            )
+        return {
+            "rotation": [list(row) for row in self.fit_transform.rotation],
+            "translation": list(self.fit_transform.translation),
+            "quaternion_wxyz": list(self.fit_transform.quaternion_wxyz),
+            "rms_error": float(self.fit_transform.rms_error),
+            "max_error": float(self.fit_transform.max_error),
+            "residual_rows": residual_rows,
+            "report_text": self.report_box.toPlainText(),
+        }
+
+    def build_project_payload(self) -> dict:
+        return {
+            "version": PROJECT_ARCHIVE_VERSION,
+            "mesh": (
+                {
+                    "embedded_name": PROJECT_EMBEDDED_MESH_NAME,
+                    "original_name": self.mesh_path.name if self.mesh_path is not None else PROJECT_EMBEDDED_MESH_NAME,
+                    "format": "stl",
+                }
+                if self.model_mesh is not None and self.model_mesh.n_points > 0
+                else None
+            ),
+            "setup": {
+                "pivot_x": self.pivot_x.value(),
+                "pivot_y": self.pivot_y.value(),
+                "pivot_z": self.pivot_z.value(),
+                "theodolite_x": self.theodolite_x.value(),
+                "theodolite_y": self.theodolite_y.value(),
+                "theodolite_z": self.theodolite_z.value(),
+                "slit_x": self.slit_x.value(),
+                "slit_y": self.slit_y.value(),
+                "slit_z": self.slit_z.value(),
+                "slit_width": self.slit_width.value(),
+                "slit_height": self.slit_height.value(),
+                "beam_length": self.beam_length.value(),
+                "detector_width_y": self.detector_width_y.value(),
+                "detector_height_z": self.detector_height_z.value(),
+                "detector_map_pixel_size_y": self.detector_map_pixel_size_y.value(),
+                "detector_map_pixel_size_z": self.detector_map_pixel_size_z.value(),
+                "stage_size_x": self.stage_size_x.value(),
+                "stage_size_y": self.stage_size_y.value(),
+                "stage_size_z": self.stage_size_z.value(),
+                "stage_offset_x": self.stage_offset_x.value(),
+                "stage_offset_y": self.stage_offset_y.value(),
+                "stage_offset_z": self.stage_offset_z.value(),
+                "collimator": self.collimator.currentText(),
+                "count_time_material": self.count_time_material.currentText(),
+            },
+            "stage_pose": {
+                "x": self.pose_x.value(),
+                "y": self.pose_y.value(),
+                "z": self.pose_z.value(),
+                "omega": self.pose_omega.value(),
+            },
+            "manual_placement": {
+                "enabled": self.manual_placement_enabled_checkbox.isChecked(),
+                "tx": self.manual_tx.value(),
+                "ty": self.manual_ty.value(),
+                "tz": self.manual_tz.value(),
+                "rx": self.manual_rx.value(),
+                "ry": self.manual_ry.value(),
+                "rz": self.manual_rz.value(),
+            },
+            "fit_transform": self.build_fit_state_payload(),
+            "measurements": table_to_serializable_rows(self.measurement_table, TABLE_HEADERS),
+            "predictions": table_to_serializable_rows(self.prediction_table, PREDICTION_TABLE_HEADERS),
+            "view": {
+                "camera_preset": self.camera_preset,
+                "parallel_projection_enabled": bool(self.parallel_projection_enabled),
+                "viewer_font_size_offset": int(self.viewer_font_size_offset),
+                "active_tab": self.main_tabs.currentIndex() if self.main_tabs is not None else 0,
+                "auto_move_to_pivot": self.auto_move_to_pivot_checkbox.isChecked(),
+                "show_stage": self.show_stage_checkbox.isChecked(),
+                "show_beam": self.show_beam_checkbox.isChecked(),
+                "show_feature_points": self.show_feature_points_checkbox.isChecked(),
+                "show_prediction_points": self.show_prediction_points_checkbox.isChecked(),
+                "show_sample_triad": self.show_sample_triad_checkbox.isChecked(),
+                "show_theodolite_sight_line": self.show_theodolite_sight_line_checkbox.isChecked(),
+                "show_diffraction_vectors": self.show_diffraction_vectors_checkbox.isChecked(),
+            },
+        }
+
+    def save_project_dialog(self) -> None:
+        default_path = self.default_project_path()
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save project",
+            str(default_path),
+            PROJECT_FILE_FILTER,
+        )
+        if not path_str:
+            return
+        output_path = Path(path_str)
+        if output_path.suffix == "":
+            output_path = output_path.with_suffix(".simsetup")
+        try:
+            self.save_project(output_path)
+        except Exception as exc:
+            self.show_error("Failed to save project", str(exc))
+
+    def save_project(self, path: Path) -> None:
+        payload = self.build_project_payload()
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(PROJECT_MANIFEST_NAME, json.dumps(payload, indent=2))
+            if payload["mesh"] is not None:
+                archive.writestr(PROJECT_EMBEDDED_MESH_NAME, polydata_to_stl_bytes(self.model_mesh))
+        self.set_project_path_label(path)
+        self.statusBar().showMessage(f"Saved project to {path}", 5000)
+
+    def load_project_dialog(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load project",
+            str(self.default_project_path().parent),
+            PROJECT_FILE_FILTER,
+        )
+        if not path_str:
+            return
+        try:
+            self.load_project(Path(path_str))
+        except Exception as exc:
+            self.show_error("Failed to load project", str(exc))
+
+    def load_project(self, path: Path) -> None:
+        with zipfile.ZipFile(path, "r") as archive:
+            try:
+                payload = json.loads(archive.read(PROJECT_MANIFEST_NAME).decode("utf-8"))
+            except KeyError as exc:
+                raise ValueError("The selected file does not contain a SimSetup project manifest.") from exc
+
+            version = int(payload.get("version", 0))
+            if version != PROJECT_ARCHIVE_VERSION:
+                raise ValueError(
+                    f"Unsupported project version {version}. Expected version {PROJECT_ARCHIVE_VERSION}."
+                )
+
+            mesh_payload = payload.get("mesh")
+            loaded_mesh = None
+            loaded_mesh_path = None
+            if mesh_payload is not None:
+                embedded_name = mesh_payload.get("embedded_name", PROJECT_EMBEDDED_MESH_NAME)
+                try:
+                    mesh_bytes = archive.read(embedded_name)
+                except KeyError as exc:
+                    raise ValueError("The project archive is missing its embedded mesh file.") from exc
+                mesh_name = mesh_payload.get("original_name", PROJECT_EMBEDDED_MESH_NAME)
+                mesh_format = str(mesh_payload.get("format", "stl"))
+                loaded_mesh = load_mesh_bytes_as_polydata(mesh_bytes, mesh_name, file_type=mesh_format)
+                loaded_mesh_path = Path(mesh_name)
+
+        setup = payload.get("setup", {})
+        stage_pose = payload.get("stage_pose", {})
+        manual_placement = payload.get("manual_placement", {})
+        fit_payload = payload.get("fit_transform")
+        view = payload.get("view", {})
+
+        spin_box_values = (
+            (self.pivot_x, setup.get("pivot_x")),
+            (self.pivot_y, setup.get("pivot_y")),
+            (self.pivot_z, setup.get("pivot_z")),
+            (self.theodolite_x, setup.get("theodolite_x")),
+            (self.theodolite_y, setup.get("theodolite_y")),
+            (self.theodolite_z, setup.get("theodolite_z")),
+            (self.slit_x, setup.get("slit_x")),
+            (self.slit_y, setup.get("slit_y")),
+            (self.slit_z, setup.get("slit_z")),
+            (self.slit_width, setup.get("slit_width")),
+            (self.slit_height, setup.get("slit_height")),
+            (self.beam_length, setup.get("beam_length")),
+            (self.detector_width_y, setup.get("detector_width_y")),
+            (self.detector_height_z, setup.get("detector_height_z")),
+            (self.detector_map_pixel_size_y, setup.get("detector_map_pixel_size_y")),
+            (self.detector_map_pixel_size_z, setup.get("detector_map_pixel_size_z")),
+            (self.stage_size_x, setup.get("stage_size_x")),
+            (self.stage_size_y, setup.get("stage_size_y")),
+            (self.stage_size_z, setup.get("stage_size_z")),
+            (self.stage_offset_x, setup.get("stage_offset_x")),
+            (self.stage_offset_y, setup.get("stage_offset_y")),
+            (self.stage_offset_z, setup.get("stage_offset_z")),
+            (self.pose_x, stage_pose.get("x")),
+            (self.pose_y, stage_pose.get("y")),
+            (self.pose_z, stage_pose.get("z")),
+            (self.pose_omega, stage_pose.get("omega")),
+            (self.manual_tx, manual_placement.get("tx")),
+            (self.manual_ty, manual_placement.get("ty")),
+            (self.manual_tz, manual_placement.get("tz")),
+            (self.manual_rx, manual_placement.get("rx")),
+            (self.manual_ry, manual_placement.get("ry")),
+            (self.manual_rz, manual_placement.get("rz")),
+        )
+        spin_signal_states = [(box, box.blockSignals(True)) for box, _value in spin_box_values]
+        try:
+            for box, value in spin_box_values:
+                if value is not None:
+                    box.setValue(float(value))
+        finally:
+            for box, previous_state in spin_signal_states:
+                box.blockSignals(previous_state)
+
+        combo_states = [
+            (self.collimator, self.collimator.blockSignals(True)),
+            (self.count_time_material, self.count_time_material.blockSignals(True)),
+        ]
+        try:
+            collimator_text = setup.get("collimator")
+            if collimator_text is not None and self.collimator.findText(str(collimator_text)) >= 0:
+                self.collimator.setCurrentText(str(collimator_text))
+            material_text = setup.get("count_time_material")
+            if material_text is not None and self.count_time_material.findText(str(material_text)) >= 0:
+                self.count_time_material.setCurrentText(str(material_text))
+        finally:
+            for combo, previous_state in combo_states:
+                combo.blockSignals(previous_state)
+
+        checkbox_values = (
+            (self.manual_placement_enabled_checkbox, manual_placement.get("enabled")),
+            (self.auto_move_to_pivot_checkbox, view.get("auto_move_to_pivot")),
+            (self.parallel_projection_checkbox, view.get("parallel_projection_enabled")),
+            (self.show_stage_checkbox, view.get("show_stage")),
+            (self.show_beam_checkbox, view.get("show_beam")),
+            (self.show_feature_points_checkbox, view.get("show_feature_points")),
+            (self.show_prediction_points_checkbox, view.get("show_prediction_points")),
+            (self.show_sample_triad_checkbox, view.get("show_sample_triad")),
+            (self.show_theodolite_sight_line_checkbox, view.get("show_theodolite_sight_line")),
+            (self.show_diffraction_vectors_checkbox, view.get("show_diffraction_vectors")),
+        )
+        checkbox_signal_states = [(checkbox, checkbox.blockSignals(True)) for checkbox, _value in checkbox_values]
+        try:
+            for checkbox, value in checkbox_values:
+                if value is not None:
+                    checkbox.setChecked(bool(value))
+        finally:
+            for checkbox, previous_state in checkbox_signal_states:
+                checkbox.blockSignals(previous_state)
+
+        populate_table_from_serialized_rows(
+            self.measurement_table,
+            TABLE_HEADERS,
+            payload.get("measurements", []),
+        )
+        populate_table_from_serialized_rows(
+            self.prediction_table,
+            PREDICTION_TABLE_HEADERS,
+            payload.get("predictions", []),
+            read_only_columns=(7, 8, 9, 10),
+        )
+
+        if loaded_mesh is None:
+            self.model_mesh = None
+            self.mesh_path = None
+            self.mesh_path_label.setText("No mesh loaded")
+        else:
+            self.model_mesh = loaded_mesh
+            self.mesh_path = loaded_mesh_path
+            self.mesh_path_label.setText(str(loaded_mesh_path))
+
+        self.csv_path_label.setText(f"Measurements restored from project {path.name}")
+        self.set_project_path_label(path)
+        self.viewer_font_size_offset = int(view.get("viewer_font_size_offset", self.viewer_font_size_offset))
+        self.parallel_projection_enabled = bool(
+            view.get("parallel_projection_enabled", self.parallel_projection_enabled)
+        )
+        self.camera_preset = str(view.get("camera_preset", self.camera_preset))
+        self.sync_view_button_states()
+
+        self.fit_transform = None
+        self.residual_rows = []
+        if fit_payload is not None:
+            self.fit_transform = Transform(
+                rotation=tuple(tuple(float(value) for value in row) for row in fit_payload["rotation"]),
+                translation=tuple(float(value) for value in fit_payload["translation"]),
+                quaternion_wxyz=tuple(float(value) for value in fit_payload["quaternion_wxyz"]),
+                rms_error=float(fit_payload["rms_error"]),
+                max_error=float(fit_payload["max_error"]),
+            )
+            residual_rows = []
+            for residual_row in fit_payload.get("residual_rows", []):
+                measurement_payload = residual_row["measurement"]
+                measurement = Measurement(
+                    label=str(measurement_payload["label"]),
+                    model_point=tuple(float(value) for value in measurement_payload["model_point"]),
+                    stage_readout=tuple(float(value) for value in measurement_payload["stage_readout"]),
+                )
+                residual_rows.append(
+                    (
+                        measurement,
+                        np.array(residual_row["stage_point"], dtype=float),
+                        float(residual_row["fit_error"]),
+                    )
+                )
+            self.residual_rows = residual_rows
+            report_text = fit_payload.get("report_text")
+            if isinstance(report_text, str) and report_text.strip():
+                self.report_box.setPlainText(report_text)
+            else:
+                self.report_box.setPlainText(self.build_fit_report(self.fit_transform, self.residual_rows))
+        else:
+            self.report_box.setPlainText(
+                "Project loaded.\n\nNo saved fit transform was present.\n"
+                "Run Fit placement or enable Manual Sample Placement to establish a transform."
+            )
+
+        self.update_placement_status()
+        self.update_placement_summary_fields()
+        self.invalidate_detector_map(update_scene=False)
+        self.update_scene(reset_camera=True)
+        if self.main_tabs is not None:
+            active_tab = int(view.get("active_tab", 0))
+            self.main_tabs.setCurrentIndex(max(0, min(active_tab, self.main_tabs.count() - 1)))
+        self.statusBar().showMessage(f"Loaded project {path.name}", 5000)
 
     def load_csv(self, path: Path) -> None:
         self.csv_path_label.setText(str(path))
@@ -2317,7 +3671,13 @@ class MainWindow(QMainWindow):
                     if value is None or value.strip() == "":
                         raise ValueError(f"Row {row_index + 2} is missing a model coordinate.")
                     model_values.append(float(value))
-                self.add_prediction_row(label=label, model_point=model_values, stage_readout=("", "", ""))
+                self.add_prediction_row(
+                    label=label,
+                    model_point=model_values,
+                    stage_readout=("", "", ""),
+                    path_values=("", ""),
+                    uamp_values=("", ""),
+                )
         self.statusBar().showMessage(f"Loaded prediction points from {path.name}", 5000)
         self.update_scene(reset_camera=False)
 
@@ -2348,7 +3708,19 @@ class MainWindow(QMainWindow):
             with Path(path_str).open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(
-                    ["label", "model_x", "model_y", "model_z", "stage_x", "stage_y", "stage_z", "path_1", "path_2"]
+                    [
+                        "label",
+                        "model_x",
+                        "model_y",
+                        "model_z",
+                        "stage_x",
+                        "stage_y",
+                        "stage_z",
+                        "path_1",
+                        "path_2",
+                        "uamp1",
+                        "uamp2",
+                    ]
                 )
                 for row in range(self.prediction_table.rowCount()):
                     values = []
@@ -2537,7 +3909,7 @@ class MainWindow(QMainWindow):
                 stage_readout_local = self.stage_readout_for_model_point(model_point)
                 bank_1_state, bank_2_state = self.compute_diffraction_bank_states_for_pose(stage_readout_local, omega_deg)
                 for index, value in enumerate(
-                    (bank_1_state["average_length"], bank_2_state["average_length"]),
+                    (float(bank_1_state["average_length"]), float(bank_2_state["average_length"])),
                     start=7,
                 ):
                     item = self.prediction_table.item(row, index)
@@ -2545,15 +3917,155 @@ class MainWindow(QMainWindow):
                         item = QTableWidgetItem()
                         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                         self.prediction_table.setItem(row, index, item)
-                    item.setText(format_decimal(float(value)))
-            self.statusBar().showMessage(
-                "Generated diffraction path columns for prediction points using the current live Omega.",
-                5000,
-            )
+                    item.setText(f"{float(value):.1f}")
+            self.statusBar().showMessage("Generated diffraction path columns using the current live Omega.", 5000)
         except Exception as exc:
             self.show_error("Generate diffraction paths failed", str(exc))
         finally:
             self.prediction_table.blockSignals(was_blocked)
+
+    def generate_prediction_estimated_times(self) -> None:
+        if self.prediction_table.rowCount() == 0:
+            self.show_error("No prediction rows", "Add one or more prediction rows first.")
+            return
+
+        gauge_volume_mm3 = self.slit_width.value() * self.slit_height.value() * float(self.collimator.currentText())
+        count_time_material = self.count_time_material.currentText()
+        was_blocked = self.prediction_table.blockSignals(True)
+        try:
+            for row in range(self.prediction_table.rowCount()):
+                path_values = []
+                for column in (7, 8):
+                    item = self.prediction_table.item(row, column)
+                    text = "" if item is None else item.text().strip()
+                    if text == "":
+                        raise ValueError(
+                            f"Prediction row {row + 1} is missing Path {column - 6}. Generate paths first."
+                        )
+                    path_values.append(float(text))
+                for index, value in enumerate(
+                    (
+                        enginx_rietveld_count_time_minutes(path_values[0], gauge_volume_mm3, count_time_material),
+                        enginx_rietveld_count_time_minutes(path_values[1], gauge_volume_mm3, count_time_material),
+                    ),
+                    start=9,
+                ):
+                    item = self.prediction_table.item(row, index)
+                    if item is None:
+                        item = QTableWidgetItem()
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        self.prediction_table.setItem(row, index, item)
+                    item.setText(str(int(np.ceil(float(value)))))
+            self.statusBar().showMessage(
+                f"Estimated Rietveld count times using {count_time_material} and the current gauge volume.",
+                5000,
+            )
+        except Exception as exc:
+            self.show_error("Estimate time failed", str(exc))
+        finally:
+            self.prediction_table.blockSignals(was_blocked)
+
+    def prompt_scan_file_options(self, default_title: str = "scan_file") -> Optional[Tuple[str, str]]:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Scan file options")
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        title_edit = QLineEdit(default_title, dialog)
+        bank_combo = QComboBox(dialog)
+        bank_combo.addItems(["Both banks", "Bank 1", "Bank 2"])
+        form.addRow("Title", title_edit)
+        form.addRow("Banks", bank_combo)
+        layout.addLayout(form)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+        title = title_edit.text().strip() or default_title
+        return title, bank_combo.currentText()
+
+    def create_prediction_scan_file(self) -> None:
+        if self.prediction_table.rowCount() == 0:
+            self.show_error("No prediction rows", "Add one or more prediction rows first.")
+            return
+
+        scan_rows: List[Tuple[float, float, float, float, int]] = []
+        omega_deg = float(self.pose_omega.value())
+        scan_options = self.prompt_scan_file_options()
+        if scan_options is None:
+            return
+        title, bank_selection = scan_options
+        try:
+            for row in range(self.prediction_table.rowCount()):
+                stage_values = []
+                for column, axis_name in zip((4, 5, 6), ("X", "Y", "Z")):
+                    item = self.prediction_table.item(row, column)
+                    text = "" if item is None else item.text().strip()
+                    if text == "":
+                        raise ValueError(
+                            f"Prediction row {row + 1} is missing Stage {axis_name}. Generate stage readouts first."
+                        )
+                    stage_values.append(float(text))
+
+                uamp_values = []
+                for column, label in zip((9, 10), ("UAmp1", "UAmp2")):
+                    item = self.prediction_table.item(row, column)
+                    text = "" if item is None else item.text().strip()
+                    if text == "":
+                        raise ValueError(
+                            f"Prediction row {row + 1} is missing {label}. Estimate time first."
+                        )
+                    uamp_values.append(float(text))
+
+                if bank_selection == "Bank 1":
+                    selected_uamp = int(np.ceil(uamp_values[0]))
+                elif bank_selection == "Bank 2":
+                    selected_uamp = int(np.ceil(uamp_values[1]))
+                else:
+                    selected_uamp = int(np.ceil(max(uamp_values)))
+                scan_rows.append((stage_values[0], stage_values[1], stage_values[2], omega_deg, selected_uamp))
+        except Exception as exc:
+            self.show_error("Create scan file failed", str(exc))
+            return
+
+        default_path = Path.cwd() / "scan_file.txt"
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Create scan file",
+            str(default_path),
+            "Text files (*.txt);;All files (*.*)",
+        )
+        if not path_str:
+            return
+
+        output_path = Path(path_str)
+
+        try:
+            with output_path.open("w", newline="", encoding="utf-8") as handle:
+                handle.write(f"{title}\n")
+                handle.write("1\n")
+                handle.write(f"{len(scan_rows)}\n")
+                for stage_x, stage_y, stage_z, omega_value, uamp_value in scan_rows:
+                    handle.write(
+                        "\t".join(
+                            [
+                                f"{stage_x:.3f}",
+                                f"{stage_y:.3f}",
+                                f"{stage_z:.3f}",
+                                format_scan_numeric(omega_value, decimals=3),
+                                str(int(uamp_value)),
+                            ]
+                        )
+                        + "\n"
+                    )
+            self.statusBar().showMessage(f"Created scan file {output_path}", 5000)
+        except Exception as exc:
+            self.show_error("Create scan file failed", str(exc))
 
     def on_manual_placement_mode_toggled(self, checked: bool) -> None:
         self.update_placement_status()
@@ -2754,8 +4266,6 @@ class MainWindow(QMainWindow):
 
     def move_selected_prediction_point_to_pivot(self, show_error: bool = True) -> None:
         try:
-            if self.fit_transform is None and not self.manual_placement_enabled_checkbox.isChecked():
-                raise ValueError("Run Fit placement or enable manual placement before moving a point to the pivot.")
             prediction_row = self.selected_prediction_row()
             if prediction_row is None:
                 raise ValueError("Select a prediction row first.")
@@ -2896,20 +4406,10 @@ class MainWindow(QMainWindow):
             raise ValueError("Load a sample mesh before computing the diffraction map.")
 
         pivot = np.array(self.current_pivot_world(), dtype=float)
+        signed_distance_evaluator = build_mesh_signed_distance_evaluator(model_world)
         horizontal_angles_deg, vertical_angles_deg = self.diffraction_angle_axes()
         slit_center = np.array([self.slit_x.value(), self.slit_y.value(), self.slit_z.value()], dtype=float)
-        slit_width = self.slit_width.value()
-        slit_height = self.slit_height.value()
-        _incoming_y, _incoming_z, incoming_path_map = compute_incoming_beam_average_map(
-            model_world,
-            slit_center,
-            slit_width,
-            slit_height,
-            len(horizontal_angles_deg),
-            len(vertical_angles_deg),
-            pivot[0],
-        )
-        incoming_average_path = float(np.mean(incoming_path_map)) if incoming_path_map.size else 0.0
+        incoming_path_length = compute_incoming_beam_path_to_point(model_world, slit_center, pivot)
         stage_pose_info = {
             "x": float(stage_readout_local[0]),
             "y": float(stage_readout_local[1]),
@@ -2922,8 +4422,9 @@ class MainWindow(QMainWindow):
             self.current_diffraction_bank_1_geometry(),
             horizontal_angles_deg,
             vertical_angles_deg,
-            incoming_average_path,
+            incoming_path_length,
             stage_pose_info,
+            signed_distance_evaluator,
         )
         bank_2_state = self._compute_single_diffraction_bank_map(
             model_world,
@@ -2931,8 +4432,9 @@ class MainWindow(QMainWindow):
             self.current_diffraction_bank_2_geometry(),
             horizontal_angles_deg,
             vertical_angles_deg,
-            incoming_average_path,
+            incoming_path_length,
             stage_pose_info,
+            signed_distance_evaluator,
         )
         return bank_1_state, bank_2_state
 
@@ -2943,24 +4445,25 @@ class MainWindow(QMainWindow):
         detector_geometry: dict,
         horizontal_angles_deg: np.ndarray,
         vertical_angles_deg: np.ndarray,
-        incoming_average_path: float,
+        incoming_path_length: float,
         stage_pose_info: dict,
+        signed_distance_evaluator: Callable[[np.ndarray], float],
     ) -> dict:
         center_direction = normalized(detector_geometry["center"] - pivot)
         right = detector_geometry["right"]
         up = detector_geometry["up"]
+        horizontal_scales = np.tan(np.radians(horizontal_angles_deg))
+        vertical_scales = np.tan(np.radians(vertical_angles_deg))
         path_map = np.full(
             (len(horizontal_angles_deg), len(vertical_angles_deg)),
-            incoming_average_path,
+            incoming_path_length,
             dtype=float,
         )
         detector_points = np.zeros((len(horizontal_angles_deg), len(vertical_angles_deg), 3), dtype=float)
         all_segments: List[Tuple[np.ndarray, np.ndarray]] = []
 
-        for h_index, horizontal_deg in enumerate(horizontal_angles_deg):
-            horizontal_scale = np.tan(np.radians(horizontal_deg))
-            for v_index, vertical_deg in enumerate(vertical_angles_deg):
-                vertical_scale = np.tan(np.radians(vertical_deg))
+        for h_index, horizontal_scale in enumerate(horizontal_scales):
+            for v_index, vertical_scale in enumerate(vertical_scales):
                 ray_direction = normalized(center_direction + horizontal_scale * right + vertical_scale * up)
                 denominator = float(np.dot(ray_direction, detector_geometry["normal"]))
                 if abs(denominator) < 1e-12:
@@ -2974,7 +4477,13 @@ class MainWindow(QMainWindow):
                 detector_points[h_index, v_index] = (
                     detector_point + detector_geometry["normal"] * (DETECTOR_THICKNESS / 2.0 + 0.2)
                 )
-                path_length, segments = compute_segment_path_length(model_world, pivot, detector_point)
+                path_length, segments = compute_segment_path_length(
+                    model_world,
+                    pivot,
+                    detector_point,
+                    signed_distance_evaluator=signed_distance_evaluator,
+                    collect_segments=False,
+                )
                 path_map[h_index, v_index] += path_length
                 all_segments.extend(segments)
 
@@ -2997,7 +4506,7 @@ class MainWindow(QMainWindow):
             "detector_height": float(detector_geometry["height"]),
             "max_length": max_length,
             "average_length": average_length,
-            "incoming_average_path": incoming_average_path,
+            "incoming_path_length": incoming_path_length,
             "interval_deg": float(DIFFRACTION_ANGLE_INTERVAL_DEG),
             "segments": all_segments,
             "stage_pose": stage_pose_info,
@@ -3768,6 +5277,7 @@ class MainWindow(QMainWindow):
             render=False,
         )
         if self.detector_map_state is not None:
+            remove_scalar_bar_if_present(self.plotter, "Imaging path")
             detector_map_mesh = self.detector_map_state["mesh"]
             detector_map_max = max(float(self.detector_map_state["max_length"]), 1e-9)
             self.set_or_add_mesh(
@@ -3791,6 +5301,7 @@ class MainWindow(QMainWindow):
                 },
             )
         elif self.detector_map_mesh is not None:
+            remove_scalar_bar_if_present(self.plotter, "Imaging path")
             self.plotter.remove_actor("detector_map", render=False)
             self.detector_map_mesh = None
 
@@ -3800,6 +5311,7 @@ class MainWindow(QMainWindow):
             if state is not None
         ]
         if diffraction_states:
+            remove_scalar_bar_if_present(self.plotter, "Diffraction path")
             shared_diffraction_map_max = max(max(float(state["max_length"]), 1e-9) for state in diffraction_states)
             shared_diffraction_map_kwargs = {
                 "scalars": "path_length",
@@ -3846,6 +5358,7 @@ class MainWindow(QMainWindow):
                     **bank_2_kwargs,
                 )
         else:
+            remove_scalar_bar_if_present(self.plotter, "Diffraction path")
             if self.diffraction_bank_1_map_mesh is not None:
                 self.plotter.remove_actor("diffraction_detector_bank_1_map", render=False)
                 self.diffraction_bank_1_map_mesh = None
