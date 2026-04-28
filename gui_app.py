@@ -14,9 +14,10 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import numpy as np
 import pyvista as pv
 import trimesh
-from PyQt5.QtCore import QEvent, QRect, QSize, Qt
-from PyQt5.QtGui import QKeySequence, QPainter
+from PyQt5.QtCore import QEvent, QPointF, QRect, QSize, Qt, QTimer
+from PyQt5.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import (
+    QAbstractScrollArea,
     QApplication,
     QAbstractItemView,
     QButtonGroup,
@@ -32,6 +33,7 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QMainWindow,
     QMessageBox,
@@ -46,6 +48,7 @@ from PyQt5.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -138,6 +141,8 @@ PROJECT_MANIFEST_NAME = "project.json"
 PROJECT_EMBEDDED_MESH_NAME = "mesh.stl"
 PROJECT_FILE_FILTER = "SimSetup project (*.simsetup);;All files (*.*)"
 MICROSTRAIN_SCALE = 1_000_000.0
+DEFAULT_UI_FONT_POINT_SIZE = 7.0
+MIN_UI_FONT_POINT_SIZE = 3.0
 
 RIETVELD_COUNT_TIME_LAWS = {
     "Al": np.array([0.8, 0.9, 1.1, 1.2], dtype=float),
@@ -175,14 +180,470 @@ def format_fixed_decimal(value: float, decimals: int = 6) -> str:
     return f"{float(value):.{decimals}f}"
 
 
+def current_application_ui_font_size(app: QApplication) -> float:
+    font = QFont(app.font())
+    if font.pointSizeF() > 0:
+        return float(font.pointSizeF())
+    if font.pointSize() > 0:
+        return float(font.pointSize())
+    return DEFAULT_UI_FONT_POINT_SIZE
+
+
+def apply_application_ui_font(app: QApplication, point_size: float = DEFAULT_UI_FONT_POINT_SIZE) -> None:
+    target_size = max(MIN_UI_FONT_POINT_SIZE, min(18.0, float(point_size)))
+    font = QFont(app.font())
+    if font.pointSizeF() > 0:
+        font.setPointSizeF(target_size)
+    else:
+        font.setPointSize(int(round(target_size)))
+    app.setFont(font)
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
+class NoWheelComboBox(QComboBox):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setMaximumWidth(150)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
 def make_spin_box(value: float, minimum: float, maximum: float, step: float = 1.0) -> QDoubleSpinBox:
-    box = QDoubleSpinBox()
+    box = NoWheelDoubleSpinBox()
     box.setDecimals(3)
     box.setRange(minimum, maximum)
     box.setValue(value)
     box.setSingleStep(step)
     box.setKeyboardTracking(False)
+    box.setMaximumWidth(150)
+    box.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
     return box
+
+
+def make_form_layout(parent: Optional[QWidget] = None, *, compact_fields: bool = False) -> QFormLayout:
+    layout = QFormLayout(parent)
+    if compact_fields:
+        layout.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+    return layout
+
+
+class FlowLayout(QLayout):
+    def __init__(self, parent: Optional[QWidget] = None, margin: int = 0, spacing: int = 0) -> None:
+        super().__init__(parent)
+        self._items = []
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+
+    def addItem(self, item) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        left, top, right, bottom = self.getContentsMargins()
+        size += QSize(left + right, top + bottom)
+        return size
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        left, top, right, bottom = self.getContentsMargins()
+        effective_rect = rect.adjusted(left, top, -right, -bottom)
+        x = effective_rect.x()
+        y = effective_rect.y()
+        line_height = 0
+        spacing = self.spacing()
+
+        for item in self._items:
+            item_size = item.sizeHint()
+            next_x = x + item_size.width() + spacing
+            if x > effective_rect.x() and next_x - spacing > effective_rect.right() + 1:
+                x = effective_rect.x()
+                y += line_height + spacing
+                next_x = x + item_size.width() + spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(x, y, item_size.width(), item_size.height()))
+            x = next_x
+            line_height = max(line_height, item_size.height())
+
+        return y + line_height - rect.y() + bottom
+
+
+def render_toolbar_toggle_icon(kind: str, color: QColor, size: int = 24) -> QPixmap:
+    pixel_ratio = 3.0
+    pixmap = QPixmap(int(round(size * pixel_ratio)), int(round(size * pixel_ratio)))
+    pixmap.setDevicePixelRatio(pixel_ratio)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+    pen = QPen(color, 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    c = size / 2.0
+
+    def draw_arrow(start: QPointF, end: QPointF, head_a: QPointF, head_b: QPointF) -> None:
+        painter.drawLine(start, end)
+        painter.drawLine(end, head_a)
+        painter.drawLine(end, head_b)
+
+    def draw_corner_label(text: str, align: int = Qt.AlignTop | Qt.AlignLeft) -> None:
+        font = QFont()
+        font.setBold(True)
+        font.setPixelSize(8)
+        painter.save()
+        painter.setFont(font)
+        painter.drawText(QRect(2, 2, size - 4, size - 4), align, text)
+        painter.restore()
+
+    if kind == "parallel":
+        painter.drawRect(QRect(4, 4, size - 8, size - 8))
+        painter.drawLine(int(c - 4), 6, int(c - 4), size - 6)
+        painter.drawLine(int(c + 4), 6, int(c + 4), size - 6)
+    elif kind == "stage":
+        top = QPolygonF(
+            [
+                QPointF(5, c - 2),
+                QPointF(c, 5),
+                QPointF(size - 5, c - 2),
+                QPointF(c, c + 3),
+            ]
+        )
+        front = QPolygonF(
+            [
+                QPointF(5, c - 2),
+                QPointF(5, size - 8),
+                QPointF(c, size - 5),
+                QPointF(c, c + 3),
+            ]
+        )
+        side = QPolygonF(
+            [
+                QPointF(c, c + 3),
+                QPointF(c, size - 5),
+                QPointF(size - 5, size - 8),
+                QPointF(size - 5, c - 2),
+            ]
+        )
+        painter.drawPolygon(top)
+        painter.drawPolygon(front)
+        painter.drawPolygon(side)
+    elif kind == "beam":
+        painter.drawLine(4, int(c), size - 7, int(c))
+        painter.drawLine(size - 10, int(c - 4), size - 5, int(c))
+        painter.drawLine(size - 10, int(c + 4), size - 5, int(c))
+    elif kind == "cube":
+        front = QRect(5, 8, 9, 9)
+        back = QRect(8, 5, 9, 9)
+        painter.drawRect(front)
+        painter.drawRect(back)
+        painter.drawLine(front.topLeft(), back.topLeft())
+        painter.drawLine(front.topRight(), back.topRight())
+        painter.drawLine(front.bottomLeft(), back.bottomLeft())
+        painter.drawLine(front.bottomRight(), back.bottomRight())
+    elif kind == "imaging":
+        painter.drawRect(QRect(4, 6, size - 8, size - 12))
+        painter.drawLine(int(c), 3, int(c), 6)
+        painter.drawLine(int(c), size - 6, int(c), size - 3)
+        painter.drawLine(7, int(c), size - 7, int(c))
+    elif kind == "features":
+        painter.setBrush(color)
+        for point in ((6, 7), (15, 6), (10, 12), (16, 16), (6, 16)):
+            painter.drawEllipse(QPointF(point[0], point[1]), 2.2, 2.2)
+    elif kind == "predicted":
+        painter.drawEllipse(QPointF(c, c), 7.0, 7.0)
+        painter.drawEllipse(QPointF(c, c), 3.0, 3.0)
+        painter.drawLine(int(c), 3, int(c), 7)
+        painter.drawLine(int(c), size - 7, int(c), size - 3)
+        painter.drawLine(3, int(c), 7, int(c))
+        painter.drawLine(size - 7, int(c), size - 3, int(c))
+    elif kind == "triad":
+        origin = QPointF(6, size - 6)
+        painter.drawLine(origin, QPointF(size - 5, size - 6))
+        painter.drawLine(origin, QPointF(6, 5))
+        painter.drawLine(origin, QPointF(size - 6, 6))
+        painter.drawLine(size - 8, size - 8, size - 5, size - 6)
+        painter.drawLine(size - 8, size - 4, size - 5, size - 6)
+        painter.drawLine(4, 8, 6, 5)
+        painter.drawLine(8, 8, 6, 5)
+        painter.drawLine(size - 8, 9, size - 6, 6)
+        painter.drawLine(size - 10, 6, size - 6, 6)
+    elif kind == "sight":
+        painter.drawEllipse(QPointF(6, c), 2.5, 2.5)
+        painter.drawLine(8, int(c), size - 8, int(c))
+        painter.drawEllipse(QPointF(size - 6, c), 4.0, 4.0)
+        painter.drawLine(size - 10, int(c), size - 2, int(c))
+        painter.drawLine(size - 6, int(c - 4), size - 6, int(c + 4))
+    elif kind == "diffraction":
+        origin = QPointF(c - 1, c)
+        painter.drawLine(origin, QPointF(size - 5, 6))
+        painter.drawLine(origin, QPointF(size - 5, size - 6))
+        painter.drawLine(size - 9, 7, size - 5, 6)
+        painter.drawLine(size - 8, 10, size - 5, 6)
+        painter.drawLine(size - 9, size - 7, size - 5, size - 6)
+        painter.drawLine(size - 8, size - 10, size - 5, size - 6)
+        painter.drawLine(4, int(c), int(c - 2), int(c))
+    elif kind == "cam_iso":
+        top = QPolygonF(
+            [
+                QPointF(7, c - 4),
+                QPointF(c, 5),
+                QPointF(size - 7, c - 4),
+                QPointF(c, c + 1),
+            ]
+        )
+        front = QPolygonF(
+            [
+                QPointF(7, c - 4),
+                QPointF(7, size - 8),
+                QPointF(c, size - 5),
+                QPointF(c, c + 1),
+            ]
+        )
+        side = QPolygonF(
+            [
+                QPointF(c, c + 1),
+                QPointF(c, size - 5),
+                QPointF(size - 7, size - 8),
+                QPointF(size - 7, c - 4),
+            ]
+        )
+        painter.drawPolygon(top)
+        painter.drawPolygon(front)
+        painter.drawPolygon(side)
+        painter.drawLine(QPointF(c, c + 1), QPointF(c, 3))
+        painter.drawLine(QPointF(c, c + 1), QPointF(size - 3, c + 1))
+        painter.drawLine(QPointF(c, c + 1), QPointF(4, size - 4))
+    elif kind == "cam_px":
+        draw_arrow(QPointF(5, c), QPointF(size - 5, c), QPointF(size - 9, c - 4), QPointF(size - 9, c + 4))
+        draw_corner_label("X")
+    elif kind == "cam_nx":
+        draw_arrow(QPointF(size - 5, c), QPointF(5, c), QPointF(9, c - 4), QPointF(9, c + 4))
+        draw_corner_label("X")
+    elif kind == "cam_py":
+        draw_arrow(QPointF(c, size - 5), QPointF(c, 5), QPointF(c - 4, 9), QPointF(c + 4, 9))
+        draw_corner_label("Y", Qt.AlignTop | Qt.AlignRight)
+    elif kind == "cam_ny":
+        draw_arrow(QPointF(c, 5), QPointF(c, size - 5), QPointF(c - 4, size - 9), QPointF(c + 4, size - 9))
+        draw_corner_label("Y", Qt.AlignTop | Qt.AlignRight)
+    elif kind == "cam_pz":
+        draw_arrow(
+            QPointF(6, size - 6),
+            QPointF(size - 6, 6),
+            QPointF(size - 10, 6),
+            QPointF(size - 6, 10),
+        )
+        draw_corner_label("Z", Qt.AlignBottom | Qt.AlignLeft)
+    elif kind == "cam_nz":
+        draw_arrow(
+            QPointF(size - 6, 6),
+            QPointF(6, size - 6),
+            QPointF(6, size - 10),
+            QPointF(10, size - 6),
+        )
+        draw_corner_label("Z", Qt.AlignBottom | Qt.AlignLeft)
+    elif kind == "cam_theodolite":
+        painter.drawEllipse(QPointF(c, 8), 3.5, 3.5)
+        painter.drawLine(QPointF(c - 5, 8), QPointF(c + 5, 8))
+        painter.drawLine(QPointF(c, 12), QPointF(c - 5, size - 5))
+        painter.drawLine(QPointF(c, 12), QPointF(c, size - 4))
+        painter.drawLine(QPointF(c, 12), QPointF(c + 5, size - 5))
+        painter.drawLine(QPointF(c + 3, 8), QPointF(size - 4, 6))
+    elif kind == "act_add":
+        painter.drawLine(QPointF(c, 5), QPointF(c, size - 5))
+        painter.drawLine(QPointF(5, c), QPointF(size - 5, c))
+    elif kind == "act_remove":
+        painter.drawLine(QPointF(5, c), QPointF(size - 5, c))
+    elif kind == "act_load":
+        painter.drawRect(QRect(5, 8, size - 10, size - 11))
+        painter.drawLine(QPointF(c, 4), QPointF(c, 13))
+        painter.drawLine(QPointF(c, 13), QPointF(c - 4, 9))
+        painter.drawLine(QPointF(c, 13), QPointF(c + 4, 9))
+    elif kind == "act_save":
+        painter.drawRect(QRect(5, 5, size - 10, size - 10))
+        painter.drawLine(QPointF(8, 8), QPointF(size - 8, 8))
+        painter.drawRect(QRect(8, size - 12, size - 16, 5))
+    elif kind == "act_move_pivot":
+        painter.drawEllipse(QPointF(c, c), 6.5, 6.5)
+        painter.drawLine(QPointF(c, 3), QPointF(c, 7))
+        painter.drawLine(QPointF(c, size - 7), QPointF(c, size - 3))
+        painter.drawLine(QPointF(3, c), QPointF(7, c))
+        painter.drawLine(QPointF(size - 7, c), QPointF(size - 3, c))
+        painter.drawLine(QPointF(5, size - 5), QPointF(c - 2, c + 2))
+        painter.drawLine(QPointF(c - 2, c + 2), QPointF(c - 4, c + 5))
+        painter.drawLine(QPointF(c - 2, c + 2), QPointF(c + 2, c + 3))
+    elif kind == "act_readouts":
+        painter.drawRect(QRect(4, 5, 9, size - 10))
+        painter.drawLine(QPointF(4, 11), QPointF(13, 11))
+        painter.drawLine(QPointF(4, 17), QPointF(13, 17))
+        painter.drawLine(QPointF(8.5, 5), QPointF(8.5, size - 5))
+        draw_arrow(QPointF(15, c), QPointF(size - 4, c), QPointF(size - 8, c - 4), QPointF(size - 8, c + 4))
+    elif kind == "act_paths":
+        painter.drawLine(QPointF(5, c), QPointF(10, c))
+        painter.drawLine(QPointF(10, c), QPointF(size - 6, 6))
+        painter.drawLine(QPointF(10, c), QPointF(size - 6, size - 6))
+        painter.drawLine(QPointF(size - 10, 7), QPointF(size - 6, 6))
+        painter.drawLine(QPointF(size - 9, 10), QPointF(size - 6, 6))
+        painter.drawLine(QPointF(size - 10, size - 7), QPointF(size - 6, size - 6))
+        painter.drawLine(QPointF(size - 9, size - 10), QPointF(size - 6, size - 6))
+    elif kind == "act_time":
+        painter.drawEllipse(QPointF(c, c), 7.0, 7.0)
+        painter.drawLine(QPointF(c, c), QPointF(c, 8))
+        painter.drawLine(QPointF(c, c), QPointF(size - 8, c))
+    elif kind == "act_scan":
+        painter.drawRect(QRect(6, 4, size - 11, size - 8))
+        painter.drawLine(QPointF(size - 9, 4), QPointF(size - 5, 8))
+        painter.drawLine(QPointF(9, 10), QPointF(size - 9, 10))
+        painter.drawLine(QPointF(9, 14), QPointF(size - 9, 14))
+        painter.drawLine(QPointF(9, 18), QPointF(size - 12, 18))
+    elif kind == "act_mesh_clear":
+        top = QPolygonF(
+            [
+                QPointF(7, c - 3),
+                QPointF(c, 6),
+                QPointF(size - 7, c - 3),
+                QPointF(c, c + 1),
+            ]
+        )
+        painter.drawPolygon(top)
+        painter.drawLine(QPointF(7, c - 3), QPointF(7, size - 8))
+        painter.drawLine(QPointF(size - 7, c - 3), QPointF(size - 7, size - 8))
+        painter.drawLine(QPointF(7, size - 8), QPointF(c, size - 5))
+        painter.drawLine(QPointF(size - 7, size - 8), QPointF(c, size - 5))
+        painter.drawLine(QPointF(c - 3, c - 2), QPointF(c + 3, c + 4))
+        painter.drawLine(QPointF(c + 3, c - 2), QPointF(c - 3, c + 4))
+    elif kind == "act_fit":
+        painter.drawRect(QRect(6, 6, size - 12, size - 12))
+        painter.drawLine(QPointF(c, 4), QPointF(c, 8))
+        painter.drawLine(QPointF(c, size - 8), QPointF(c, size - 4))
+        painter.drawLine(QPointF(4, c), QPointF(8, c))
+        painter.drawLine(QPointF(size - 8, c), QPointF(size - 4, c))
+        painter.drawEllipse(QPointF(c, c), 2.5, 2.5)
+    elif kind == "act_export":
+        painter.drawRect(QRect(6, 4, size - 11, size - 8))
+        painter.drawLine(QPointF(size - 9, 4), QPointF(size - 5, 8))
+        painter.drawLine(QPointF(9, 10), QPointF(size - 12, 10))
+        painter.drawLine(QPointF(9, 14), QPointF(size - 14, 14))
+        draw_arrow(QPointF(9, size - 8), QPointF(size - 5, size - 8), QPointF(size - 9, size - 12), QPointF(size - 9, size - 4))
+    elif kind == "act_pick":
+        painter.drawEllipse(QPointF(c, c), 6.5, 6.5)
+        painter.drawLine(QPointF(c, 3), QPointF(c, 7))
+        painter.drawLine(QPointF(c, size - 7), QPointF(c, size - 3))
+        painter.drawLine(QPointF(3, c), QPointF(7, c))
+        painter.drawLine(QPointF(size - 7, c), QPointF(size - 3, c))
+        painter.setBrush(color)
+        painter.drawEllipse(QPointF(c + 2, c - 2), 1.8, 1.8)
+    painter.end()
+    return pixmap
+
+
+def make_toolbar_toggle_icon(kind: str) -> QIcon:
+    icon = QIcon()
+    off_color = QColor("#5f6773")
+    on_color = QColor("#ffffff")
+    for mode in (QIcon.Normal, QIcon.Active, QIcon.Selected):
+        icon.addPixmap(render_toolbar_toggle_icon(kind, off_color), mode, QIcon.Off)
+        icon.addPixmap(render_toolbar_toggle_icon(kind, on_color), mode, QIcon.On)
+    return icon
+
+
+def make_toolbar_toggle_button(
+    icon_kind: str,
+    tooltip: str,
+    checked: bool,
+    slot: Callable[[bool], None],
+) -> QToolButton:
+    button = QToolButton()
+    button.setCheckable(True)
+    button.setChecked(checked)
+    button.setIcon(make_toolbar_toggle_icon(icon_kind))
+    button.setIconSize(QSize(16, 16))
+    button.setToolTip(tooltip)
+    button.setToolTipDuration(4000)
+    button.setStatusTip(tooltip)
+    button.setWhatsThis(tooltip)
+    button.setAccessibleName(tooltip)
+    button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+    button.setAutoRaise(False)
+    button.setFixedSize(24, 24)
+    button.toggled.connect(slot)
+    return button
+
+
+def make_toolbar_preset_button(icon_kind: str, tooltip: str, slot: Callable[[], None]) -> QToolButton:
+    button = QToolButton()
+    button.setCheckable(True)
+    button.setIcon(make_toolbar_toggle_icon(icon_kind))
+    button.setIconSize(QSize(16, 16))
+    button.setToolTip(tooltip)
+    button.setToolTipDuration(4000)
+    button.setStatusTip(tooltip)
+    button.setWhatsThis(tooltip)
+    button.setAccessibleName(tooltip)
+    button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+    button.setAutoRaise(False)
+    button.setFixedSize(24, 24)
+    button.clicked.connect(slot)
+    return button
+
+
+def make_toolbar_action_button(
+    icon_kind: str,
+    tooltip: str,
+    slot: Callable[[], None],
+    *,
+    button_size: int = 24,
+    icon_size: int = 16,
+) -> QToolButton:
+    button = QToolButton()
+    button.setIcon(make_toolbar_toggle_icon(icon_kind))
+    button.setIconSize(QSize(icon_size, icon_size))
+    button.setToolTip(tooltip)
+    button.setToolTipDuration(4000)
+    button.setStatusTip(tooltip)
+    button.setWhatsThis(tooltip)
+    button.setAccessibleName(tooltip)
+    button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+    button.setAutoRaise(False)
+    button.setFixedSize(button_size, button_size)
+    button.clicked.connect(slot)
+    return button
 
 
 def gui_like_label_font_size(widget: QWidget) -> int:
@@ -224,6 +685,15 @@ def rotation_matrix_from_euler_xyz_deg(rx_deg: float, ry_deg: float, rz_deg: flo
         dtype=float,
     )
     return rz_matrix @ ry_matrix @ rx_matrix
+
+
+def orthonormalize_rotation_matrix(rotation: np.ndarray) -> np.ndarray:
+    u, _singular_values, vh = np.linalg.svd(np.asarray(rotation, dtype=float))
+    orthonormal = u @ vh
+    if np.linalg.det(orthonormal) < 0.0:
+        u[:, -1] *= -1.0
+        orthonormal = u @ vh
+    return orthonormal
 
 
 def rotation_matrix_to_euler_xyz_deg(rotation: np.ndarray) -> Tuple[float, float, float]:
@@ -857,15 +1327,19 @@ class StressTableHeaderView(QHeaderView):
             (24, "Stress 3 (MPA)", ["\u03c3", "\u0394\u03c3"]),
         ]
         self.setDefaultAlignment(Qt.AlignCenter)
-        self.setMinimumHeight(48)
+        self.setMinimumHeight(self._target_header_height())
+
+    def _target_header_height(self) -> int:
+        metrics = self.fontMetrics()
+        return max(metrics.height() * 2 + 8, 32)
 
     def sizeHint(self) -> QSize:
         hint = super().sizeHint()
-        return QSize(hint.width(), max(hint.height() * 2, 48))
+        return QSize(hint.width(), self._target_header_height())
 
     def sectionSizeFromContents(self, logical_index: int) -> QSize:
         size = super().sectionSizeFromContents(logical_index)
-        return QSize(size.width(), max(size.height() * 2, 48))
+        return QSize(size.width(), self._target_header_height())
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self.viewport())
@@ -1067,14 +1541,11 @@ def populate_table_from_serialized_rows(
         table.blockSignals(previous_state)
 
 
-class PointPickerDialog(QDialog):
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+class PointPickerPanel(QWidget):
+    def __init__(self, parent: Optional[QWidget] = None, *, enable_3d: bool = True) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Pick Model Points")
-        self.setModal(False)
-        self.setWindowFlags(self.windowFlags() | Qt.WindowMinMaxButtonsHint)
-        self.resize(1280, 920)
 
+        self.enable_3d = enable_3d
         self.model_mesh: Optional[pv.PolyData] = None
         self.mesh_path: Optional[Path] = None
         self.plane_mesh = None
@@ -1082,6 +1553,7 @@ class PointPickerDialog(QDialog):
         self.clipped_mesh = None
         self.picked_points_mesh = None
         self.picked_points: List[Tuple[str, np.ndarray]] = []
+        self._surface_picking_initialized = False
 
         self._build_ui()
 
@@ -1110,7 +1582,7 @@ class PointPickerDialog(QDialog):
         slice_group = QGroupBox("Slice Plane Picking")
         slice_layout = QVBoxLayout(slice_group)
         slice_form = QFormLayout()
-        self.plane_mode_combo = QComboBox()
+        self.plane_mode_combo = NoWheelComboBox()
         self.plane_mode_combo.addItems(["Axis aligned", "Point + normal", "Three points"])
         self.plane_mode_combo.currentTextChanged.connect(self.on_plane_mode_changed)
         slice_form.addRow("Plane mode", self.plane_mode_combo)
@@ -1118,7 +1590,7 @@ class PointPickerDialog(QDialog):
         self.plane_mode_stack = QStackedWidget()
         axis_mode_widget = QWidget()
         axis_mode_layout = QFormLayout(axis_mode_widget)
-        self.plane_axis_combo = QComboBox()
+        self.plane_axis_combo = NoWheelComboBox()
         self.plane_axis_combo.addItems(["X", "Y", "Z"])
         self.plane_axis_combo.currentTextChanged.connect(self.on_plane_definition_changed)
         self.plane_value_spin = make_spin_box(0.0, -100000.0, 100000.0)
@@ -1225,14 +1697,11 @@ class PointPickerDialog(QDialog):
         clear_button.clicked.connect(self.clear_points)
         save_button = QPushButton("Save CSV")
         save_button.clicked.connect(self.save_csv_dialog)
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.hide)
         points_button_row.addWidget(remove_button)
         points_button_row.addWidget(undo_button)
         points_button_row.addWidget(clear_button)
         points_button_row.addWidget(save_button)
         points_button_row.addStretch(1)
-        points_button_row.addWidget(close_button)
         points_layout.addLayout(points_button_row)
 
         self.points_table = QTableWidget(0, 4)
@@ -1244,7 +1713,7 @@ class PointPickerDialog(QDialog):
         points_layout.addWidget(self.points_table)
         controls_layout.addWidget(points_group, stretch=1)
 
-        self.status_label = QLabel("Load a mesh from the main window, then use the plane or direct coordinates to add model points.")
+        self.status_label = QLabel("Load a mesh from this tab or the Placement tab, then use the plane or direct coordinates to add model points.")
         self.status_label.setWordWrap(True)
         controls_layout.addWidget(self.status_label)
         self.live_coordinate_label = QLabel("Cursor: -")
@@ -1256,11 +1725,40 @@ class PointPickerDialog(QDialog):
         viewer_layout = QVBoxLayout(viewer_panel)
         viewer_layout.setContentsMargins(0, 0, 0, 0)
         viewer_layout.setSpacing(0)
-        self.plotter = CursorZoomQtInteractor(self)
-        self.plotter.set_background("white")
-        self.plotter.add_axes()
-        self.plotter.enable_parallel_projection()
-        self.plotter.interactor.installEventFilter(self)
+        if self.enable_3d:
+            self.plotter = CursorZoomQtInteractor(self)
+            self.plotter.set_background("white")
+            self.plotter.add_axes()
+            self.plotter.enable_parallel_projection()
+            self.plotter.interactor.installEventFilter(self)
+            viewer_layout.addWidget(self.plotter.interactor)
+        else:
+            self.plotter = None
+            placeholder = QLabel("3D point-picking viewport disabled for smoke test mode.")
+            placeholder.setAlignment(Qt.AlignCenter)
+            placeholder.setStyleSheet(
+                "background-color: #0d1117; color: #d7d7d7; border: 1px solid #2f3a45; padding: 24px;"
+            )
+            viewer_layout.addWidget(placeholder)
+        main_splitter.addWidget(viewer_panel)
+        main_splitter.setStretchFactor(0, 0)
+        main_splitter.setStretchFactor(1, 1)
+        main_splitter.setSizes([560, 720])
+        if self.enable_3d:
+            QTimer.singleShot(0, self.initialize_surface_point_picking)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self.enable_3d:
+            self.initialize_surface_point_picking()
+
+    def initialize_surface_point_picking(self) -> None:
+        if self._surface_picking_initialized:
+            return
+        if self.plotter is None:
+            return
+        if getattr(self.plotter, "iren", None) is None:
+            return
         self.plotter.enable_surface_point_picking(
             callback=self.on_plane_picked,
             show_message=False,
@@ -1268,17 +1766,9 @@ class PointPickerDialog(QDialog):
             left_clicking=True,
             clear_on_no_selection=False,
         )
-        viewer_layout.addWidget(self.plotter.interactor)
-        main_splitter.addWidget(viewer_panel)
-        main_splitter.setStretchFactor(0, 0)
-        main_splitter.setStretchFactor(1, 1)
-        main_splitter.setSizes([560, 720])
+        self._surface_picking_initialized = True
 
-    def closeEvent(self, event) -> None:
-        self.hide()
-        event.ignore()
-
-    def set_mesh(self, mesh: pv.PolyData, mesh_path: Optional[Path] = None) -> None:
+    def set_mesh(self, mesh: Optional[pv.PolyData], mesh_path: Optional[Path] = None) -> None:
         previous_path = None if self.mesh_path is None else str(self.mesh_path)
         next_path = None if mesh_path is None else str(mesh_path)
         if previous_path != next_path:
@@ -1286,9 +1776,25 @@ class PointPickerDialog(QDialog):
             self.refresh_points_table()
         self.mesh_path = mesh_path
         self.model_mesh = mesh.copy(deep=True) if mesh is not None else None
+        if self.model_mesh is None or self.model_mesh.n_points == 0:
+            self.clear_scene()
+            self.status_label.setText("Load a mesh from this tab or the Placement tab, then use the plane or direct coordinates to add model points.")
+            self.live_coordinate_label.setText("Cursor: -")
+            return
         self.configure_coordinate_ranges()
         self.refresh_scene(reset_camera=True)
         self.view_plane_normal()
+
+    def clear_scene(self) -> None:
+        if self.plotter is None:
+            return
+        for actor_name in ("picker_clipped_mesh", "picker_slice_contour", "picker_plane", "picker_points", "picker_point_labels"):
+            self.plotter.remove_actor(actor_name, render=False)
+        self.plane_mesh = None
+        self.slice_mesh = None
+        self.clipped_mesh = None
+        self.picked_points_mesh = None
+        self.plotter.render()
 
     def configure_coordinate_ranges(self) -> None:
         if self.model_mesh is None or self.model_mesh.n_points == 0:
@@ -1478,7 +1984,7 @@ class PointPickerDialog(QDialog):
         self.plotter.render()
 
     def eventFilter(self, watched, event) -> bool:
-        if watched is self.plotter.interactor:
+        if self.plotter is not None and watched is self.plotter.interactor:
             if event.type() == QEvent.MouseMove:
                 self.update_live_coordinate_label(event)
             elif event.type() == QEvent.Leave:
@@ -1537,7 +2043,7 @@ class PointPickerDialog(QDialog):
         )
 
     def refresh_scene(self, reset_camera: bool = False) -> None:
-        if self.model_mesh is None or self.model_mesh.n_points == 0:
+        if self.plotter is None or self.model_mesh is None or self.model_mesh.n_points == 0:
             return
         camera_state = None
         if not reset_camera and self.plotter.renderer is not None:
@@ -1759,21 +2265,33 @@ class MainWindow(QMainWindow):
         self.enable_3d = enable_3d
         self.project_path: Optional[Path] = None
         self.mesh_path: Optional[Path] = None
+        self.measurement_source_text = "Measurements can be loaded from CSV or edited directly."
+        self.report_body_text = (
+            "Fit report will appear here.\n\n"
+            "Workflow:\n"
+            "1. Load an STL/mesh.\n"
+            "2. Either run Fit placement or enable Manual Sample Placement.\n"
+            "3. Adjust the live stage pose to inspect the setup.\n"
+            "4. Compute the imaging map if needed."
+        )
         self.model_mesh: Optional[pv.PolyData] = None
         self.fit_transform = None
         self.residual_rows = []
+        self.manual_rotation_matrix = np.eye(3, dtype=float)
+        self.manual_rotation_display_values = np.zeros(3, dtype=float)
         self.top_splitter = None
         self.bottom_splitter = None
-        self.lower_splitter = None
+        self.left_splitter = None
         self.tables_splitter = None
         self.controls_scroll = None
         self.main_tabs = None
         self.instrument_setup_dialog = None
-        self.point_picker_dialog = None
+        self.point_picker_panel = None
         self._initial_sizes_applied = False
         self.camera_preset = "iso"
-        self.parallel_projection_enabled = False
-        self.viewer_font_size_offset = 8
+        self.parallel_projection_enabled = True
+        self.viewer_font_size_offset = 0
+        self.ui_font_size_spin = None
         self.view_buttons = {}
         self.view_button_group = None
         self.scene_initialized = False
@@ -1781,6 +2299,7 @@ class MainWindow(QMainWindow):
         self.beam_mesh = None
         self.beam_centerline_mesh = None
         self.slit_mesh = None
+        self.gauge_volume_mesh = None
         self.detector_mesh = None
         self.diffraction_bank_1_detector_mesh = None
         self.diffraction_bank_2_detector_mesh = None
@@ -1801,8 +2320,14 @@ class MainWindow(QMainWindow):
         self.stage_y_arrow_pos_secondary_mesh = None
         self.diffraction_vector_bank_1_mesh = None
         self.diffraction_vector_bank_2_mesh = None
+        self.parallel_projection_checkbox = None
         self.show_stage_checkbox = None
         self.show_beam_checkbox = None
+        self.show_gauge_volume_checkbox = None
+        self.show_imaging_detector_checkbox = None
+        self.show_diffraction_detectors_checkbox = None
+        self.show_feature_points_checkbox = None
+        self.show_prediction_points_checkbox = None
         self.show_sample_triad_checkbox = None
         self.show_theodolite_sight_line_checkbox = None
         self.show_diffraction_vectors_checkbox = None
@@ -1837,9 +2362,8 @@ class MainWindow(QMainWindow):
         placement_layout.setSpacing(0)
 
         self.top_splitter = QSplitter(Qt.Horizontal)
-        self.bottom_splitter = QSplitter(Qt.Vertical)
-        placement_layout.addWidget(self.bottom_splitter)
-        self.bottom_splitter.addWidget(self.top_splitter)
+        self.top_splitter.setChildrenCollapsible(False)
+        placement_layout.addWidget(self.top_splitter)
 
         self.viewer_font_increase_shortcut = QShortcut(QKeySequence("Shift+>"), self)
         self.viewer_font_increase_shortcut.setContext(Qt.WindowShortcut)
@@ -1847,6 +2371,14 @@ class MainWindow(QMainWindow):
         self.viewer_font_decrease_shortcut = QShortcut(QKeySequence("Shift+<"), self)
         self.viewer_font_decrease_shortcut.setContext(Qt.WindowShortcut)
         self.viewer_font_decrease_shortcut.activated.connect(lambda: self.adjust_viewer_font_size(-1))
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
+        self.left_splitter = QSplitter(Qt.Vertical)
+        self.left_splitter.setChildrenCollapsible(False)
+        left_layout.addWidget(self.left_splitter)
 
         controls_container = QWidget()
         controls_layout = QVBoxLayout(controls_container)
@@ -1858,12 +2390,26 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self._build_pose_group())
         controls_layout.addWidget(self._build_results_group())
         controls_layout.addStretch(1)
-        controls_container.setMinimumWidth(360)
+        controls_container.setMinimumWidth(300)
         self.controls_scroll = QScrollArea()
         self.controls_scroll.setWidgetResizable(True)
         self.controls_scroll.setFrameShape(QFrame.NoFrame)
         self.controls_scroll.setWidget(controls_container)
-        self.top_splitter.addWidget(self.controls_scroll)
+        self.left_splitter.addWidget(self.controls_scroll)
+        self.report_box = self._build_report_box()
+        self.left_splitter.addWidget(self.report_box)
+        self.left_splitter.setStretchFactor(0, 1)
+        self.left_splitter.setStretchFactor(1, 0)
+        self.refresh_report_box()
+        self.top_splitter.addWidget(left_panel)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        self.bottom_splitter = QSplitter(Qt.Vertical)
+        self.bottom_splitter.setChildrenCollapsible(False)
+        right_layout.addWidget(self.bottom_splitter)
 
         view_panel = QWidget()
         view_layout = QVBoxLayout(view_panel)
@@ -1876,7 +2422,6 @@ class MainWindow(QMainWindow):
             self.plotter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self.plotter.interactor.installEventFilter(self)
             view_layout.addWidget(self.plotter.interactor)
-            self.top_splitter.setStretchFactor(1, 1)
         else:
             self.plotter = None
             placeholder = QLabel("3D viewport disabled for smoke test mode.")
@@ -1885,33 +2430,24 @@ class MainWindow(QMainWindow):
                 "background-color: #0d1117; color: #d7d7d7; border: 1px solid #2f3a45; padding: 24px;"
             )
             view_layout.addWidget(placeholder)
-            self.top_splitter.setStretchFactor(1, 1)
-        self.top_splitter.addWidget(view_panel)
-
-        lower_panel = QWidget()
-        lower_layout = QVBoxLayout(lower_panel)
-        lower_layout.setContentsMargins(0, 0, 0, 0)
-        lower_layout.setSpacing(8)
+        self.bottom_splitter.addWidget(view_panel)
 
         self.tables_splitter = QSplitter(Qt.Horizontal)
         self.tables_splitter.setChildrenCollapsible(False)
         self.tables_splitter.addWidget(self._build_measurement_section())
         self.tables_splitter.addWidget(self._build_prediction_section())
 
-        self.lower_splitter = QSplitter(Qt.Vertical)
-        self.lower_splitter.setChildrenCollapsible(False)
-        self.lower_splitter.addWidget(self.tables_splitter)
-        self.report_box = self._build_report_box()
-        self.lower_splitter.addWidget(self.report_box)
-        self.lower_splitter.setStretchFactor(0, 4)
-        self.lower_splitter.setStretchFactor(1, 1)
-        lower_layout.addWidget(self.lower_splitter)
-        self.bottom_splitter.addWidget(lower_panel)
+        self.bottom_splitter.addWidget(self.tables_splitter)
         self.bottom_splitter.setStretchFactor(0, 3)
-        self.bottom_splitter.setStretchFactor(1, 2)
+        self.bottom_splitter.setStretchFactor(1, 1)
+        self.top_splitter.addWidget(right_panel)
+        self.top_splitter.setStretchFactor(0, 0)
+        self.top_splitter.setStretchFactor(1, 1)
 
         self.main_tabs.addTab(placement_tab, "Placement")
+        self.main_tabs.addTab(self._build_point_picker_tab(), "Pick Point")
         self.main_tabs.addTab(self._build_stress_tab(), "Residual Stress")
+        self.main_tabs.addTab(self._build_settings_tab(), "Settings")
 
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Load a mesh, then use Fit placement or Manual Sample Placement.")
@@ -1919,72 +2455,167 @@ class MainWindow(QMainWindow):
     def _apply_initial_splitter_sizes(self) -> None:
         if self.top_splitter is not None:
             self.top_splitter.setChildrenCollapsible(False)
-            self.top_splitter.setSizes([430, 1130])
+            self.top_splitter.setSizes([340, 1220])
         if self.bottom_splitter is not None:
             self.bottom_splitter.setChildrenCollapsible(False)
-            self.bottom_splitter.setSizes([640, 260])
+            self.bottom_splitter.setSizes([650, 260])
+        if self.left_splitter is not None:
+            self.left_splitter.setChildrenCollapsible(False)
+            self.left_splitter.setSizes([760, 80])
         if self.tables_splitter is not None:
-            self.tables_splitter.setSizes([820, 740])
-        if self.lower_splitter is not None:
-            self.lower_splitter.setSizes([320, 110])
+            self.tables_splitter.setSizes([565, 565])
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
         if not self._initial_sizes_applied:
             self._apply_initial_splitter_sizes()
+            self.apply_initial_table_column_widths()
             self._initial_sizes_applied = True
         if self.controls_scroll is not None:
             self.controls_scroll.verticalScrollBar().setValue(0)
 
+    def apply_initial_table_column_widths(self) -> None:
+        for table in (getattr(self, "measurement_table", None), getattr(self, "prediction_table", None)):
+            if table is None:
+                continue
+            self._set_equal_table_column_widths(table)
+
+    def _set_equal_table_column_widths(self, table: QTableWidget) -> None:
+        column_count = table.columnCount()
+        if column_count <= 0:
+            return
+        digit_width = table.fontMetrics().horizontalAdvance("000000")
+        column_width = max(56, digit_width + 18)
+        for column in range(column_count):
+            table.setColumnWidth(column, column_width)
+
     def _build_files_group(self) -> QGroupBox:
         group = QGroupBox("Files")
         layout = QVBoxLayout(group)
+        group.setStyleSheet(
+            """
+            QToolButton {
+                padding: 0px;
+                min-width: 30px;
+                min-height: 30px;
+                border: 1px solid #b9c2ce;
+                border-radius: 8px;
+                background-color: #ffffff;
+            }
+            QToolButton:hover {
+                background-color: #f3f7fb;
+                border-color: #8da2bd;
+            }
+            QToolButton:pressed {
+                background-color: #e6eef8;
+            }
+            """
+        )
 
-        self.project_path_label = QLabel("No project saved or loaded")
-        self.project_path_label.setWordWrap(True)
-        self.mesh_path_label = QLabel("No mesh loaded")
-        self.mesh_path_label.setWordWrap(True)
-        self.csv_path_label = QLabel("Measurements can be loaded from CSV or edited directly.")
-        self.csv_path_label.setWordWrap(True)
+        button_flow = FlowLayout(spacing=10)
 
-        row1 = QHBoxLayout()
-        save_project_button = QPushButton("Save project")
-        save_project_button.clicked.connect(self.save_project_dialog)
-        load_project_button = QPushButton("Load project")
-        load_project_button.clicked.connect(self.load_project_dialog)
-        row1.addWidget(save_project_button)
-        row1.addWidget(load_project_button)
+        save_project_button = make_toolbar_action_button(
+            "act_save",
+            "Save project",
+            self.save_project_dialog,
+            button_size=30,
+            icon_size=18,
+        )
+        load_project_button = make_toolbar_action_button(
+            "act_load",
+            "Load project",
+            self.load_project_dialog,
+            button_size=30,
+            icon_size=18,
+        )
 
-        row2 = QHBoxLayout()
-        load_mesh_button = QPushButton("Load STL/mesh")
-        load_mesh_button.clicked.connect(self.load_mesh_dialog)
-        clear_mesh_button = QPushButton("Clear mesh")
-        clear_mesh_button.clicked.connect(self.clear_mesh)
-        row2.addWidget(load_mesh_button)
-        row2.addWidget(clear_mesh_button)
+        load_mesh_button = make_toolbar_action_button(
+            "act_load",
+            "Load STL/mesh",
+            self.load_mesh_dialog,
+            button_size=30,
+            icon_size=18,
+        )
+        clear_mesh_button = make_toolbar_action_button(
+            "act_mesh_clear",
+            "Clear mesh",
+            self.clear_mesh,
+            button_size=30,
+            icon_size=18,
+        )
 
-        row3 = QHBoxLayout()
-        fit_button = QPushButton("Fit placement")
-        fit_button.clicked.connect(self.fit_placement)
-        export_button = QPushButton("Export fit JSON")
-        export_button.clicked.connect(self.export_json_dialog)
-        row3.addWidget(fit_button)
-        row3.addWidget(export_button)
+        export_button = make_toolbar_action_button(
+            "act_export",
+            "Export fit JSON",
+            self.export_json_dialog,
+            button_size=30,
+            icon_size=18,
+        )
 
-        row4 = QHBoxLayout()
-        pick_point_button = QPushButton("Pick point")
-        pick_point_button.clicked.connect(self.open_point_picker_dialog)
-        row4.addWidget(pick_point_button)
-        row4.addStretch(1)
+        for button in (
+            load_mesh_button,
+            clear_mesh_button,
+            load_project_button,
+            save_project_button,
+            export_button,
+        ):
+            button_flow.addWidget(button)
 
-        layout.addWidget(self.project_path_label)
-        layout.addWidget(self.mesh_path_label)
-        layout.addWidget(self.csv_path_label)
-        layout.addLayout(row1)
-        layout.addLayout(row2)
-        layout.addLayout(row3)
-        layout.addLayout(row4)
+        layout.addLayout(button_flow)
         return group
+
+    def _build_point_picker_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        toolbar = QWidget()
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setSpacing(6)
+        toolbar.setStyleSheet(
+            """
+            QToolButton {
+                padding: 0px;
+                min-width: 30px;
+                min-height: 30px;
+                border: 1px solid #b9c2ce;
+                border-radius: 8px;
+                background-color: #ffffff;
+            }
+            QToolButton:hover {
+                background-color: #f3f7fb;
+                border-color: #8da2bd;
+            }
+            QToolButton:pressed {
+                background-color: #e6eef8;
+            }
+            """
+        )
+        load_mesh_button = make_toolbar_action_button(
+            "act_load",
+            "Load STL/mesh",
+            self.load_mesh_dialog,
+            button_size=30,
+            icon_size=18,
+        )
+        clear_mesh_button = make_toolbar_action_button(
+            "act_mesh_clear",
+            "Clear mesh",
+            self.clear_mesh,
+            button_size=30,
+            icon_size=18,
+        )
+        toolbar_layout.addWidget(load_mesh_button)
+        toolbar_layout.addWidget(clear_mesh_button)
+        toolbar_layout.addStretch(1)
+        layout.addWidget(toolbar)
+
+        self.point_picker_panel = PointPickerPanel(self, enable_3d=self.enable_3d)
+        self.point_picker_panel.set_mesh(self.model_mesh, self.mesh_path)
+        layout.addWidget(self.point_picker_panel)
+        return tab
 
     def _build_stress_tab(self) -> QWidget:
         tab = QWidget()
@@ -2034,6 +2665,36 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.stress_status_label)
         return tab
 
+    def _build_settings_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        appearance_group = QGroupBox("Appearance")
+        appearance_layout = QFormLayout(appearance_group)
+        self.ui_font_size_spin = NoWheelDoubleSpinBox()
+        self.ui_font_size_spin.setDecimals(1)
+        self.ui_font_size_spin.setRange(MIN_UI_FONT_POINT_SIZE, 18.0)
+        self.ui_font_size_spin.setSingleStep(0.5)
+        app = QApplication.instance()
+        initial_font_size = DEFAULT_UI_FONT_POINT_SIZE
+        if app is not None:
+            initial_font_size = current_application_ui_font_size(app)
+        self.ui_font_size_spin.setValue(initial_font_size)
+        self.ui_font_size_spin.valueChanged.connect(self.on_ui_font_size_changed)
+        appearance_layout.addRow("UI font size (pt)", self.ui_font_size_spin)
+
+        help_label = QLabel(
+            "Changes apply to the Qt interface immediately. The 3D viewer label size remains controlled separately."
+        )
+        help_label.setWordWrap(True)
+        appearance_layout.addRow(help_label)
+
+        layout.addWidget(appearance_group)
+        layout.addStretch(1)
+        return tab
+
     def _build_stress_toolbar(self) -> QWidget:
         toolbar = QWidget()
         layout = QHBoxLayout(toolbar)
@@ -2075,17 +2736,29 @@ class MainWindow(QMainWindow):
         header = table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Fixed)
         header.setStretchLastSection(False)
-        header.setDefaultSectionSize(140)
         table.read_only_columns = set(range(14, len(STRESS_TABLE_HEADERS)))
         table.after_paste = self.normalize_stress_input_cells
         table.itemChanged.connect(self.on_stress_item_changed)
-        for column in range(14, len(STRESS_TABLE_HEADERS)):
-            table.setColumnWidth(column, 120)
+        self.update_stress_table_metrics(table)
         return table
+
+    def update_stress_table_metrics(self, table: Optional[QTableWidget] = None) -> None:
+        target_table = self.stress_table if table is None else table
+        if target_table is None:
+            return
+        column_width = max(target_table.fontMetrics().horizontalAdvance("0" * 8) + 18, 60)
+        header = target_table.horizontalHeader()
+        header.setDefaultSectionSize(column_width)
+        for column in range(target_table.columnCount()):
+            target_table.setColumnWidth(column, column_width)
+        if isinstance(header, StressTableHeaderView):
+            header.setMinimumHeight(header._target_header_height())
+        header.updateGeometry()
+        header.viewport().update()
 
     def _build_setup_group(self) -> QGroupBox:
         group = QGroupBox("Setup Geometry")
-        layout = QFormLayout(group)
+        layout = make_form_layout(group, compact_fields=True)
 
         self.pivot_x = make_spin_box(0.0, -100000.0, 100000.0)
         self.pivot_y = make_spin_box(0.0, -100000.0, 100000.0)
@@ -2098,10 +2771,10 @@ class MainWindow(QMainWindow):
         self.slit_z = make_spin_box(0.0, -100000.0, 100000.0)
         self.slit_width = make_spin_box(4.0, 0.001, 100000.0)
         self.slit_height = make_spin_box(4.0, 0.001, 100000.0)
-        self.collimator = QComboBox()
+        self.collimator = NoWheelComboBox()
         self.collimator.addItems(["0.5", "1", "2", "3", "4"])
         self.collimator.setCurrentText("4")
-        self.count_time_material = QComboBox()
+        self.count_time_material = NoWheelComboBox()
         self.count_time_material.addItems(list(RIETVELD_COUNT_TIME_LAWS.keys()))
         self.beam_length = make_spin_box(700.0, 1.0, 100000.0)
         self.detector_width_y = make_spin_box(100.0, 10.0, 200.0)
@@ -2138,6 +2811,7 @@ class MainWindow(QMainWindow):
             self.stage_offset_z,
         ):
             widget.valueChanged.connect(self.on_view_parameter_changed)
+        self.collimator.currentTextChanged.connect(lambda _text: self.on_view_parameter_changed())
         for widget in (
             self.detector_map_pixel_size_y,
             self.detector_map_pixel_size_z,
@@ -2146,7 +2820,13 @@ class MainWindow(QMainWindow):
 
         instrument_setup_button = QPushButton("Instrument setup...")
         instrument_setup_button.clicked.connect(self.open_instrument_setup_dialog)
-        layout.addRow(instrument_setup_button)
+        instrument_setup_button.setMaximumWidth(180)
+        instrument_setup_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        instrument_setup_row = QHBoxLayout()
+        instrument_setup_row.setContentsMargins(0, 0, 0, 0)
+        instrument_setup_row.addWidget(instrument_setup_button)
+        instrument_setup_row.addStretch(1)
+        layout.addRow(instrument_setup_row)
         layout.addRow(self._separator())
         layout.addRow("Slit width", self.slit_width)
         layout.addRow("Slit height", self.slit_height)
@@ -2203,7 +2883,7 @@ class MainWindow(QMainWindow):
 
     def _build_pose_group(self) -> QGroupBox:
         group = QGroupBox("Live Stage Pose")
-        layout = QFormLayout(group)
+        layout = make_form_layout(group, compact_fields=True)
 
         self.pose_x = make_spin_box(0.0, -100000.0, 100000.0)
         self.pose_y = make_spin_box(0.0, -100000.0, 100000.0)
@@ -2219,21 +2899,49 @@ class MainWindow(QMainWindow):
         layout.addRow("Omega", self.pose_omega)
 
         button_row = QHBoxLayout()
-        selected_pose_button = QPushButton("Use selected row pose")
-        selected_pose_button.clicked.connect(self.use_selected_row_pose)
         reset_pose_button = QPushButton("Reset pose")
         reset_pose_button.clicked.connect(self.reset_pose)
-        button_row.addWidget(selected_pose_button)
+        reset_pose_button.setMaximumWidth(110)
+        reset_pose_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         button_row.addWidget(reset_pose_button)
+        button_row.addStretch(1)
         layout.addRow(button_row)
         return group
 
     def _build_manual_placement_group(self) -> QGroupBox:
         group = QGroupBox("Manual Sample Placement")
-        layout = QFormLayout(group)
+        layout = make_form_layout(group, compact_fields=True)
+        manual_placement_tooltip = (
+            "Manual placement overrides the model-to-stage transform used by the viewer and point-to-pivot tools.\n\n"
+            "Model->Stage X/Y/Z translates the sample in stage coordinates. Changing these values makes the model "
+            "shift in the 3D view relative to the stage, beam, and detectors.\n\n"
+            "Local Rot X/Y/Z shows the current accumulated orientation in degrees. Editing one value applies the "
+            "change as an incremental rotation about the sample's current local triad axis, then the boxes update to "
+            "the new accumulated orientation.\n\n"
+            "When manual placement is enabled, these values are used instead of the fitted transform. "
+            "The Live Stage Pose controls still apply separately on top as the current stage readout."
+        )
 
         self.manual_placement_enabled_checkbox = QCheckBox("Use manual placement")
         self.manual_placement_enabled_checkbox.toggled.connect(self.on_manual_placement_mode_toggled)
+        manual_help_button = QToolButton()
+        manual_help_button.setText("?")
+        manual_help_button.setToolTip(manual_placement_tooltip)
+        manual_help_button.setToolTipDuration(10000)
+        manual_help_button.setStatusTip("Explain how manual sample placement works.")
+        manual_help_button.setAutoRaise(True)
+        manual_help_button.setCursor(Qt.WhatsThisCursor)
+        manual_help_button.setFixedSize(18, 18)
+        manual_help_button.setStyleSheet(
+            "QToolButton { font-weight: 600; border: 1px solid #b9c2ce; border-radius: 9px; padding: 0px; }"
+            "QToolButton:hover { background-color: #f3f7fb; border-color: #8da2bd; }"
+        )
+        checkbox_row = QHBoxLayout()
+        checkbox_row.setContentsMargins(0, 0, 0, 0)
+        checkbox_row.setSpacing(6)
+        checkbox_row.addWidget(self.manual_placement_enabled_checkbox)
+        checkbox_row.addWidget(manual_help_button)
+        checkbox_row.addStretch(1)
 
         self.manual_tx = make_spin_box(0.0, -100000.0, 100000.0)
         self.manual_ty = make_spin_box(0.0, -100000.0, 100000.0)
@@ -2246,79 +2954,86 @@ class MainWindow(QMainWindow):
             self.manual_tx,
             self.manual_ty,
             self.manual_tz,
+        ):
+            widget.valueChanged.connect(self.on_manual_placement_changed)
+        for widget in (
             self.manual_rx,
             self.manual_ry,
             self.manual_rz,
         ):
-            widget.valueChanged.connect(self.on_manual_placement_changed)
+            widget.valueChanged.connect(self.on_manual_rotation_increment_changed)
 
-        reset_button = QPushButton("Reset manual")
+        reset_button = QPushButton("Reset")
+        reset_button.setToolTip("Reset the manual model-to-stage translation and rotation to zero.")
         reset_button.clicked.connect(self.reset_manual_placement)
-        load_fit_button = QPushButton("Load fit into manual")
+        reset_button.setMaximumWidth(90)
+        reset_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        load_fit_button = QPushButton("Load transform")
+        load_fit_button.setToolTip("Copy the current fitted transform into the manual placement fields and enable manual placement.")
         load_fit_button.clicked.connect(self.load_fit_into_manual)
+        load_fit_button.setMaximumWidth(130)
+        load_fit_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         button_row = QHBoxLayout()
         button_row.addWidget(reset_button)
         button_row.addWidget(load_fit_button)
+        button_row.addStretch(1)
 
-        layout.addRow(self.manual_placement_enabled_checkbox)
+        layout.addRow(checkbox_row)
         layout.addRow("Model->Stage X", self.manual_tx)
         layout.addRow("Model->Stage Y", self.manual_ty)
         layout.addRow("Model->Stage Z", self.manual_tz)
-        layout.addRow("Rot X", self.manual_rx)
-        layout.addRow("Rot Y", self.manual_ry)
-        layout.addRow("Rot Z", self.manual_rz)
+        layout.addRow("Local Rot X", self.manual_rx)
+        layout.addRow("Local Rot Y", self.manual_ry)
+        layout.addRow("Local Rot Z", self.manual_rz)
         layout.addRow(button_row)
+        self.sync_manual_rotation_spin_boxes_from_matrix()
         return group
 
     def _build_results_group(self) -> QGroupBox:
-        group = QGroupBox("Fit Summary")
-        layout = QFormLayout(group)
+        group = QGroupBox("Placement Actions")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        self.summary_status = QLabel("No fit computed")
-        self.summary_translation = QLabel("-")
-        self.summary_euler = QLabel("-")
-        self.summary_rms = QLabel("-")
-        self.summary_max = QLabel("-")
-        self.summary_beam_path = QLabel("-")
-        self.summary_detector_map = QLabel("-")
-        self.summary_diffraction_path = QLabel("-")
-        self.summary_diffraction_map = QLabel("-")
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(6)
 
-        for label in (
-            self.summary_status,
-            self.summary_translation,
-            self.summary_euler,
-            self.summary_rms,
-            self.summary_max,
-            self.summary_beam_path,
-            self.summary_detector_map,
-            self.summary_diffraction_path,
-            self.summary_diffraction_map,
-        ):
-            label.setWordWrap(True)
+        clear_placement_button = make_toolbar_action_button(
+            "act_remove",
+            "Clear placement",
+            self.clear_placement,
+            button_size=28,
+            icon_size=18,
+        )
+        compute_detector_map_button = make_toolbar_action_button(
+            "imaging",
+            "Compute imaging map",
+            self.compute_detector_map,
+            button_size=28,
+            icon_size=18,
+        )
+        compute_diffraction_map_button = make_toolbar_action_button(
+            "act_paths",
+            "Compute diffraction path",
+            self.compute_diffraction_map,
+            button_size=28,
+            icon_size=18,
+        )
+        export_detector_map_button = make_toolbar_action_button(
+            "act_export",
+            "Export detector map",
+            self.export_detector_map_dialog,
+            button_size=28,
+            icon_size=18,
+        )
 
-        clear_placement_button = QPushButton("Clear placement")
-        clear_placement_button.clicked.connect(self.clear_placement)
-        compute_detector_map_button = QPushButton("Compute imaging map")
-        compute_detector_map_button.clicked.connect(self.compute_detector_map)
-        compute_diffraction_map_button = QPushButton("Compute diffraction path")
-        compute_diffraction_map_button.clicked.connect(self.compute_diffraction_map)
-        export_detector_map_button = QPushButton("Export detector map")
-        export_detector_map_button.clicked.connect(self.export_detector_map_dialog)
-
-        layout.addRow("Status", self.summary_status)
-        layout.addRow("Translation", self.summary_translation)
-        layout.addRow("Euler ZYX", self.summary_euler)
-        layout.addRow("RMS error", self.summary_rms)
-        layout.addRow("Max error", self.summary_max)
-        layout.addRow("Imaging path", self.summary_beam_path)
-        layout.addRow("Imaging map", self.summary_detector_map)
-        layout.addRow("Diffraction path", self.summary_diffraction_path)
-        layout.addRow("Diffraction map", self.summary_diffraction_map)
-        layout.addRow(clear_placement_button)
-        layout.addRow(compute_detector_map_button)
-        layout.addRow(compute_diffraction_map_button)
-        layout.addRow(export_detector_map_button)
+        action_row.addWidget(clear_placement_button)
+        action_row.addWidget(compute_detector_map_button)
+        action_row.addWidget(compute_diffraction_map_button)
+        action_row.addWidget(export_detector_map_button)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
         return group
 
     def _build_view_toolbar(self) -> QWidget:
@@ -2336,60 +3051,64 @@ class MainWindow(QMainWindow):
                 border: 2px solid #3a7bd5;
                 font-weight: 600;
             }
+            QToolButton {
+                padding: 0px;
+                min-width: 24px;
+                min-height: 24px;
+                border: 1px solid #b9c2ce;
+                border-radius: 6px;
+                background-color: #ffffff;
+            }
+            QToolButton:hover {
+                background-color: #f3f7fb;
+                border-color: #8da2bd;
+            }
+            QToolButton:checked {
+                background-color: #1f6fca;
+                border: 1px solid #1f6fca;
+            }
             """
         )
         self.view_button_group = QButtonGroup(toolbar)
         self.view_button_group.setExclusive(True)
 
         buttons = [
-            ("Iso", "iso"),
-            ("+X", "+x"),
-            ("-X", "-x"),
-            ("+Y", "+y"),
-            ("-Y", "-y"),
-            ("+Z", "+z"),
-            ("-Z", "-z"),
-            ("Theodolite", "theodolite"),
+            ("cam_iso", "Isometric view", "iso"),
+            ("cam_px", "View +X", "+x"),
+            ("cam_nx", "View -X", "-x"),
+            ("cam_py", "View +Y", "+y"),
+            ("cam_ny", "View -Y", "-y"),
+            ("cam_pz", "View +Z", "+z"),
+            ("cam_nz", "View -Z", "-z"),
+            ("cam_theodolite", "Theodolite view", "theodolite"),
         ]
-        for label, preset in buttons:
-            button = QPushButton(label)
-            button.setCheckable(True)
-            button.clicked.connect(lambda _checked=False, view=preset: self.set_camera_preset(view))
+        for icon_kind, tooltip, preset in buttons:
+            button = make_toolbar_preset_button(
+                icon_kind,
+                tooltip,
+                lambda _checked=False, view=preset: self.set_camera_preset(view),
+            )
             self.view_button_group.addButton(button)
             self.view_buttons[preset] = button
             layout.addWidget(button)
 
-        self.parallel_projection_checkbox = QCheckBox("Parallel")
-        self.parallel_projection_checkbox.toggled.connect(self.on_projection_toggled)
-        layout.addWidget(self.parallel_projection_checkbox)
-        self.show_stage_checkbox = QCheckBox("Stage")
-        self.show_stage_checkbox.setChecked(True)
-        self.show_stage_checkbox.toggled.connect(self.on_overlay_visibility_changed)
-        layout.addWidget(self.show_stage_checkbox)
-        self.show_beam_checkbox = QCheckBox("Beam")
-        self.show_beam_checkbox.setChecked(True)
-        self.show_beam_checkbox.toggled.connect(self.on_overlay_visibility_changed)
-        layout.addWidget(self.show_beam_checkbox)
-        self.show_feature_points_checkbox = QCheckBox("Features")
-        self.show_feature_points_checkbox.setChecked(True)
-        self.show_feature_points_checkbox.toggled.connect(self.on_overlay_visibility_changed)
-        layout.addWidget(self.show_feature_points_checkbox)
-        self.show_prediction_points_checkbox = QCheckBox("Predicted")
-        self.show_prediction_points_checkbox.setChecked(True)
-        self.show_prediction_points_checkbox.toggled.connect(self.on_overlay_visibility_changed)
-        layout.addWidget(self.show_prediction_points_checkbox)
-        self.show_sample_triad_checkbox = QCheckBox("Sample triad")
-        self.show_sample_triad_checkbox.setChecked(True)
-        self.show_sample_triad_checkbox.toggled.connect(self.on_overlay_visibility_changed)
-        layout.addWidget(self.show_sample_triad_checkbox)
-        self.show_theodolite_sight_line_checkbox = QCheckBox("Sight line")
-        self.show_theodolite_sight_line_checkbox.setChecked(True)
-        self.show_theodolite_sight_line_checkbox.toggled.connect(self.on_overlay_visibility_changed)
-        layout.addWidget(self.show_theodolite_sight_line_checkbox)
-        self.show_diffraction_vectors_checkbox = QCheckBox("Diffraction vectors")
-        self.show_diffraction_vectors_checkbox.setChecked(True)
-        self.show_diffraction_vectors_checkbox.toggled.connect(self.on_overlay_visibility_changed)
-        layout.addWidget(self.show_diffraction_vectors_checkbox)
+        toggle_specs = [
+            ("parallel_projection_checkbox", "parallel", "Parallel projection", True, self.on_projection_toggled),
+            ("show_stage_checkbox", "stage", "Show stage", True, self.on_overlay_visibility_changed),
+            ("show_beam_checkbox", "beam", "Show beam", True, self.on_overlay_visibility_changed),
+            ("show_gauge_volume_checkbox", "cube", "Show gauge volume", True, self.on_overlay_visibility_changed),
+            ("show_imaging_detector_checkbox", "imaging", "Show imaging detector", False, self.on_overlay_visibility_changed),
+            ("show_diffraction_detectors_checkbox", "diffraction", "Show diffraction detectors", True, self.on_overlay_visibility_changed),
+            ("show_feature_points_checkbox", "features", "Show feature points", True, self.on_overlay_visibility_changed),
+            ("show_prediction_points_checkbox", "predicted", "Show predicted points", True, self.on_overlay_visibility_changed),
+            ("show_sample_triad_checkbox", "triad", "Show sample triad", True, self.on_overlay_visibility_changed),
+            ("show_theodolite_sight_line_checkbox", "sight", "Show sight line", True, self.on_overlay_visibility_changed),
+            ("show_diffraction_vectors_checkbox", "diffraction", "Show diffraction vectors", True, self.on_overlay_visibility_changed),
+        ]
+        for attribute_name, icon_kind, tooltip, checked, slot in toggle_specs:
+            button = make_toolbar_toggle_button(icon_kind, tooltip, checked, slot)
+            setattr(self, attribute_name, button)
+            layout.addWidget(button)
         layout.addStretch(1)
         self.sync_view_button_states()
         return toolbar
@@ -2398,17 +3117,37 @@ class MainWindow(QMainWindow):
         toolbar = QWidget()
         layout = QHBoxLayout(toolbar)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        toolbar.setStyleSheet(
+            """
+            QToolButton {
+                padding: 0px;
+                min-width: 24px;
+                min-height: 24px;
+                border: 1px solid #b9c2ce;
+                border-radius: 6px;
+                background-color: #ffffff;
+            }
+            QToolButton:hover {
+                background-color: #f3f7fb;
+                border-color: #8da2bd;
+            }
+            QToolButton:pressed {
+                background-color: #e6eef8;
+            }
+            """
+        )
 
-        add_row_button = QPushButton("Add row")
-        add_row_button.clicked.connect(lambda: self.add_measurement_row())
-        load_csv_button = QPushButton("Load CSV")
-        load_csv_button.clicked.connect(self.load_csv_dialog)
-        save_csv_button = QPushButton("Save CSV")
-        save_csv_button.clicked.connect(self.save_csv_dialog)
-        remove_row_button = QPushButton("Remove row")
-        remove_row_button.clicked.connect(self.remove_selected_rows)
-        move_to_pivot_button = QPushButton("Move point to pivot")
-        move_to_pivot_button.clicked.connect(self.move_selected_point_to_pivot)
+        add_row_button = make_toolbar_action_button("act_add", "Add row", self.add_measurement_row)
+        load_csv_button = make_toolbar_action_button("act_load", "Load CSV", self.load_csv_dialog)
+        save_csv_button = make_toolbar_action_button("act_save", "Save CSV", self.save_csv_dialog)
+        remove_row_button = make_toolbar_action_button("act_remove", "Remove row", self.remove_selected_rows)
+        move_to_pivot_button = make_toolbar_action_button(
+            "act_move_pivot",
+            "Move point to pivot",
+            self.move_selected_point_to_pivot,
+        )
+        fit_button = make_toolbar_action_button("act_fit", "Fit placement", self.fit_placement)
         self.auto_move_to_pivot_checkbox = QCheckBox("Auto move on select")
         self.auto_move_to_pivot_checkbox.setChecked(True)
 
@@ -2417,6 +3156,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(load_csv_button)
         layout.addWidget(save_csv_button)
         layout.addWidget(move_to_pivot_button)
+        layout.addWidget(fit_button)
         layout.addWidget(self.auto_move_to_pivot_checkbox)
         layout.addStretch(1)
         return toolbar
@@ -2430,6 +3170,7 @@ class MainWindow(QMainWindow):
 
     def _build_measurement_section(self) -> QWidget:
         section = QWidget()
+        section.setMinimumHeight(0)
         layout = QVBoxLayout(section)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
@@ -2443,23 +3184,55 @@ class MainWindow(QMainWindow):
         toolbar = QWidget()
         layout = QHBoxLayout(toolbar)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        toolbar.setStyleSheet(
+            """
+            QToolButton {
+                padding: 0px;
+                min-width: 24px;
+                min-height: 24px;
+                border: 1px solid #b9c2ce;
+                border-radius: 6px;
+                background-color: #ffffff;
+            }
+            QToolButton:hover {
+                background-color: #f3f7fb;
+                border-color: #8da2bd;
+            }
+            QToolButton:pressed {
+                background-color: #e6eef8;
+            }
+            """
+        )
 
-        add_row_button = QPushButton("Add prediction")
-        add_row_button.clicked.connect(lambda: self.add_prediction_row())
-        remove_row_button = QPushButton("Remove prediction")
-        remove_row_button.clicked.connect(self.remove_selected_prediction_rows)
-        load_csv_button = QPushButton("Load CSV")
-        load_csv_button.clicked.connect(self.load_prediction_csv_dialog)
-        save_csv_button = QPushButton("Save CSV")
-        save_csv_button.clicked.connect(self.save_prediction_csv_dialog)
-        generate_button = QPushButton("Generate stage readouts")
-        generate_button.clicked.connect(self.generate_prediction_stage_readouts)
-        generate_paths_button = QPushButton("Generate paths")
-        generate_paths_button.clicked.connect(self.generate_prediction_diffraction_paths)
-        estimate_time_button = QPushButton("Estimate time")
-        estimate_time_button.clicked.connect(self.generate_prediction_estimated_times)
-        create_scan_file_button = QPushButton("Create scan file")
-        create_scan_file_button.clicked.connect(self.create_prediction_scan_file)
+        add_row_button = make_toolbar_action_button("act_add", "Add prediction", self.add_prediction_row)
+        remove_row_button = make_toolbar_action_button(
+            "act_remove",
+            "Remove prediction",
+            self.remove_selected_prediction_rows,
+        )
+        load_csv_button = make_toolbar_action_button("act_load", "Load CSV", self.load_prediction_csv_dialog)
+        save_csv_button = make_toolbar_action_button("act_save", "Save CSV", self.save_prediction_csv_dialog)
+        generate_button = make_toolbar_action_button(
+            "act_readouts",
+            "Generate stage readouts",
+            self.generate_prediction_stage_readouts,
+        )
+        generate_paths_button = make_toolbar_action_button(
+            "act_paths",
+            "Generate paths",
+            self.generate_prediction_diffraction_paths,
+        )
+        estimate_time_button = make_toolbar_action_button(
+            "act_time",
+            "Estimate time",
+            self.generate_prediction_estimated_times,
+        )
+        create_scan_file_button = make_toolbar_action_button(
+            "act_scan",
+            "Create scan file",
+            self.create_prediction_scan_file,
+        )
 
         layout.addWidget(add_row_button)
         layout.addWidget(remove_row_button)
@@ -2474,6 +3247,7 @@ class MainWindow(QMainWindow):
 
     def _build_prediction_section(self) -> QWidget:
         section = QWidget()
+        section.setMinimumHeight(0)
         layout = QVBoxLayout(section)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
@@ -2490,12 +3264,17 @@ class MainWindow(QMainWindow):
         table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         table.setAlternatingRowColors(True)
         table.setWordWrap(False)
-        table.setMinimumHeight(220)
+        table.setMinimumHeight(80)
+        table.setSizeAdjustPolicy(QAbstractScrollArea.AdjustIgnored)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         table.verticalHeader().setDefaultSectionSize(30)
         header = table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Stretch)
-        header.setStretchLastSection(True)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
         table.itemSelectionChanged.connect(self.on_measurement_selection_changed)
         table.itemChanged.connect(self.on_measurement_item_changed)
         return table
@@ -2507,12 +3286,17 @@ class MainWindow(QMainWindow):
         table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         table.setAlternatingRowColors(True)
         table.setWordWrap(False)
-        table.setMinimumHeight(180)
+        table.setMinimumHeight(80)
+        table.setSizeAdjustPolicy(QAbstractScrollArea.AdjustIgnored)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         table.verticalHeader().setDefaultSectionSize(30)
         header = table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Stretch)
-        header.setStretchLastSection(True)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
         table.read_only_columns = {7, 8, 9, 10}
         table.after_paste = lambda: self.update_scene(reset_camera=False)
         table.itemSelectionChanged.connect(self.on_prediction_selection_changed)
@@ -2522,16 +3306,7 @@ class MainWindow(QMainWindow):
     def _build_report_box(self) -> QPlainTextEdit:
         report = QPlainTextEdit()
         report.setReadOnly(True)
-        report.setMinimumHeight(96)
-        report.setMaximumHeight(180)
-        report.setPlainText(
-            "Fit report will appear here.\n\n"
-            "Workflow:\n"
-            "1. Load an STL/mesh.\n"
-            "2. Either run Fit placement or enable Manual Sample Placement.\n"
-            "3. Adjust the live stage pose to inspect the setup.\n"
-            "4. Compute the imaging map if needed."
-        )
+        report.setMinimumHeight(36)
         return report
 
     def _separator(self) -> QFrame:
@@ -2553,6 +3328,17 @@ class MainWindow(QMainWindow):
         self.invalidate_detector_map(update_scene=True)
 
     def on_overlay_visibility_changed(self, _checked: bool) -> None:
+        self.update_scene(reset_camera=False)
+
+    def on_ui_font_size_changed(self, value: float) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        apply_application_ui_font(app, float(value))
+        self.update_stress_table_metrics()
+        if hasattr(self, "instrument_setup_dialog") and self.instrument_setup_dialog is not None:
+            self.instrument_setup_dialog.adjustSize()
+        self.updateGeometry()
         self.update_scene(reset_camera=False)
 
     def on_measurement_selection_changed(self) -> None:
@@ -2628,13 +3414,25 @@ class MainWindow(QMainWindow):
         return self.current_diffraction_detector_geometry(DIFFRACTION_BANK_2_CENTER_WORLD)
 
     def manual_model_to_stage_transform(self) -> Tuple[np.ndarray, np.ndarray]:
-        rotation = rotation_matrix_from_euler_xyz_deg(
-            self.manual_rx.value(),
-            self.manual_ry.value(),
-            self.manual_rz.value(),
-        )
+        rotation = np.array(self.manual_rotation_matrix, dtype=float)
         translation = np.array([self.manual_tx.value(), self.manual_ty.value(), self.manual_tz.value()], dtype=float)
         return rotation, translation
+
+    def sync_manual_rotation_spin_boxes_from_matrix(self) -> None:
+        if not all(hasattr(self, attr) for attr in ("manual_rx", "manual_ry", "manual_rz")):
+            return
+        rotation_boxes = (
+            (self.manual_rx, self.manual_rotation_display_values[0]),
+            (self.manual_ry, self.manual_rotation_display_values[1]),
+            (self.manual_rz, self.manual_rotation_display_values[2]),
+        )
+        previous_states = [(box, box.blockSignals(True)) for box, _value in rotation_boxes]
+        try:
+            for box, value in rotation_boxes:
+                box.setValue(float(value))
+        finally:
+            for box, previous_state in previous_states:
+                box.blockSignals(previous_state)
 
     def current_model_to_stage_transform(self) -> Tuple[np.ndarray, np.ndarray, str]:
         if self.manual_placement_enabled_checkbox.isChecked():
@@ -2653,42 +3451,62 @@ class MainWindow(QMainWindow):
         self.detector_map_state = None
         self.diffraction_bank_1_map_state = None
         self.diffraction_bank_2_map_state = None
-        if hasattr(self, "summary_beam_path"):
-            self.summary_beam_path.setText("-")
-        if hasattr(self, "summary_detector_map"):
-            self.summary_detector_map.setText("-")
-        if hasattr(self, "summary_diffraction_path"):
-            self.summary_diffraction_path.setText("-")
-        if hasattr(self, "summary_diffraction_map"):
-            self.summary_diffraction_map.setText("-")
+        self.refresh_report_box()
         if update_scene:
             self.update_scene(reset_camera=False)
 
     def update_placement_status(self) -> None:
-        if self.manual_placement_enabled_checkbox.isChecked():
-            self.summary_status.setText("Manual placement active")
-        elif self.fit_transform is not None:
-            self.summary_status.setText(f"Fit placement active with {len(self.residual_rows)} point pairs")
-        else:
-            self.summary_status.setText("No placement transform; model shown as imported")
+        self.refresh_report_box()
 
     def update_placement_summary_fields(self) -> None:
+        self.refresh_report_box()
+
+    def placement_summary_lines(self) -> List[str]:
+        lines: List[str] = []
         if self.manual_placement_enabled_checkbox.isChecked():
             rotation, translation, _source = self.current_model_to_stage_transform()
-            self.summary_translation.setText(pretty_vector(translation))
-            self.summary_euler.setText(pretty_vector(rotation_matrix_to_euler_zyx_deg(rotation)))
-            self.summary_rms.setText("-")
-            self.summary_max.setText("-")
+            lines.append("Placement: Manual placement active")
+            lines.append(f"Translation: {pretty_vector(translation)}")
+            lines.append(f"Euler ZYX: {pretty_vector(rotation_matrix_to_euler_zyx_deg(rotation))}")
         elif self.fit_transform is not None:
-            self.summary_translation.setText(pretty_vector(self.fit_transform.translation))
-            self.summary_euler.setText(pretty_vector(rotation_matrix_to_euler_zyx_deg(self.fit_transform.rotation)))
-            self.summary_rms.setText(format_decimal(self.fit_transform.rms_error))
-            self.summary_max.setText(format_decimal(self.fit_transform.max_error))
+            lines.append(f"Placement: Fit placement active with {len(self.residual_rows)} point pairs")
+            lines.append(f"Translation: {pretty_vector(self.fit_transform.translation)}")
+            lines.append(f"Euler ZYX: {pretty_vector(rotation_matrix_to_euler_zyx_deg(self.fit_transform.rotation))}")
+            lines.append(f"RMS error: {format_decimal(self.fit_transform.rms_error)}")
+            lines.append(f"Max error: {format_decimal(self.fit_transform.max_error)}")
         else:
-            self.summary_translation.setText("-")
-            self.summary_euler.setText("-")
-            self.summary_rms.setText("-")
-            self.summary_max.setText("-")
+            lines.append("Placement: No placement transform; model shown as imported")
+
+        if self.detector_map_state is not None:
+            lines.append(f"Imaging path: {format_decimal(self.detector_map_state['average_length'])}")
+            lines.append(
+                "Imaging map: "
+                f"{self.detector_map_state['resolution_y']}x{self.detector_map_state['resolution_z']} "
+                f"@ {format_decimal(self.detector_map_state['pixel_size_y'])}/{format_decimal(self.detector_map_state['pixel_size_z'])}, "
+                f"max {format_decimal(self.detector_map_state['max_length'])}"
+            )
+
+        diffraction_path_parts: List[str] = []
+        diffraction_map_parts: List[str] = []
+        if self.diffraction_bank_1_map_state is not None:
+            diffraction_path_parts.append(f"Bank 1 {format_decimal(self.diffraction_bank_1_map_state['average_length'])}")
+            diffraction_map_parts.append(
+                f"Bank 1 {len(self.diffraction_bank_1_map_state['horizontal_angles_deg'])}x"
+                f"{len(self.diffraction_bank_1_map_state['vertical_angles_deg'])}, "
+                f"max {format_decimal(self.diffraction_bank_1_map_state['max_length'])}"
+            )
+        if self.diffraction_bank_2_map_state is not None:
+            diffraction_path_parts.append(f"Bank 2 {format_decimal(self.diffraction_bank_2_map_state['average_length'])}")
+            diffraction_map_parts.append(
+                f"Bank 2 {len(self.diffraction_bank_2_map_state['horizontal_angles_deg'])}x"
+                f"{len(self.diffraction_bank_2_map_state['vertical_angles_deg'])}, "
+                f"max {format_decimal(self.diffraction_bank_2_map_state['max_length'])}"
+            )
+        if diffraction_path_parts:
+            lines.append(f"Diffraction path: {'; '.join(diffraction_path_parts)}")
+        if diffraction_map_parts:
+            lines.append(f"Diffraction map: {'; '.join(diffraction_map_parts)}")
+        return lines
 
     def build_current_model_world_mesh(self) -> Optional[pv.PolyData]:
         stage_readout_local, omega_deg = self.current_stage_pose()
@@ -3247,10 +4065,30 @@ class MainWindow(QMainWindow):
 
     def set_project_path_label(self, path: Optional[Path]) -> None:
         self.project_path = path
-        if path is None:
-            self.project_path_label.setText("No project saved or loaded")
-        else:
-            self.project_path_label.setText(f"Project: {path}")
+        self.refresh_report_box()
+
+    def file_status_header_text(self) -> str:
+        project_text = "No project saved or loaded" if self.project_path is None else f"Project: {self.project_path}"
+        mesh_text = "No mesh loaded" if self.mesh_path is None else str(self.mesh_path)
+        return "\n".join((project_text, mesh_text, self.measurement_source_text))
+
+    def refresh_report_box(self) -> None:
+        if not hasattr(self, "report_box") or self.report_box is None:
+            return
+        summary = "\n".join(self.placement_summary_lines()).strip()
+        body = self.report_body_text.strip()
+        header = self.file_status_header_text().strip()
+        sections = [section for section in (header, summary, body) if section]
+        text = "\n\n".join(sections)
+        self.report_box.setPlainText(text)
+
+    def set_report_body(self, text: str) -> None:
+        self.report_body_text = text
+        self.refresh_report_box()
+
+    def sync_point_picker_panel_mesh(self) -> None:
+        if self.point_picker_panel is not None:
+            self.point_picker_panel.set_mesh(self.model_mesh, self.mesh_path)
 
     def default_project_path(self) -> Path:
         if self.project_path is not None:
@@ -3282,7 +4120,7 @@ class MainWindow(QMainWindow):
             "rms_error": float(self.fit_transform.rms_error),
             "max_error": float(self.fit_transform.max_error),
             "residual_rows": residual_rows,
-            "report_text": self.report_box.toPlainText(),
+            "report_text": self.report_body_text,
         }
 
     def build_project_payload(self) -> dict:
@@ -3334,9 +4172,10 @@ class MainWindow(QMainWindow):
                 "tx": self.manual_tx.value(),
                 "ty": self.manual_ty.value(),
                 "tz": self.manual_tz.value(),
-                "rx": self.manual_rx.value(),
-                "ry": self.manual_ry.value(),
-                "rz": self.manual_rz.value(),
+                "rx": float(self.manual_rotation_display_values[0]),
+                "ry": float(self.manual_rotation_display_values[1]),
+                "rz": float(self.manual_rotation_display_values[2]),
+                "rotation_matrix": [list(row) for row in np.asarray(self.manual_rotation_matrix, dtype=float)],
             },
             "fit_transform": self.build_fit_state_payload(),
             "measurements": table_to_serializable_rows(self.measurement_table, TABLE_HEADERS),
@@ -3344,11 +4183,17 @@ class MainWindow(QMainWindow):
             "view": {
                 "camera_preset": self.camera_preset,
                 "parallel_projection_enabled": bool(self.parallel_projection_enabled),
+                "ui_font_size_pt": (
+                    float(self.ui_font_size_spin.value()) if self.ui_font_size_spin is not None else DEFAULT_UI_FONT_POINT_SIZE
+                ),
                 "viewer_font_size_offset": int(self.viewer_font_size_offset),
                 "active_tab": self.main_tabs.currentIndex() if self.main_tabs is not None else 0,
                 "auto_move_to_pivot": self.auto_move_to_pivot_checkbox.isChecked(),
                 "show_stage": self.show_stage_checkbox.isChecked(),
                 "show_beam": self.show_beam_checkbox.isChecked(),
+                "show_gauge_volume": self.show_gauge_volume_checkbox.isChecked(),
+                "show_imaging_detector": self.show_imaging_detector_checkbox.isChecked(),
+                "show_diffraction_detectors": self.show_diffraction_detectors_checkbox.isChecked(),
                 "show_feature_points": self.show_feature_points_checkbox.isChecked(),
                 "show_prediction_points": self.show_prediction_points_checkbox.isChecked(),
                 "show_sample_triad": self.show_sample_triad_checkbox.isChecked(),
@@ -3461,9 +4306,6 @@ class MainWindow(QMainWindow):
             (self.manual_tx, manual_placement.get("tx")),
             (self.manual_ty, manual_placement.get("ty")),
             (self.manual_tz, manual_placement.get("tz")),
-            (self.manual_rx, manual_placement.get("rx")),
-            (self.manual_ry, manual_placement.get("ry")),
-            (self.manual_rz, manual_placement.get("rz")),
         )
         spin_signal_states = [(box, box.blockSignals(True)) for box, _value in spin_box_values]
         try:
@@ -3473,6 +4315,35 @@ class MainWindow(QMainWindow):
         finally:
             for box, previous_state in spin_signal_states:
                 box.blockSignals(previous_state)
+
+        manual_rotation_payload = manual_placement.get("rotation_matrix")
+        if manual_rotation_payload is not None:
+            self.manual_rotation_matrix = orthonormalize_rotation_matrix(
+                np.array(manual_rotation_payload, dtype=float)
+            )
+        else:
+            self.manual_rotation_matrix = orthonormalize_rotation_matrix(
+                rotation_matrix_from_euler_xyz_deg(
+                    float(manual_placement.get("rx", 0.0)),
+                    float(manual_placement.get("ry", 0.0)),
+                    float(manual_placement.get("rz", 0.0)),
+                )
+            )
+        if any(key in manual_placement for key in ("rx", "ry", "rz")):
+            self.manual_rotation_display_values = np.array(
+                [
+                    float(manual_placement.get("rx", 0.0)),
+                    float(manual_placement.get("ry", 0.0)),
+                    float(manual_placement.get("rz", 0.0)),
+                ],
+                dtype=float,
+            )
+        else:
+            self.manual_rotation_display_values = np.array(
+                rotation_matrix_to_euler_xyz_deg(np.array(self.manual_rotation_matrix, dtype=float)),
+                dtype=float,
+            )
+        self.sync_manual_rotation_spin_boxes_from_matrix()
 
         combo_states = [
             (self.collimator, self.collimator.blockSignals(True)),
@@ -3495,6 +4366,9 @@ class MainWindow(QMainWindow):
             (self.parallel_projection_checkbox, view.get("parallel_projection_enabled")),
             (self.show_stage_checkbox, view.get("show_stage")),
             (self.show_beam_checkbox, view.get("show_beam")),
+            (self.show_gauge_volume_checkbox, view.get("show_gauge_volume")),
+            (self.show_imaging_detector_checkbox, view.get("show_imaging_detector")),
+            (self.show_diffraction_detectors_checkbox, view.get("show_diffraction_detectors")),
             (self.show_feature_points_checkbox, view.get("show_feature_points")),
             (self.show_prediction_points_checkbox, view.get("show_prediction_points")),
             (self.show_sample_triad_checkbox, view.get("show_sample_triad")),
@@ -3525,14 +4399,21 @@ class MainWindow(QMainWindow):
         if loaded_mesh is None:
             self.model_mesh = None
             self.mesh_path = None
-            self.mesh_path_label.setText("No mesh loaded")
         else:
             self.model_mesh = loaded_mesh
             self.mesh_path = loaded_mesh_path
-            self.mesh_path_label.setText(str(loaded_mesh_path))
 
-        self.csv_path_label.setText(f"Measurements restored from project {path.name}")
+        self.measurement_source_text = f"Measurements restored from project {path.name}"
         self.set_project_path_label(path)
+        ui_font_size_pt = float(view.get("ui_font_size_pt", DEFAULT_UI_FONT_POINT_SIZE))
+        app = QApplication.instance()
+        if app is not None:
+            apply_application_ui_font(app, ui_font_size_pt)
+        self.update_stress_table_metrics()
+        if self.ui_font_size_spin is not None:
+            previous_state = self.ui_font_size_spin.blockSignals(True)
+            self.ui_font_size_spin.setValue(ui_font_size_pt)
+            self.ui_font_size_spin.blockSignals(previous_state)
         self.viewer_font_size_offset = int(view.get("viewer_font_size_offset", self.viewer_font_size_offset))
         self.parallel_projection_enabled = bool(
             view.get("parallel_projection_enabled", self.parallel_projection_enabled)
@@ -3568,11 +4449,11 @@ class MainWindow(QMainWindow):
             self.residual_rows = residual_rows
             report_text = fit_payload.get("report_text")
             if isinstance(report_text, str) and report_text.strip():
-                self.report_box.setPlainText(report_text)
+                self.set_report_body(report_text)
             else:
-                self.report_box.setPlainText(self.build_fit_report(self.fit_transform, self.residual_rows))
+                self.set_report_body(self.build_fit_report(self.fit_transform, self.residual_rows))
         else:
-            self.report_box.setPlainText(
+            self.set_report_body(
                 "Project loaded.\n\nNo saved fit transform was present.\n"
                 "Run Fit placement or enable Manual Sample Placement to establish a transform."
             )
@@ -3580,6 +4461,7 @@ class MainWindow(QMainWindow):
         self.update_placement_status()
         self.update_placement_summary_fields()
         self.invalidate_detector_map(update_scene=False)
+        self.sync_point_picker_panel_mesh()
         self.update_scene(reset_camera=True)
         if self.main_tabs is not None:
             active_tab = int(view.get("active_tab", 0))
@@ -3587,7 +4469,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Loaded project {path.name}", 5000)
 
     def load_csv(self, path: Path) -> None:
-        self.csv_path_label.setText(str(path))
+        self.measurement_source_text = str(path)
         self.measurement_table.setRowCount(0)
         with path.open("r", newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
@@ -3605,7 +4487,7 @@ class MainWindow(QMainWindow):
         self.update_placement_status()
         self.update_placement_summary_fields()
         self.invalidate_detector_map(update_scene=False)
-        self.report_box.setPlainText(f"Loaded measurements from {path}")
+        self.set_report_body(f"Loaded measurements from {path}")
         self.update_scene(reset_camera=False)
 
     def load_csv_dialog(self) -> None:
@@ -3746,23 +4628,23 @@ class MainWindow(QMainWindow):
         self.load_mesh(Path(path_str))
 
     def open_point_picker_dialog(self) -> None:
-        if self.model_mesh is None or self.model_mesh.n_points == 0:
-            self.show_error("No mesh loaded", "Load a sample mesh before opening the point picker.")
+        if self.main_tabs is None:
             return
-        if self.point_picker_dialog is None:
-            self.point_picker_dialog = PointPickerDialog(self)
-        self.point_picker_dialog.set_mesh(self.model_mesh, self.mesh_path)
-        self.point_picker_dialog.show()
-        self.point_picker_dialog.raise_()
-        self.point_picker_dialog.activateWindow()
+        if self.point_picker_panel is not None:
+            self.point_picker_panel.set_mesh(self.model_mesh, self.mesh_path)
+        for index in range(self.main_tabs.count()):
+            if self.main_tabs.tabText(index) == "Pick Point":
+                self.main_tabs.setCurrentIndex(index)
+                break
 
     def load_mesh(self, path: Path) -> None:
         try:
             self.model_mesh = load_mesh_as_polydata(path)
             self.mesh_path = path
-            self.mesh_path_label.setText(str(path))
+            self.refresh_report_box()
             self.invalidate_detector_map(update_scene=False)
             self.update_placement_status()
+            self.sync_point_picker_panel_mesh()
             self.statusBar().showMessage(f"Loaded mesh {path.name}", 5000)
             self.update_scene(reset_camera=True)
         except Exception as exc:
@@ -3771,9 +4653,10 @@ class MainWindow(QMainWindow):
     def clear_mesh(self) -> None:
         self.mesh_path = None
         self.model_mesh = None
-        self.mesh_path_label.setText("No mesh loaded")
+        self.refresh_report_box()
         self.invalidate_detector_map(update_scene=False)
         self.update_placement_status()
+        self.sync_point_picker_panel_mesh()
         self.update_scene(reset_camera=False)
 
     def fit_placement(self) -> None:
@@ -3785,7 +4668,7 @@ class MainWindow(QMainWindow):
             self.update_placement_status()
             self.update_placement_summary_fields()
             self.invalidate_detector_map(update_scene=False)
-            self.report_box.setPlainText(self.build_fit_report(transform, residual_rows))
+            self.set_report_body(self.build_fit_report(transform, residual_rows))
             self.statusBar().showMessage("Placement fit completed", 5000)
             self.update_scene(reset_camera=False)
         except Exception as exc:
@@ -3973,7 +4856,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
         title_edit = QLineEdit(default_title, dialog)
-        bank_combo = QComboBox(dialog)
+        bank_combo = NoWheelComboBox(dialog)
         bank_combo.addItems(["Both banks", "Bank 1", "Bank 2"])
         form.addRow("Title", title_edit)
         form.addRow("Banks", bank_combo)
@@ -4083,20 +4966,48 @@ class MainWindow(QMainWindow):
         self.invalidate_detector_map(update_scene=False)
         self.update_scene(reset_camera=False)
 
+    def on_manual_rotation_increment_changed(self) -> None:
+        new_values = np.array(
+            [self.manual_rx.value(), self.manual_ry.value(), self.manual_rz.value()],
+            dtype=float,
+        )
+        deltas = new_values - self.manual_rotation_display_values
+        delta_x, delta_y, delta_z = deltas.tolist()
+        if max(abs(delta_x), abs(delta_y), abs(delta_z)) < 1e-12:
+            return
+
+        rotation = np.array(self.manual_rotation_matrix, dtype=float)
+        if abs(delta_x) >= 1e-12:
+            rotation = rotation @ rotation_matrix_from_euler_xyz_deg(delta_x, 0.0, 0.0)
+        if abs(delta_y) >= 1e-12:
+            rotation = rotation @ rotation_matrix_from_euler_xyz_deg(0.0, delta_y, 0.0)
+        if abs(delta_z) >= 1e-12:
+            rotation = rotation @ rotation_matrix_from_euler_xyz_deg(0.0, 0.0, delta_z)
+        self.manual_rotation_matrix = orthonormalize_rotation_matrix(rotation)
+        self.manual_rotation_display_values = new_values
+        self.sync_manual_rotation_spin_boxes_from_matrix()
+
+        if not self.manual_placement_enabled_checkbox.isChecked():
+            return
+        self.update_placement_status()
+        self.update_placement_summary_fields()
+        self.invalidate_detector_map(update_scene=False)
+        self.update_scene(reset_camera=False)
+
     def reset_manual_placement(self) -> None:
-        spin_boxes = (
+        translation_boxes = (
             self.manual_tx,
             self.manual_ty,
             self.manual_tz,
-            self.manual_rx,
-            self.manual_ry,
-            self.manual_rz,
         )
-        previous_states = [box.blockSignals(True) for box in spin_boxes]
-        for box in spin_boxes:
+        previous_states = [box.blockSignals(True) for box in translation_boxes]
+        for box in translation_boxes:
             box.setValue(0.0)
-        for box, previous in zip(spin_boxes, previous_states):
+        for box, previous in zip(translation_boxes, previous_states):
             box.blockSignals(previous)
+        self.manual_rotation_matrix = np.eye(3, dtype=float)
+        self.manual_rotation_display_values = np.zeros(3, dtype=float)
+        self.sync_manual_rotation_spin_boxes_from_matrix()
         self.update_placement_status()
         self.update_placement_summary_fields()
         self.invalidate_detector_map(update_scene=False)
@@ -4107,24 +5018,23 @@ class MainWindow(QMainWindow):
             self.show_error("No fit available", "Run Fit placement before loading fit values into manual placement.")
             return
         translation = np.array(self.fit_transform.translation, dtype=float)
-        euler_xyz = rotation_matrix_to_euler_xyz_deg(np.array(self.fit_transform.rotation, dtype=float))
-        spin_boxes = (
+        translation_boxes = (
             self.manual_tx,
             self.manual_ty,
             self.manual_tz,
-            self.manual_rx,
-            self.manual_ry,
-            self.manual_rz,
         )
-        previous_states = [box.blockSignals(True) for box in spin_boxes]
+        previous_states = [box.blockSignals(True) for box in translation_boxes]
         self.manual_tx.setValue(float(translation[0]))
         self.manual_ty.setValue(float(translation[1]))
         self.manual_tz.setValue(float(translation[2]))
-        self.manual_rx.setValue(float(euler_xyz[0]))
-        self.manual_ry.setValue(float(euler_xyz[1]))
-        self.manual_rz.setValue(float(euler_xyz[2]))
-        for box, previous in zip(spin_boxes, previous_states):
+        for box, previous in zip(translation_boxes, previous_states):
             box.blockSignals(previous)
+        self.manual_rotation_matrix = orthonormalize_rotation_matrix(np.array(self.fit_transform.rotation, dtype=float))
+        self.manual_rotation_display_values = np.array(
+            rotation_matrix_to_euler_xyz_deg(np.array(self.fit_transform.rotation, dtype=float)),
+            dtype=float,
+        )
+        self.sync_manual_rotation_spin_boxes_from_matrix()
         previous_toggle_state = self.manual_placement_enabled_checkbox.blockSignals(True)
         self.manual_placement_enabled_checkbox.setChecked(True)
         self.manual_placement_enabled_checkbox.blockSignals(previous_toggle_state)
@@ -4135,19 +5045,19 @@ class MainWindow(QMainWindow):
         self.update_scene(reset_camera=False)
 
     def clear_placement(self) -> None:
-        spin_boxes = (
+        translation_boxes = (
             self.manual_tx,
             self.manual_ty,
             self.manual_tz,
-            self.manual_rx,
-            self.manual_ry,
-            self.manual_rz,
         )
-        previous_states = [box.blockSignals(True) for box in spin_boxes]
-        for box in spin_boxes:
+        previous_states = [box.blockSignals(True) for box in translation_boxes]
+        for box in translation_boxes:
             box.setValue(0.0)
-        for box, previous in zip(spin_boxes, previous_states):
+        for box, previous in zip(translation_boxes, previous_states):
             box.blockSignals(previous)
+        self.manual_rotation_matrix = np.eye(3, dtype=float)
+        self.manual_rotation_display_values = np.zeros(3, dtype=float)
+        self.sync_manual_rotation_spin_boxes_from_matrix()
 
         previous_toggle_state = self.manual_placement_enabled_checkbox.blockSignals(True)
         self.manual_placement_enabled_checkbox.setChecked(False)
@@ -4155,7 +5065,7 @@ class MainWindow(QMainWindow):
 
         self.fit_transform = None
         self.residual_rows = []
-        self.report_box.setPlainText(
+        self.set_report_body(
             "Placement cleared.\n\n"
             "The model is now shown as imported.\n"
             "Run Fit placement or enable Manual Sample Placement to establish a new transform."
@@ -4352,10 +5262,7 @@ class MainWindow(QMainWindow):
                     "omega": self.pose_omega.value(),
                 },
             }
-            self.summary_beam_path.setText(format_decimal(average_length))
-            self.summary_detector_map.setText(
-                f"{resolution_y}x{resolution_z} @ {format_decimal(pixel_size_y)}/{format_decimal(pixel_size_z)}, max {format_decimal(max_length)}"
-            )
+            self.refresh_report_box()
             self.statusBar().showMessage("Computed imaging path-length map.", 5000)
             self.update_scene(reset_camera=False)
         except Exception as exc:
@@ -4368,14 +5275,7 @@ class MainWindow(QMainWindow):
                 stage_readout_local,
                 omega_deg,
             )
-            self.summary_diffraction_path.setText(
-                f"Bank 1: {format_decimal(self.diffraction_bank_1_map_state['average_length'])}, "
-                f"Bank 2: {format_decimal(self.diffraction_bank_2_map_state['average_length'])}"
-            )
-            self.summary_diffraction_map.setText(
-                f"Bank 1: {len(self.diffraction_bank_1_map_state['horizontal_angles_deg'])}x{len(self.diffraction_bank_1_map_state['vertical_angles_deg'])}, max {format_decimal(self.diffraction_bank_1_map_state['max_length'])}; "
-                f"Bank 2: {len(self.diffraction_bank_2_map_state['horizontal_angles_deg'])}x{len(self.diffraction_bank_2_map_state['vertical_angles_deg'])}, max {format_decimal(self.diffraction_bank_2_map_state['max_length'])}"
-            )
+            self.refresh_report_box()
             self.statusBar().showMessage("Computed diffraction path-length maps for banks 1 and 2.", 5000)
             self.update_scene(reset_camera=False)
         except Exception as exc:
@@ -4779,35 +5679,38 @@ class MainWindow(QMainWindow):
 
         focus = self.scene_focus_point()
         pivot = np.array(self.current_pivot_world(), dtype=float)
-        distance = self.scene_scale() * 1.8
+        distance = self.scene_scale() * 0.8
         preset = self.camera_preset
 
+        def offset(direction: np.ndarray) -> np.ndarray:
+            return normalized(np.asarray(direction, dtype=float)) * distance
+
         if preset == "iso":
-            position = focus + np.array([distance, -distance, distance], dtype=float)
+            position = focus + offset(np.array([1.0, -1.0, 1.0], dtype=float))
             view_up = (0.0, 0.0, 1.0)
             focal_point = focus
         elif preset == "+x":
-            position = focus + np.array([distance, 0.0, 0.0], dtype=float)
+            position = focus + offset(np.array([1.0, 0.0, 0.0], dtype=float))
             view_up = (0.0, 0.0, 1.0)
             focal_point = focus
         elif preset == "-x":
-            position = focus + np.array([-distance, 0.0, 0.0], dtype=float)
+            position = focus + offset(np.array([-1.0, 0.0, 0.0], dtype=float))
             view_up = (0.0, 0.0, 1.0)
             focal_point = focus
         elif preset == "+y":
-            position = focus + np.array([0.0, distance, 0.0], dtype=float)
+            position = focus + offset(np.array([0.0, 1.0, 0.0], dtype=float))
             view_up = (0.0, 0.0, 1.0)
             focal_point = focus
         elif preset == "-y":
-            position = focus + np.array([0.0, -distance, 0.0], dtype=float)
+            position = focus + offset(np.array([0.0, -1.0, 0.0], dtype=float))
             view_up = (0.0, 0.0, 1.0)
             focal_point = focus
         elif preset == "+z":
-            position = focus + np.array([0.0, 0.0, distance], dtype=float)
+            position = focus + offset(np.array([0.0, 0.0, 1.0], dtype=float))
             view_up = (0.0, 1.0, 0.0)
             focal_point = focus
         elif preset == "-z":
-            position = focus + np.array([0.0, 0.0, -distance], dtype=float)
+            position = focus + offset(np.array([0.0, 0.0, -1.0], dtype=float))
             view_up = (0.0, 1.0, 0.0)
             focal_point = focus
         elif preset == "theodolite":
@@ -4818,18 +5721,14 @@ class MainWindow(QMainWindow):
             focal_point = pivot
             view_up = (0.0, 0.0, 1.0)
         else:
-            position = focus + np.array([distance, -distance, distance], dtype=float)
+            position = focus + offset(np.array([1.0, -1.0, 1.0], dtype=float))
             view_up = (0.0, 0.0, 1.0)
             focal_point = focus
 
         self.plotter.camera_position = [tuple(position), tuple(focal_point), view_up]
         self.apply_projection_mode()
-        if reset_camera and preset != "theodolite":
-            self.plotter.reset_camera()
-            self.apply_projection_mode()
-        else:
-            self.plotter.reset_camera_clipping_range()
-            self.apply_projection_mode()
+        self.plotter.reset_camera_clipping_range()
+        self.apply_projection_mode()
 
     def set_camera_preset(self, preset: str) -> None:
         self.camera_preset = preset
@@ -5117,6 +6016,7 @@ class MainWindow(QMainWindow):
         slit_height = self.slit_height.value()
         beam_length = self.beam_length.value()
         show_beam = self.show_beam_checkbox is None or self.show_beam_checkbox.isChecked()
+        show_gauge_volume = self.show_gauge_volume_checkbox is None or self.show_gauge_volume_checkbox.isChecked()
         slit_thickness = max(min(self.scene_scale() * 0.01, 8.0), 2.0)
         slit_plate = pv.Box(
             bounds=(
@@ -5153,6 +6053,17 @@ class MainWindow(QMainWindow):
                 slit_center[2] + slit_height / 2.0,
             )
         )
+        gauge_volume_depth = float(self.collimator.currentText())
+        gauge_volume_box = pv.Box(
+            bounds=(
+                pivot[0] - gauge_volume_depth / 2.0,
+                pivot[0] + gauge_volume_depth / 2.0,
+                pivot[1] - slit_width / 2.0,
+                pivot[1] + slit_width / 2.0,
+                pivot[2] - slit_height / 2.0,
+                pivot[2] + slit_height / 2.0,
+            )
+        )
         if show_beam:
             self.set_or_add_mesh(
                 "beam_mesh",
@@ -5179,6 +6090,22 @@ class MainWindow(QMainWindow):
             if self.beam_centerline_mesh is not None:
                 self.plotter.remove_actor("beam_centerline", render=False)
                 self.beam_centerline_mesh = None
+        if show_gauge_volume:
+            self.set_or_add_mesh(
+                "gauge_volume_mesh",
+                gauge_volume_box,
+                "gauge_volume",
+                color="#5bc0be",
+                opacity=0.24,
+                smooth_shading=True,
+                show_edges=True,
+                edge_color="#187d7a",
+                line_width=2,
+            )
+        else:
+            if self.gauge_volume_mesh is not None:
+                self.plotter.remove_actor("gauge_volume", render=False)
+                self.gauge_volume_mesh = None
         direct_detector_center = np.array(DIRECT_DETECTOR_CENTER_WORLD, dtype=float)
         direct_detector_box = make_oriented_box(
             center=direct_detector_center,
@@ -5189,28 +6116,37 @@ class MainWindow(QMainWindow):
             size_v=self.detector_height_z.value(),
             size_w=DETECTOR_THICKNESS,
         )
-        self.set_or_add_mesh(
-            "detector_mesh",
-            direct_detector_box,
-            "imaging_detector_plane",
-            color="#f4f4f5",
-            opacity=0.92,
-            smooth_shading=False,
-            show_edges=True,
-            edge_color="#d11f1f",
-            line_width=2,
+        show_imaging_detector = (
+            self.show_imaging_detector_checkbox is None or self.show_imaging_detector_checkbox.isChecked()
         )
-        self.plotter.remove_actor("imaging_detector_label", render=False)
-        self.plotter.add_point_labels(
-            pv.PolyData(np.array([direct_detector_center], dtype=float)),
-            ["Imaging detector"],
-            font_size=self.viewer_font_size(max(gui_like_label_font_size(self) - 1, 14)),
-            shape=None,
-            text_color="#9a0000",
-            always_visible=True,
-            name="imaging_detector_label",
-            render=False,
-        )
+        if show_imaging_detector:
+            self.set_or_add_mesh(
+                "detector_mesh",
+                direct_detector_box,
+                "imaging_detector_plane",
+                color="#f4f4f5",
+                opacity=0.92,
+                smooth_shading=False,
+                show_edges=True,
+                edge_color="#d11f1f",
+                line_width=2,
+            )
+            self.plotter.remove_actor("imaging_detector_label", render=False)
+            self.plotter.add_point_labels(
+                pv.PolyData(np.array([direct_detector_center], dtype=float)),
+                ["Imaging detector"],
+                font_size=self.viewer_font_size(max(gui_like_label_font_size(self) - 1, 14)),
+                shape=None,
+                text_color="#9a0000",
+                always_visible=True,
+                name="imaging_detector_label",
+                render=False,
+            )
+        else:
+            if self.detector_mesh is not None:
+                self.plotter.remove_actor("imaging_detector_plane", render=False)
+                self.detector_mesh = None
+            self.plotter.remove_actor("imaging_detector_label", render=False)
 
         diffraction_bank_1_geometry = self.current_diffraction_bank_1_geometry()
         diffraction_bank_1_box = make_oriented_box(
@@ -5222,28 +6158,6 @@ class MainWindow(QMainWindow):
             size_v=float(diffraction_bank_1_geometry["height"]),
             size_w=DETECTOR_THICKNESS,
         )
-        self.set_or_add_mesh(
-            "diffraction_bank_1_detector_mesh",
-            diffraction_bank_1_box,
-            "diffraction_detector_bank_1_plane",
-            color="#fff5e6",
-            opacity=0.65,
-            smooth_shading=False,
-            show_edges=True,
-            edge_color="#d17a00",
-            line_width=2,
-        )
-        self.plotter.remove_actor("diffraction_detector_bank_1_label", render=False)
-        self.plotter.add_point_labels(
-            pv.PolyData(np.array([diffraction_bank_1_geometry["center"]], dtype=float)),
-            ["Diffraction detector - bank 1"],
-            font_size=self.viewer_font_size(max(gui_like_label_font_size(self) - 1, 14)),
-            shape=None,
-            text_color="#9a5400",
-            always_visible=True,
-            name="diffraction_detector_bank_1_label",
-            render=False,
-        )
         diffraction_bank_2_geometry = self.current_diffraction_bank_2_geometry()
         diffraction_bank_2_box = make_oriented_box(
             center=np.asarray(diffraction_bank_2_geometry["center"], dtype=float),
@@ -5254,28 +6168,63 @@ class MainWindow(QMainWindow):
             size_v=float(diffraction_bank_2_geometry["height"]),
             size_w=DETECTOR_THICKNESS,
         )
-        self.set_or_add_mesh(
-            "diffraction_bank_2_detector_mesh",
-            diffraction_bank_2_box,
-            "diffraction_detector_bank_2_plane",
-            color="#e8f3ff",
-            opacity=0.65,
-            smooth_shading=False,
-            show_edges=True,
-            edge_color="#225ea8",
-            line_width=2,
+        show_diffraction_detectors = (
+            self.show_diffraction_detectors_checkbox is None or self.show_diffraction_detectors_checkbox.isChecked()
         )
-        self.plotter.remove_actor("diffraction_detector_bank_2_label", render=False)
-        self.plotter.add_point_labels(
-            pv.PolyData(np.array([diffraction_bank_2_geometry["center"]], dtype=float)),
-            ["Diffraction detector - bank 2"],
-            font_size=self.viewer_font_size(max(gui_like_label_font_size(self) - 1, 14)),
-            shape=None,
-            text_color="#12407a",
-            always_visible=True,
-            name="diffraction_detector_bank_2_label",
-            render=False,
-        )
+        if show_diffraction_detectors:
+            self.set_or_add_mesh(
+                "diffraction_bank_1_detector_mesh",
+                diffraction_bank_1_box,
+                "diffraction_detector_bank_1_plane",
+                color="#fff5e6",
+                opacity=0.65,
+                smooth_shading=False,
+                show_edges=True,
+                edge_color="#d17a00",
+                line_width=2,
+            )
+            self.plotter.remove_actor("diffraction_detector_bank_1_label", render=False)
+            self.plotter.add_point_labels(
+                pv.PolyData(np.array([diffraction_bank_1_geometry["center"]], dtype=float)),
+                ["Diffraction detector - bank 1"],
+                font_size=self.viewer_font_size(max(gui_like_label_font_size(self) - 1, 14)),
+                shape=None,
+                text_color="#9a5400",
+                always_visible=True,
+                name="diffraction_detector_bank_1_label",
+                render=False,
+            )
+            self.set_or_add_mesh(
+                "diffraction_bank_2_detector_mesh",
+                diffraction_bank_2_box,
+                "diffraction_detector_bank_2_plane",
+                color="#e8f3ff",
+                opacity=0.65,
+                smooth_shading=False,
+                show_edges=True,
+                edge_color="#225ea8",
+                line_width=2,
+            )
+            self.plotter.remove_actor("diffraction_detector_bank_2_label", render=False)
+            self.plotter.add_point_labels(
+                pv.PolyData(np.array([diffraction_bank_2_geometry["center"]], dtype=float)),
+                ["Diffraction detector - bank 2"],
+                font_size=self.viewer_font_size(max(gui_like_label_font_size(self) - 1, 14)),
+                shape=None,
+                text_color="#12407a",
+                always_visible=True,
+                name="diffraction_detector_bank_2_label",
+                render=False,
+            )
+        else:
+            if self.diffraction_bank_1_detector_mesh is not None:
+                self.plotter.remove_actor("diffraction_detector_bank_1_plane", render=False)
+                self.diffraction_bank_1_detector_mesh = None
+            if self.diffraction_bank_2_detector_mesh is not None:
+                self.plotter.remove_actor("diffraction_detector_bank_2_plane", render=False)
+                self.diffraction_bank_2_detector_mesh = None
+            self.plotter.remove_actor("diffraction_detector_bank_1_label", render=False)
+            self.plotter.remove_actor("diffraction_detector_bank_2_label", render=False)
         if self.detector_map_state is not None:
             remove_scalar_bar_if_present(self.plotter, "Imaging path")
             detector_map_mesh = self.detector_map_state["mesh"]
@@ -5372,10 +6321,10 @@ class MainWindow(QMainWindow):
         if show_diffraction_vectors:
             diffraction_vector_bank_1 = pv.Arrow(
                 start=pivot,
-                direction=np.array([-200.0, 200.0, 0.0], dtype=float),
-                tip_length=0.09,
-                tip_radius=0.022,
-                shaft_radius=0.006,
+                direction=np.array([-100.0, 100.0, 0.0], dtype=float),
+                tip_length=0.0225,
+                tip_radius=0.011,
+                shaft_radius=0.003,
                 scale="auto",
             )
             self.set_or_add_mesh(
@@ -5387,10 +6336,10 @@ class MainWindow(QMainWindow):
             )
             diffraction_vector_bank_2 = pv.Arrow(
                 start=pivot,
-                direction=np.array([-200.0, -200.0, 0.0], dtype=float),
-                tip_length=0.09,
-                tip_radius=0.022,
-                shaft_radius=0.006,
+                direction=np.array([-100.0, -100.0, 0.0], dtype=float),
+                tip_length=0.0225,
+                tip_radius=0.011,
+                shaft_radius=0.003,
                 scale="auto",
             )
             self.set_or_add_mesh(
@@ -5729,7 +6678,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if hasattr(Qt, "AA_EnableHighDpiScaling"):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, "AA_UseHighDpiPixmaps"):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
     app = QApplication(sys.argv if argv is None else [sys.argv[0], *argv])
+    apply_application_ui_font(app, DEFAULT_UI_FONT_POINT_SIZE)
     window = MainWindow(enable_3d=not args.smoke_test)
 
     if args.csv:
@@ -5744,7 +6699,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         app.quit()
         return 0
 
-    window.show()
+    window.showMaximized()
     return app.exec_()
 
 
