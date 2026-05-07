@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" role="img" aria-label="Export fit JSON">
+  <path d="M6 4.5h8l4 4v11H6z"/>
+  <path d="M14 4.5v4h4"/>
+  <path d="M8.75 14.5c.75-1.5 1.75-1.5 2.5 0s1.75 1.5 2.5 0"/>
+  <path d="M15.5 15.5h3.5"/>
+  <path d="M17.25 13.75 19 15.5l-1.75 1.75"/>
+</svg>

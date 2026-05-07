@@ -332,8 +332,16 @@ def render_toolbar_toggle_icon(kind: str, color: QColor, size: int = 24) -> QPix
         painter.drawText(QRect(2, 2, size - 4, size - 4), align, text)
         painter.restore()
 
+    def draw_center_label(text: str) -> None:
+        font = QFont()
+        font.setBold(True)
+        font.setPixelSize(10)
+        painter.save()
+        painter.setFont(font)
+        painter.drawText(QRect(2, 2, size - 4, size - 4), Qt.AlignCenter, text)
+        painter.restore()
+
     if kind == "parallel":
-        painter.drawRect(QRect(4, 4, size - 8, size - 8))
         painter.drawLine(int(c - 4), 6, int(c - 4), size - 6)
         painter.drawLine(int(c + 4), 6, int(c + 4), size - 6)
     elif kind == "stage":
@@ -365,9 +373,15 @@ def render_toolbar_toggle_icon(kind: str, color: QColor, size: int = 24) -> QPix
         painter.drawPolygon(front)
         painter.drawPolygon(side)
     elif kind == "beam":
-        painter.drawLine(4, int(c), size - 7, int(c))
-        painter.drawLine(size - 10, int(c - 4), size - 5, int(c))
-        painter.drawLine(size - 10, int(c + 4), size - 5, int(c))
+        font = QFont()
+        font.setBold(True)
+        font.setPixelSize(14)
+        painter.save()
+        painter.setFont(font)
+        painter.drawText(QRect(0, int(c - 9), 11, 16), Qt.AlignCenter, "n")
+        painter.restore()
+        painter.drawLine(QPointF(9, c - 2), QPointF(size - 2, c - 2))
+        painter.drawLine(QPointF(9, c + 2), QPointF(size - 2, c + 2))
     elif kind == "cube":
         front = QRect(5, 8, 9, 9)
         back = QRect(8, 5, 9, 9)
@@ -378,10 +392,17 @@ def render_toolbar_toggle_icon(kind: str, color: QColor, size: int = 24) -> QPix
         painter.drawLine(front.bottomLeft(), back.bottomLeft())
         painter.drawLine(front.bottomRight(), back.bottomRight())
     elif kind == "imaging":
-        painter.drawRect(QRect(4, 6, size - 8, size - 12))
-        painter.drawLine(int(c), 3, int(c), 6)
-        painter.drawLine(int(c), size - 6, int(c), size - 3)
-        painter.drawLine(7, int(c), size - 7, int(c))
+        front = QRect(4, 7, 11, 11)
+        back_top_left = QPointF(8, 3)
+        back_top_right = QPointF(size - 4, 3)
+        back_bottom_right = QPointF(size - 4, size - 8)
+        painter.drawRect(front)
+        painter.drawRect(QRect(7, 10, 5, 5))
+        painter.drawLine(front.topLeft(), back_top_left)
+        painter.drawLine(front.topRight(), back_top_right)
+        painter.drawLine(front.bottomRight(), back_bottom_right)
+        painter.drawLine(back_top_left, back_top_right)
+        painter.drawLine(back_top_right, back_bottom_right)
     elif kind == "features":
         painter.setBrush(color)
         for point in ((6, 7), (15, 6), (10, 12), (16, 16), (6, 16)):
@@ -411,14 +432,19 @@ def render_toolbar_toggle_icon(kind: str, color: QColor, size: int = 24) -> QPix
         painter.drawLine(size - 10, int(c), size - 2, int(c))
         painter.drawLine(size - 6, int(c - 4), size - 6, int(c + 4))
     elif kind == "diffraction":
-        origin = QPointF(c - 1, c)
-        painter.drawLine(origin, QPointF(size - 5, 6))
-        painter.drawLine(origin, QPointF(size - 5, size - 6))
-        painter.drawLine(size - 9, 7, size - 5, 6)
-        painter.drawLine(size - 8, 10, size - 5, 6)
-        painter.drawLine(size - 9, size - 7, size - 5, size - 6)
-        painter.drawLine(size - 8, size - 10, size - 5, size - 6)
-        painter.drawLine(4, int(c), int(c - 2), int(c))
+        front = QRect(4, 8, 9, 9)
+        back_top_left = QPointF(1, 4)
+        back_top_right = QPointF(size - 5, 4)
+        back_bottom_left = QPointF(1, size - 4)
+        back_bottom_right = QPointF(size - 5, size - 4)
+        painter.drawRect(front)
+        painter.drawLine(front.topLeft(), back_top_left)
+        painter.drawLine(front.topRight(), back_top_right)
+        painter.drawLine(front.bottomLeft(), back_bottom_left)
+        painter.drawLine(front.bottomRight(), back_bottom_right)
+        painter.drawLine(back_top_left, back_top_right)
+        painter.drawLine(back_top_right, back_bottom_right)
+        painter.drawLine(back_bottom_left, back_bottom_right)
     elif kind == "cam_iso":
         top = QPolygonF(
             [
@@ -451,50 +477,88 @@ def render_toolbar_toggle_icon(kind: str, color: QColor, size: int = 24) -> QPix
         painter.drawLine(QPointF(c, c + 1), QPointF(size - 3, c + 1))
         painter.drawLine(QPointF(c, c + 1), QPointF(4, size - 4))
     elif kind == "cam_px":
-        draw_arrow(QPointF(5, c), QPointF(size - 5, c), QPointF(size - 9, c - 4), QPointF(size - 9, c + 4))
-        draw_corner_label("X")
+        draw_center_label("+X")
     elif kind == "cam_nx":
-        draw_arrow(QPointF(size - 5, c), QPointF(5, c), QPointF(9, c - 4), QPointF(9, c + 4))
-        draw_corner_label("X")
+        draw_center_label("-X")
     elif kind == "cam_py":
-        draw_arrow(QPointF(c, size - 5), QPointF(c, 5), QPointF(c - 4, 9), QPointF(c + 4, 9))
-        draw_corner_label("Y", Qt.AlignTop | Qt.AlignRight)
+        draw_center_label("+Y")
     elif kind == "cam_ny":
-        draw_arrow(QPointF(c, 5), QPointF(c, size - 5), QPointF(c - 4, size - 9), QPointF(c + 4, size - 9))
-        draw_corner_label("Y", Qt.AlignTop | Qt.AlignRight)
+        draw_center_label("-Y")
     elif kind == "cam_pz":
-        draw_arrow(
-            QPointF(6, size - 6),
-            QPointF(size - 6, 6),
-            QPointF(size - 10, 6),
-            QPointF(size - 6, 10),
-        )
-        draw_corner_label("Z", Qt.AlignBottom | Qt.AlignLeft)
+        draw_center_label("+Z")
     elif kind == "cam_nz":
-        draw_arrow(
-            QPointF(size - 6, 6),
-            QPointF(6, size - 6),
-            QPointF(6, size - 10),
-            QPointF(10, size - 6),
-        )
-        draw_corner_label("Z", Qt.AlignBottom | Qt.AlignLeft)
+        draw_center_label("-Z")
     elif kind == "cam_theodolite":
         painter.drawEllipse(QPointF(c, 8), 3.5, 3.5)
-        painter.drawLine(QPointF(c - 5, 8), QPointF(c + 5, 8))
-        painter.drawLine(QPointF(c, 12), QPointF(c - 5, size - 5))
-        painter.drawLine(QPointF(c, 12), QPointF(c, size - 4))
-        painter.drawLine(QPointF(c, 12), QPointF(c + 5, size - 5))
-        painter.drawLine(QPointF(c + 3, 8), QPointF(size - 4, 6))
+        painter.drawLine(QPointF(c, 11.5), QPointF(c, size - 4))
     elif kind == "act_add":
         painter.drawLine(QPointF(c, 5), QPointF(c, size - 5))
         painter.drawLine(QPointF(5, c), QPointF(size - 5, c))
     elif kind == "act_remove":
         painter.drawLine(QPointF(5, c), QPointF(size - 5, c))
+    elif kind == "act_clear_placement":
+        painter.drawEllipse(QPointF(c, c), 6.5, 6.5)
+        painter.drawLine(QPointF(c, 3), QPointF(c, 7))
+        painter.drawLine(QPointF(c, size - 7), QPointF(c, size - 3))
+        painter.drawLine(QPointF(3, c), QPointF(7, c))
+        painter.drawLine(QPointF(size - 7, c), QPointF(size - 3, c))
+        painter.drawLine(QPointF(c - 4, c - 4), QPointF(c + 4, c + 4))
+        painter.drawLine(QPointF(c + 4, c - 4), QPointF(c - 4, c + 4))
     elif kind == "act_load":
         painter.drawRect(QRect(5, 8, size - 10, size - 11))
         painter.drawLine(QPointF(c, 4), QPointF(c, 13))
         painter.drawLine(QPointF(c, 13), QPointF(c - 4, 9))
         painter.drawLine(QPointF(c, 13), QPointF(c + 4, 9))
+    elif kind == "act_project_load":
+        painter.drawRect(QRect(5, 7, size - 10, size - 10))
+        painter.drawLine(QPointF(7, 11), QPointF(size - 7, 11))
+        painter.drawLine(QPointF(9, 15), QPointF(size - 9, 15))
+        draw_arrow(QPointF(c, 3), QPointF(c, size - 5), QPointF(c - 4, size - 9), QPointF(c + 4, size - 9))
+    elif kind == "act_project_save":
+        painter.drawRect(QRect(5, 5, size - 10, size - 10))
+        painter.drawLine(QPointF(8, 8), QPointF(size - 8, 8))
+        painter.drawRect(QRect(8, size - 12, size - 16, 5))
+        painter.drawLine(QPointF(size - 9, 5), QPointF(size - 5, 9))
+    elif kind == "act_mesh_load":
+        top = QPolygonF(
+            [
+                QPointF(6, c - 3),
+                QPointF(c, 6),
+                QPointF(size - 6, c - 3),
+                QPointF(c, c + 2),
+            ]
+        )
+        front = QPolygonF(
+            [
+                QPointF(6, c - 3),
+                QPointF(6, size - 8),
+                QPointF(c, size - 5),
+                QPointF(c, c + 2),
+            ]
+        )
+        side = QPolygonF(
+            [
+                QPointF(c, c + 2),
+                QPointF(c, size - 5),
+                QPointF(size - 6, size - 8),
+                QPointF(size - 6, c - 3),
+            ]
+        )
+        painter.drawPolygon(top)
+        painter.drawPolygon(front)
+        painter.drawPolygon(side)
+        draw_arrow(QPointF(c, 3), QPointF(c, c - 2), QPointF(c - 3, c - 5), QPointF(c + 3, c - 5))
+    elif kind == "act_table_load":
+        painter.drawRect(QRect(5, 7, size - 10, size - 8))
+        painter.drawLine(QPointF(5, 12), QPointF(size - 5, 12))
+        painter.drawLine(QPointF(5, 17), QPointF(size - 5, 17))
+        painter.drawLine(QPointF(11, 7), QPointF(11, size - 1))
+        draw_arrow(QPointF(c, 3), QPointF(c, 11), QPointF(c - 4, 7), QPointF(c + 4, 7))
+    elif kind == "act_table_save":
+        painter.drawRect(QRect(5, 5, size - 10, size - 10))
+        painter.drawLine(QPointF(5, 11), QPointF(size - 5, 11))
+        painter.drawLine(QPointF(11, 5), QPointF(11, size - 5))
+        painter.drawRect(QRect(9, size - 10, size - 18, 4))
     elif kind == "act_save":
         painter.drawRect(QRect(5, 5, size - 10, size - 10))
         painter.drawLine(QPointF(8, 8), QPointF(size - 8, 8))
@@ -522,6 +586,27 @@ def render_toolbar_toggle_icon(kind: str, color: QColor, size: int = 24) -> QPix
         painter.drawLine(QPointF(size - 9, 10), QPointF(size - 6, 6))
         painter.drawLine(QPointF(size - 10, size - 7), QPointF(size - 6, size - 6))
         painter.drawLine(QPointF(size - 9, size - 10), QPointF(size - 6, size - 6))
+    elif kind == "act_detector_map":
+        painter.drawRect(QRect(4, 6, size - 8, size - 12))
+        painter.drawLine(QPointF(8, 10), QPointF(size - 8, 10))
+        painter.drawLine(QPointF(8, 14), QPointF(size - 8, 14))
+        painter.drawLine(QPointF(c, 6), QPointF(c, size - 6))
+        painter.setBrush(color)
+        painter.drawEllipse(QPointF(size - 8, size - 8), 2.3, 2.3)
+    elif kind == "act_diffraction_map":
+        painter.drawLine(QPointF(4, c), QPointF(c - 1, c))
+        painter.drawLine(QPointF(c - 1, c), QPointF(size - 5, 6))
+        painter.drawLine(QPointF(c - 1, c), QPointF(size - 5, size - 6))
+        painter.drawEllipse(QPointF(c - 1, c), 2.2, 2.2)
+        painter.drawLine(QPointF(size - 9, 7), QPointF(size - 5, 6))
+        painter.drawLine(QPointF(size - 8, 10), QPointF(size - 5, 6))
+        painter.drawLine(QPointF(size - 9, size - 7), QPointF(size - 5, size - 6))
+        painter.drawLine(QPointF(size - 8, size - 10), QPointF(size - 5, size - 6))
+    elif kind == "diffraction_vectors":
+        painter.drawEllipse(QPointF(c, c), 3.0, 3.0)
+        draw_arrow(QPointF(c, c), QPointF(size - 5, 6), QPointF(size - 9, 6), QPointF(size - 6, 10))
+        draw_arrow(QPointF(c, c), QPointF(size - 5, size - 6), QPointF(size - 9, size - 6), QPointF(size - 6, size - 10))
+        draw_arrow(QPointF(c, c), QPointF(5, c), QPointF(9, c - 4), QPointF(9, c + 4))
     elif kind == "act_time":
         painter.drawEllipse(QPointF(c, c), 7.0, 7.0)
         painter.drawLine(QPointF(c, c), QPointF(c, 8))
@@ -561,6 +646,15 @@ def render_toolbar_toggle_icon(kind: str, color: QColor, size: int = 24) -> QPix
         painter.drawLine(QPointF(9, 10), QPointF(size - 12, 10))
         painter.drawLine(QPointF(9, 14), QPointF(size - 14, 14))
         draw_arrow(QPointF(9, size - 8), QPointF(size - 5, size - 8), QPointF(size - 9, size - 12), QPointF(size - 9, size - 4))
+    elif kind == "act_map_export":
+        painter.drawRect(QRect(4, 5, size - 9, size - 9))
+        painter.drawLine(QPointF(4, 11), QPointF(size - 5, 11))
+        painter.drawLine(QPointF(10, 5), QPointF(10, size - 4))
+        painter.setBrush(color)
+        painter.drawEllipse(QPointF(7, 8), 1.6, 1.6)
+        painter.drawEllipse(QPointF(16, 16), 1.6, 1.6)
+        painter.setBrush(Qt.NoBrush)
+        draw_arrow(QPointF(10, size - 5), QPointF(size - 4, size - 5), QPointF(size - 8, size - 9), QPointF(size - 8, size - 1))
     elif kind == "act_pick":
         painter.drawEllipse(QPointF(c, c), 6.5, 6.5)
         painter.drawLine(QPointF(c, 3), QPointF(c, 7))
@@ -593,7 +687,7 @@ def make_toolbar_toggle_button(
     button.setCheckable(True)
     button.setChecked(checked)
     button.setIcon(make_toolbar_toggle_icon(icon_kind))
-    button.setIconSize(QSize(16, 16))
+    button.setIconSize(QSize(18, 18))
     button.setToolTip(tooltip)
     button.setToolTipDuration(4000)
     button.setStatusTip(tooltip)
@@ -610,7 +704,7 @@ def make_toolbar_preset_button(icon_kind: str, tooltip: str, slot: Callable[[], 
     button = QToolButton()
     button.setCheckable(True)
     button.setIcon(make_toolbar_toggle_icon(icon_kind))
-    button.setIconSize(QSize(16, 16))
+    button.setIconSize(QSize(18, 18))
     button.setToolTip(tooltip)
     button.setToolTipDuration(4000)
     button.setStatusTip(tooltip)
@@ -633,6 +727,29 @@ def make_toolbar_action_button(
 ) -> QToolButton:
     button = QToolButton()
     button.setIcon(make_toolbar_toggle_icon(icon_kind))
+    button.setIconSize(QSize(icon_size, icon_size))
+    button.setToolTip(tooltip)
+    button.setToolTipDuration(4000)
+    button.setStatusTip(tooltip)
+    button.setWhatsThis(tooltip)
+    button.setAccessibleName(tooltip)
+    button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+    button.setAutoRaise(False)
+    button.setFixedSize(button_size, button_size)
+    button.clicked.connect(slot)
+    return button
+
+
+def make_toolbar_icon_button(
+    icon: QIcon,
+    tooltip: str,
+    slot: Callable[[], None],
+    *,
+    button_size: int = 24,
+    icon_size: int = 16,
+) -> QToolButton:
+    button = QToolButton()
+    button.setIcon(icon)
     button.setIconSize(QSize(icon_size, icon_size))
     button.setToolTip(tooltip)
     button.setToolTipDuration(4000)
@@ -1222,6 +1339,11 @@ class SpreadsheetTableWidget(QTableWidget):
         super().__init__(rows, columns, parent)
         self.read_only_columns: set[int] = set()
         self.after_paste: Optional[Callable[[], None]] = None
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(180, 120)
 
     def keyPressEvent(self, event) -> None:
         if event.matches(QKeySequence.Copy):
@@ -1752,6 +1874,23 @@ class PointPickerPanel(QWidget):
         if self.enable_3d:
             self.initialize_surface_point_picking()
 
+    def closeEvent(self, event) -> None:
+        self.cleanup_plotter()
+        super().closeEvent(event)
+
+    def cleanup_plotter(self) -> None:
+        plotter = getattr(self, "plotter", None)
+        if plotter is None:
+            return
+        try:
+            plotter.close()
+        except Exception:
+            try:
+                plotter.Finalize()
+            except Exception:
+                pass
+        self.plotter = None
+
     def initialize_surface_point_picking(self) -> None:
         if self._surface_picking_initialized:
             return
@@ -2261,6 +2400,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Sample Setup Fitting")
         self.resize(1600, 960)
+        self.setWindowState(self.windowState() | Qt.WindowMaximized)
 
         self.enable_3d = enable_3d
         self.project_path: Optional[Path] = None
@@ -2474,6 +2614,22 @@ class MainWindow(QMainWindow):
         if self.controls_scroll is not None:
             self.controls_scroll.verticalScrollBar().setValue(0)
 
+    def closeEvent(self, event) -> None:
+        point_picker_panel = getattr(self, "point_picker_panel", None)
+        if point_picker_panel is not None:
+            point_picker_panel.cleanup_plotter()
+        plotter = getattr(self, "plotter", None)
+        if plotter is not None:
+            try:
+                plotter.close()
+            except Exception:
+                try:
+                    plotter.Finalize()
+                except Exception:
+                    pass
+            self.plotter = None
+        super().closeEvent(event)
+
     def apply_initial_table_column_widths(self) -> None:
         for table in (getattr(self, "measurement_table", None), getattr(self, "prediction_table", None)):
             if table is None:
@@ -2492,6 +2648,7 @@ class MainWindow(QMainWindow):
     def _build_files_group(self) -> QGroupBox:
         group = QGroupBox("Files")
         layout = QVBoxLayout(group)
+        icons_dir = Path(__file__).resolve().parent / "icons"
         group.setStyleSheet(
             """
             QToolButton {
@@ -2514,38 +2671,38 @@ class MainWindow(QMainWindow):
 
         button_flow = FlowLayout(spacing=10)
 
-        save_project_button = make_toolbar_action_button(
-            "act_save",
+        save_project_button = make_toolbar_icon_button(
+            QIcon(str(icons_dir / "save-project.svg")),
             "Save project",
             self.save_project_dialog,
             button_size=30,
             icon_size=18,
         )
-        load_project_button = make_toolbar_action_button(
-            "act_load",
+        load_project_button = make_toolbar_icon_button(
+            QIcon(str(icons_dir / "load-project.svg")),
             "Load project",
             self.load_project_dialog,
             button_size=30,
             icon_size=18,
         )
 
-        load_mesh_button = make_toolbar_action_button(
-            "act_load",
+        load_mesh_button = make_toolbar_icon_button(
+            QIcon(str(icons_dir / "import-stl-mesh.svg")),
             "Load STL/mesh",
             self.load_mesh_dialog,
             button_size=30,
             icon_size=18,
         )
-        clear_mesh_button = make_toolbar_action_button(
-            "act_mesh_clear",
+        clear_mesh_button = make_toolbar_icon_button(
+            QIcon(str(icons_dir / "clear-stl-mesh.svg")),
             "Clear mesh",
             self.clear_mesh,
             button_size=30,
             icon_size=18,
         )
 
-        export_button = make_toolbar_action_button(
-            "act_export",
+        export_button = make_toolbar_icon_button(
+            QIcon(str(icons_dir / "export-fit-json.svg")),
             "Export fit JSON",
             self.export_json_dialog,
             button_size=30,
@@ -2594,7 +2751,7 @@ class MainWindow(QMainWindow):
             """
         )
         load_mesh_button = make_toolbar_action_button(
-            "act_load",
+            "act_mesh_load",
             "Load STL/mesh",
             self.load_mesh_dialog,
             button_size=30,
@@ -3000,28 +3157,28 @@ class MainWindow(QMainWindow):
         action_row.setSpacing(6)
 
         clear_placement_button = make_toolbar_action_button(
-            "act_remove",
+            "act_clear_placement",
             "Clear placement",
             self.clear_placement,
             button_size=28,
             icon_size=18,
         )
         compute_detector_map_button = make_toolbar_action_button(
-            "imaging",
+            "act_detector_map",
             "Compute imaging map",
             self.compute_detector_map,
             button_size=28,
             icon_size=18,
         )
         compute_diffraction_map_button = make_toolbar_action_button(
-            "act_paths",
+            "act_diffraction_map",
             "Compute diffraction path",
             self.compute_diffraction_map,
             button_size=28,
             icon_size=18,
         )
         export_detector_map_button = make_toolbar_action_button(
-            "act_export",
+            "act_map_export",
             "Export detector map",
             self.export_detector_map_dialog,
             button_size=28,
@@ -3103,7 +3260,7 @@ class MainWindow(QMainWindow):
             ("show_prediction_points_checkbox", "predicted", "Show predicted points", True, self.on_overlay_visibility_changed),
             ("show_sample_triad_checkbox", "triad", "Show sample triad", True, self.on_overlay_visibility_changed),
             ("show_theodolite_sight_line_checkbox", "sight", "Show sight line", True, self.on_overlay_visibility_changed),
-            ("show_diffraction_vectors_checkbox", "diffraction", "Show diffraction vectors", True, self.on_overlay_visibility_changed),
+            ("show_diffraction_vectors_checkbox", "diffraction_vectors", "Show diffraction vectors", True, self.on_overlay_visibility_changed),
         ]
         for attribute_name, icon_kind, tooltip, checked, slot in toggle_specs:
             button = make_toolbar_toggle_button(icon_kind, tooltip, checked, slot)
@@ -3139,8 +3296,8 @@ class MainWindow(QMainWindow):
         )
 
         add_row_button = make_toolbar_action_button("act_add", "Add row", self.add_measurement_row)
-        load_csv_button = make_toolbar_action_button("act_load", "Load CSV", self.load_csv_dialog)
-        save_csv_button = make_toolbar_action_button("act_save", "Save CSV", self.save_csv_dialog)
+        load_csv_button = make_toolbar_action_button("act_table_load", "Load CSV", self.load_csv_dialog)
+        save_csv_button = make_toolbar_action_button("act_table_save", "Save CSV", self.save_csv_dialog)
         remove_row_button = make_toolbar_action_button("act_remove", "Remove row", self.remove_selected_rows)
         move_to_pivot_button = make_toolbar_action_button(
             "act_move_pivot",
@@ -3211,8 +3368,8 @@ class MainWindow(QMainWindow):
             "Remove prediction",
             self.remove_selected_prediction_rows,
         )
-        load_csv_button = make_toolbar_action_button("act_load", "Load CSV", self.load_prediction_csv_dialog)
-        save_csv_button = make_toolbar_action_button("act_save", "Save CSV", self.save_prediction_csv_dialog)
+        load_csv_button = make_toolbar_action_button("act_table_load", "Load CSV", self.load_prediction_csv_dialog)
+        save_csv_button = make_toolbar_action_button("act_table_save", "Save CSV", self.save_prediction_csv_dialog)
         generate_button = make_toolbar_action_button(
             "act_readouts",
             "Generate stage readouts",
@@ -6095,11 +6252,11 @@ class MainWindow(QMainWindow):
                 "gauge_volume_mesh",
                 gauge_volume_box,
                 "gauge_volume",
-                color="#5bc0be",
-                opacity=0.24,
+                color="#ef4444",
+                opacity=0.28,
                 smooth_shading=True,
                 show_edges=True,
-                edge_color="#187d7a",
+                edge_color="#b91c1c",
                 line_width=2,
             )
         else:
