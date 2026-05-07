@@ -36,7 +36,9 @@ from PyQt5.QtWidgets import (
     QLayout,
     QLineEdit,
     QMainWindow,
+    QAction,
     QMessageBox,
+    QMenuBar,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -2426,6 +2428,8 @@ class MainWindow(QMainWindow):
         self.controls_scroll = None
         self.main_tabs = None
         self.instrument_setup_dialog = None
+        self.settings_dialog = None
+        self.setup_group = None
         self.point_picker_panel = None
         self._initial_sizes_applied = False
         self.camera_preset = "iso"
@@ -2500,6 +2504,7 @@ class MainWindow(QMainWindow):
         placement_layout = QVBoxLayout(placement_tab)
         placement_layout.setContentsMargins(0, 0, 0, 0)
         placement_layout.setSpacing(0)
+        placement_layout.addWidget(self._build_tab_menu_bar("Placement"))
 
         self.top_splitter = QSplitter(Qt.Horizontal)
         self.top_splitter.setChildrenCollapsible(False)
@@ -2524,11 +2529,10 @@ class MainWindow(QMainWindow):
         controls_layout = QVBoxLayout(controls_container)
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(8)
-        controls_layout.addWidget(self._build_files_group())
-        controls_layout.addWidget(self._build_setup_group())
+        self.setup_group = self._build_setup_group()
+        controls_layout.addWidget(self._build_setup_quick_controls_group())
         controls_layout.addWidget(self._build_manual_placement_group())
         controls_layout.addWidget(self._build_pose_group())
-        controls_layout.addWidget(self._build_results_group())
         controls_layout.addStretch(1)
         controls_container.setMinimumWidth(300)
         self.controls_scroll = QScrollArea()
@@ -2587,7 +2591,7 @@ class MainWindow(QMainWindow):
         self.main_tabs.addTab(placement_tab, "Placement")
         self.main_tabs.addTab(self._build_point_picker_tab(), "Pick Point")
         self.main_tabs.addTab(self._build_stress_tab(), "Residual Stress")
-        self.main_tabs.addTab(self._build_settings_tab(), "Settings")
+        self.settings_dialog = self._build_settings_dialog()
 
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Load a mesh, then use Fit placement or Manual Sample Placement.")
@@ -2644,6 +2648,230 @@ class MainWindow(QMainWindow):
         column_width = max(56, digit_width + 18)
         for column in range(column_count):
             table.setColumnWidth(column, column_width)
+
+    def _build_tab_menu_bar(self, tab_name: str) -> QMenuBar:
+        menu_bar = QMenuBar()
+        menu_bar.setNativeMenuBar(False)
+        menu_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        menu_bar.setStyleSheet(
+            """
+            QMenuBar {
+                background-color: #f7f9fc;
+                border: 1px solid #d7dee8;
+                padding: 1px 4px;
+            }
+            QMenuBar::item {
+                padding: 4px 10px;
+                background: transparent;
+            }
+            QMenuBar::item:selected {
+                background-color: #e8f0fb;
+            }
+            """
+        )
+
+        file_menu = menu_bar.addMenu("File")
+        setting_menu = menu_bar.addMenu("Setting")
+        view_menu = menu_bar.addMenu("View")
+        about_menu = menu_bar.addMenu("About")
+
+        if tab_name == "Placement":
+            self._populate_placement_file_menu(file_menu)
+            self._populate_placement_setting_menu(setting_menu)
+            self._populate_placement_view_menu(view_menu)
+            self._add_tab_menu_action(
+                about_menu,
+                "About Placement",
+                lambda: self.show_tab_about(
+                    "Placement",
+                    "Use Placement to load a sample mesh, fit or manually set the model-to-stage transform, "
+                    "inspect the instrument view, and export placement outputs.",
+                ),
+            )
+        elif tab_name == "Pick Point":
+            self._populate_pick_point_file_menu(file_menu)
+            self._populate_pick_point_setting_menu(setting_menu)
+            self._populate_pick_point_view_menu(view_menu)
+            self._add_tab_menu_action(
+                about_menu,
+                "About Pick Point",
+                lambda: self.show_tab_about(
+                    "Pick Point",
+                    "Use Pick Point to load a mesh, define a slice plane, pick model coordinates, and save the "
+                    "picked points as CSV.",
+                ),
+            )
+        elif tab_name == "Residual Stress":
+            self._populate_residual_stress_file_menu(file_menu)
+            self._populate_residual_stress_setting_menu(setting_menu)
+            self._populate_residual_stress_view_menu(view_menu)
+            self._add_tab_menu_action(about_menu, "Equations", self.show_stress_equations_dialog)
+            about_menu.addSeparator()
+            self._add_tab_menu_action(
+                about_menu,
+                "About Residual Stress",
+                lambda: self.show_tab_about(
+                    "Residual Stress",
+                    "Use Residual Stress to enter lattice parameters and D0 values, calculate microstrain and "
+                    "3D stress, and save the table as CSV.",
+                ),
+            )
+        return menu_bar
+
+    def _add_tab_menu_action(
+        self,
+        menu,
+        label: str,
+        slot: Callable[[], None],
+        *,
+        checkable: bool = False,
+        checked: bool = False,
+        status_tip: Optional[str] = None,
+    ) -> QAction:
+        action = QAction(label, self)
+        action.setCheckable(checkable)
+        if checkable:
+            action.setChecked(checked)
+        action.setStatusTip(status_tip or label)
+        action.triggered.connect(lambda _checked=False, target=slot: target())
+        menu.addAction(action)
+        return action
+
+    def _populate_placement_file_menu(self, menu) -> None:
+        self._add_tab_menu_action(menu, "Load Project", self.load_project_dialog)
+        self._add_tab_menu_action(menu, "Save Project", self.save_project_dialog)
+        menu.addSeparator()
+        self._add_tab_menu_action(menu, "Load STL/mesh", self.load_mesh_dialog)
+        self._add_tab_menu_action(menu, "Clear Mesh", self.clear_mesh)
+        menu.addSeparator()
+        self._add_tab_menu_action(menu, "Export Fit JSON", self.export_json_dialog)
+        menu.addSeparator()
+        self._add_tab_menu_action(menu, "Exit", self.close)
+
+    def _populate_placement_setting_menu(self, menu) -> None:
+        self._add_tab_menu_action(menu, "Open Settings", self.open_settings_tab)
+        self._add_tab_menu_action(menu, "Instrument Setup", self.open_instrument_setup_dialog)
+
+    def _populate_placement_view_menu(self, menu) -> None:
+        preset_actions = []
+        for label, preset in (
+            ("Isometric View", "iso"),
+            ("View +X", "+x"),
+            ("View -X", "-x"),
+            ("View +Y", "+y"),
+            ("View -Y", "-y"),
+            ("View +Z", "+z"),
+            ("View -Z", "-z"),
+            ("Theodolite View", "theodolite"),
+        ):
+            action = self._add_tab_menu_action(
+                menu,
+                label,
+                lambda target_preset=preset: self.set_camera_preset(target_preset),
+                checkable=True,
+                checked=self.camera_preset == preset,
+            )
+            preset_actions.append((action, preset))
+        menu.addSeparator()
+
+        toggle_specs = [
+            ("Parallel Projection", "parallel_projection_checkbox"),
+            ("Show Stage", "show_stage_checkbox"),
+            ("Show Beam", "show_beam_checkbox"),
+            ("Show Gauge Volume", "show_gauge_volume_checkbox"),
+            ("Show Imaging Detector", "show_imaging_detector_checkbox"),
+            ("Show Diffraction Detectors", "show_diffraction_detectors_checkbox"),
+            ("Show Feature Points", "show_feature_points_checkbox"),
+            ("Show Prediction Points", "show_prediction_points_checkbox"),
+            ("Show Sample Triad", "show_sample_triad_checkbox"),
+            ("Show Theodolite Sight Line", "show_theodolite_sight_line_checkbox"),
+            ("Show Diffraction Vectors", "show_diffraction_vectors_checkbox"),
+        ]
+        toggle_actions = []
+        for label, button_attr in toggle_specs:
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setStatusTip(label)
+            action.triggered.connect(
+                lambda checked=False, attr=button_attr: self.set_placement_view_toggle(attr, checked)
+            )
+            menu.addAction(action)
+            toggle_actions.append((action, button_attr))
+
+        menu.aboutToShow.connect(lambda: self.sync_placement_view_menu_actions(preset_actions, toggle_actions))
+
+    def _populate_pick_point_file_menu(self, menu) -> None:
+        self._add_tab_menu_action(menu, "Load STL/mesh", self.load_mesh_dialog)
+        self._add_tab_menu_action(menu, "Clear Mesh", self.clear_mesh)
+        menu.addSeparator()
+        self._add_tab_menu_action(menu, "Save Picked Points", self.save_picked_points_dialog)
+        menu.addSeparator()
+        self._add_tab_menu_action(menu, "Exit", self.close)
+
+    def _populate_pick_point_setting_menu(self, menu) -> None:
+        self._add_tab_menu_action(menu, "Open Settings", self.open_settings_tab)
+
+    def _populate_pick_point_view_menu(self, menu) -> None:
+        self._add_tab_menu_action(menu, "Normal View", self.point_picker_normal_view)
+        self._add_tab_menu_action(menu, "Reset View", self.reset_point_picker_view)
+
+    def _populate_residual_stress_file_menu(self, menu) -> None:
+        self._add_tab_menu_action(menu, "Save CSV", self.save_stress_csv_dialog)
+        menu.addSeparator()
+        self._add_tab_menu_action(menu, "Exit", self.close)
+
+    def _populate_residual_stress_setting_menu(self, menu) -> None:
+        self._add_tab_menu_action(menu, "Open Settings", self.open_settings_tab)
+
+    def _populate_residual_stress_view_menu(self, menu) -> None:
+        self._add_tab_menu_action(menu, "Calculate", self.calculate_residual_stress)
+        self._add_tab_menu_action(menu, "Clear Outputs", self.clear_stress_outputs)
+        menu.addSeparator()
+        self._add_tab_menu_action(menu, "Add Row", self.add_stress_row)
+        self._add_tab_menu_action(menu, "Remove Row", self.remove_selected_stress_rows)
+
+    def sync_placement_view_menu_actions(self, preset_actions, toggle_actions) -> None:
+        for action, preset in preset_actions:
+            action.setChecked(preset == self.camera_preset)
+        for action, button_attr in toggle_actions:
+            button = getattr(self, button_attr, None)
+            if button is None:
+                action.setChecked(False)
+                action.setEnabled(False)
+                continue
+            action.setEnabled(True)
+            action.setChecked(button.isChecked())
+
+    def set_placement_view_toggle(self, button_attr: str, checked: bool) -> None:
+        button = getattr(self, button_attr, None)
+        if button is None:
+            return
+        button.setChecked(checked)
+
+    def open_settings_tab(self) -> None:
+        if self.settings_dialog is None:
+            self.settings_dialog = self._build_settings_dialog()
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+
+    def show_tab_about(self, title: str, message: str) -> None:
+        QMessageBox.information(self, title, message)
+
+    def save_picked_points_dialog(self) -> None:
+        if self.point_picker_panel is None:
+            return
+        self.point_picker_panel.save_csv_dialog()
+
+    def point_picker_normal_view(self) -> None:
+        if self.point_picker_panel is None:
+            return
+        self.point_picker_panel.view_plane_normal()
+
+    def reset_point_picker_view(self) -> None:
+        if self.point_picker_panel is None:
+            return
+        self.point_picker_panel.refresh_scene(reset_camera=True)
 
     def _build_files_group(self) -> QGroupBox:
         group = QGroupBox("Files")
@@ -2721,11 +2949,79 @@ class MainWindow(QMainWindow):
         layout.addLayout(button_flow)
         return group
 
+    def _build_setup_quick_controls_group(self) -> QGroupBox:
+        group = QGroupBox("Setup")
+        layout = make_form_layout(group, compact_fields=True)
+
+        slit_width_proxy = make_spin_box(self.slit_width.value(), self.slit_width.minimum(), self.slit_width.maximum())
+        slit_width_proxy.setDecimals(self.slit_width.decimals())
+        slit_width_proxy.setSingleStep(self.slit_width.singleStep())
+
+        slit_height_proxy = make_spin_box(
+            self.slit_height.value(),
+            self.slit_height.minimum(),
+            self.slit_height.maximum(),
+        )
+        slit_height_proxy.setDecimals(self.slit_height.decimals())
+        slit_height_proxy.setSingleStep(self.slit_height.singleStep())
+
+        collimator_proxy = NoWheelComboBox()
+        for index in range(self.collimator.count()):
+            collimator_proxy.addItem(self.collimator.itemText(index))
+        collimator_proxy.setCurrentText(self.collimator.currentText())
+
+        material_proxy = NoWheelComboBox()
+        for index in range(self.count_time_material.count()):
+            material_proxy.addItem(self.count_time_material.itemText(index))
+        material_proxy.setCurrentText(self.count_time_material.currentText())
+
+        self._bind_spin_box_proxy(slit_width_proxy, self.slit_width)
+        self._bind_spin_box_proxy(slit_height_proxy, self.slit_height)
+        self._bind_combo_box_proxy(collimator_proxy, self.collimator)
+        self._bind_combo_box_proxy(material_proxy, self.count_time_material)
+
+        layout.addRow("Slit width", slit_width_proxy)
+        layout.addRow("Slit height", slit_height_proxy)
+        layout.addRow("Collimator", collimator_proxy)
+        layout.addRow("Material", material_proxy)
+        return group
+
+    def _bind_spin_box_proxy(self, proxy, target) -> None:
+        def sync_proxy(value: float) -> None:
+            previous_state = proxy.blockSignals(True)
+            proxy.setValue(float(value))
+            proxy.blockSignals(previous_state)
+
+        def sync_target(value: float) -> None:
+            previous_state = target.blockSignals(True)
+            target.setValue(float(value))
+            target.blockSignals(previous_state)
+            self.on_view_parameter_changed()
+
+        proxy.valueChanged.connect(sync_target)
+        target.valueChanged.connect(sync_proxy)
+
+    def _bind_combo_box_proxy(self, proxy: QComboBox, target: QComboBox) -> None:
+        def sync_proxy(text: str) -> None:
+            previous_state = proxy.blockSignals(True)
+            proxy.setCurrentText(str(text))
+            proxy.blockSignals(previous_state)
+
+        def sync_target(text: str) -> None:
+            previous_state = target.blockSignals(True)
+            target.setCurrentText(str(text))
+            target.blockSignals(previous_state)
+            self.on_view_parameter_changed()
+
+        proxy.currentTextChanged.connect(sync_target)
+        target.currentTextChanged.connect(sync_proxy)
+
     def _build_point_picker_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
+        layout.addWidget(self._build_tab_menu_bar("Pick Point"))
 
         toolbar = QWidget()
         toolbar_layout = QHBoxLayout(toolbar)
@@ -2779,6 +3075,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
+        layout.addWidget(self._build_tab_menu_bar("Residual Stress"))
 
         metadata_group = QGroupBox("Stress Metadata")
         metadata_layout = QVBoxLayout(metadata_group)
@@ -2822,12 +3119,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.stress_status_label)
         return tab
 
-    def _build_settings_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
+    def _build_settings_content(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
-
         appearance_group = QGroupBox("Appearance")
         appearance_layout = QFormLayout(appearance_group)
         self.ui_font_size_spin = NoWheelDoubleSpinBox()
@@ -2850,7 +3146,27 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(appearance_group)
         layout.addStretch(1)
-        return tab
+        return content
+
+    def _build_settings_dialog(self) -> QDialog:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Settings")
+        dialog.setModal(False)
+        dialog.resize(420, 220)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._build_settings_content())
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.close)
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(12, 0, 12, 12)
+        button_row.addStretch(1)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+        return dialog
 
     def _build_stress_toolbar(self) -> QWidget:
         toolbar = QWidget()
@@ -3146,53 +3462,6 @@ class MainWindow(QMainWindow):
         self.sync_manual_rotation_spin_boxes_from_matrix()
         return group
 
-    def _build_results_group(self) -> QGroupBox:
-        group = QGroupBox("Placement Actions")
-        layout = QVBoxLayout(group)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        action_row = QHBoxLayout()
-        action_row.setContentsMargins(0, 0, 0, 0)
-        action_row.setSpacing(6)
-
-        clear_placement_button = make_toolbar_action_button(
-            "act_clear_placement",
-            "Clear placement",
-            self.clear_placement,
-            button_size=28,
-            icon_size=18,
-        )
-        compute_detector_map_button = make_toolbar_action_button(
-            "act_detector_map",
-            "Compute imaging map",
-            self.compute_detector_map,
-            button_size=28,
-            icon_size=18,
-        )
-        compute_diffraction_map_button = make_toolbar_action_button(
-            "act_diffraction_map",
-            "Compute diffraction path",
-            self.compute_diffraction_map,
-            button_size=28,
-            icon_size=18,
-        )
-        export_detector_map_button = make_toolbar_action_button(
-            "act_map_export",
-            "Export detector map",
-            self.export_detector_map_dialog,
-            button_size=28,
-            icon_size=18,
-        )
-
-        action_row.addWidget(clear_placement_button)
-        action_row.addWidget(compute_detector_map_button)
-        action_row.addWidget(compute_diffraction_map_button)
-        action_row.addWidget(export_detector_map_button)
-        action_row.addStretch(1)
-        layout.addLayout(action_row)
-        return group
-
     def _build_view_toolbar(self) -> QWidget:
         toolbar = QWidget()
         layout = QHBoxLayout(toolbar)
@@ -3266,6 +3535,25 @@ class MainWindow(QMainWindow):
             button = make_toolbar_toggle_button(icon_kind, tooltip, checked, slot)
             setattr(self, attribute_name, button)
             layout.addWidget(button)
+
+        compute_detector_map_button = make_toolbar_action_button(
+            "act_detector_map",
+            "Compute imaging map",
+            self.compute_detector_map,
+        )
+        compute_diffraction_map_button = make_toolbar_action_button(
+            "act_diffraction_map",
+            "Compute diffraction path",
+            self.compute_diffraction_map,
+        )
+        export_detector_map_button = make_toolbar_action_button(
+            "act_map_export",
+            "Export detector map",
+            self.export_detector_map_dialog,
+        )
+        layout.addWidget(compute_detector_map_button)
+        layout.addWidget(compute_diffraction_map_button)
+        layout.addWidget(export_detector_map_button)
         layout.addStretch(1)
         self.sync_view_button_states()
         return toolbar
@@ -3305,6 +3593,11 @@ class MainWindow(QMainWindow):
             self.move_selected_point_to_pivot,
         )
         fit_button = make_toolbar_action_button("act_fit", "Fit placement", self.fit_placement)
+        clear_placement_button = make_toolbar_action_button(
+            "act_clear_placement",
+            "Clear placement",
+            self.clear_placement,
+        )
         self.auto_move_to_pivot_checkbox = QCheckBox("Auto move on select")
         self.auto_move_to_pivot_checkbox.setChecked(True)
 
@@ -3314,6 +3607,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(save_csv_button)
         layout.addWidget(move_to_pivot_button)
         layout.addWidget(fit_button)
+        layout.addWidget(clear_placement_button)
         layout.addWidget(self.auto_move_to_pivot_checkbox)
         layout.addStretch(1)
         return toolbar
