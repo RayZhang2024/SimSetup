@@ -80,6 +80,14 @@ from placement_fit import (
     save_json_report,
 )
 
+try:
+    from diffraction.tab import DiffractionTab
+except Exception as exc:
+    DiffractionTab = None
+    DIFFRACTION_TAB_IMPORT_ERROR = exc
+else:
+    DIFFRACTION_TAB_IMPORT_ERROR = None
+
 
 if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
     pv.OFF_SCREEN = True
@@ -2591,6 +2599,7 @@ class MainWindow(QMainWindow):
         self.main_tabs.addTab(placement_tab, "Placement")
         self.main_tabs.addTab(self._build_point_picker_tab(), "Pick Point")
         self.main_tabs.addTab(self._build_stress_tab(), "Residual Stress")
+        self.main_tabs.addTab(self._build_diffraction_tab(), "Diffraction")
         self.settings_dialog = self._build_settings_dialog()
 
         self.setStatusBar(QStatusBar(self))
@@ -3117,6 +3126,20 @@ class MainWindow(QMainWindow):
         )
         self.stress_status_label.setWordWrap(True)
         layout.addWidget(self.stress_status_label)
+        return tab
+
+    def _build_diffraction_tab(self) -> QWidget:
+        if DiffractionTab is not None:
+            return DiffractionTab(self)
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        label = QLabel(
+            "The Diffraction tab could not be loaded. Install the diffraction dependencies in requirements.txt "
+            f"and restart SimSetup.\n\nImport error: {DIFFRACTION_TAB_IMPORT_ERROR}"
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        layout.addStretch(1)
         return tab
 
     def _build_settings_content(self) -> QWidget:
@@ -4360,20 +4383,71 @@ class MainWindow(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("Residual Stress Equations")
         dialog.setModal(False)
-        dialog.resize(980, 760)
+        dialog.resize(1040, 780)
+        dialog.setStyleSheet(
+            """
+            QDialog {
+                background-color: #eef2f7;
+            }
+            QScrollArea {
+                border: none;
+                background-color: #eef2f7;
+            }
+            QFrame#EquationCard {
+                background-color: #ffffff;
+                border: 1px solid #d8e0ea;
+                border-radius: 8px;
+            }
+            QFrame#EquationAccent {
+                background-color: #2563a9;
+                border: none;
+                border-radius: 3px;
+                min-width: 4px;
+                max-width: 4px;
+            }
+            QPushButton {
+                padding: 6px 18px;
+            }
+            """
+        )
 
         layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        header = QFrame(dialog)
+        header.setStyleSheet(
+            "QFrame { background-color: #17324d; border: none; }"
+            "QLabel { color: white; }"
+        )
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(24, 18, 24, 18)
+        header_layout.setSpacing(4)
+
+        title_label = QLabel("Residual Stress Equations", header)
+        title_label.setStyleSheet("font-size: 22px; font-weight: 700; font-family: 'Segoe UI', sans-serif;")
+        header_layout.addWidget(title_label)
+
+        subtitle_label = QLabel(
+            "Formula reference for lattice strain, microstrain, isotropic stress, and uncertainty propagation.",
+            header,
+        )
+        subtitle_label.setWordWrap(True)
+        subtitle_label.setStyleSheet("font-size: 13px; color: #d8e5f3; font-family: 'Segoe UI', sans-serif;")
+        header_layout.addWidget(subtitle_label)
+        layout.addWidget(header)
+
         scroll = QScrollArea(dialog)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         layout.addWidget(scroll)
 
         content = QWidget()
-        content.setStyleSheet("background-color: white;")
+        content.setStyleSheet("background-color: #eef2f7;")
         scroll.setWidget(content)
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(18, 18, 18, 18)
-        content_layout.setSpacing(14)
+        content_layout.setContentsMargins(24, 22, 24, 22)
+        content_layout.setSpacing(12)
 
         intro_label = QLabel(
             "The residual-stress tab uses the following equations.",
@@ -4381,7 +4455,7 @@ class MainWindow(QMainWindow):
         )
         intro_label.setWordWrap(True)
         intro_label.setStyleSheet(
-            "color: black; font-size: 16px; font-family: 'Times New Roman', Georgia, serif;"
+            "color: #334155; font-size: 14px; font-family: 'Segoe UI', sans-serif;"
         )
         content_layout.addWidget(intro_label)
 
@@ -4390,8 +4464,8 @@ class MainWindow(QMainWindow):
                 "Lattice strain",
                 "<span style='font-style: italic;'>"
                 "&epsilon;<sub>i</sub> = "
-                "<span style='font-size: 120%;'>(</span>a<sub>i</sub> - a0<sub>i</sub><span style='font-size: 120%;'>)</span>"
-                " / a0<sub>i</sub>"
+                "<span style='font-size: 120%;'>(</span>a<sub>i</sub> - a<sub>0,i</sub><span style='font-size: 120%;'>)</span>"
+                " / a<sub>0,i</sub>"
                 "</span>",
             ),
             (
@@ -4399,9 +4473,9 @@ class MainWindow(QMainWindow):
                 "<span style='font-style: italic;'>"
                 "u(&epsilon;<sub>i</sub>) = "
                 "&radic;<span style='font-size: 115%;'>(</span>"
-                "<span>(u(a<sub>i</sub>) / a0<sub>i</sub>)<sup>2</sup></span>"
+                "<span>(u(a<sub>i</sub>) / a<sub>0,i</sub>)<sup>2</sup></span>"
                 " + "
-                "<span>(a<sub>i</sub>u(a0<sub>i</sub>) / a0<sub>i</sub><sup>2</sup>)<sup>2</sup></span>"
+                "<span>(a<sub>i</sub>u(a<sub>0,i</sub>) / a<sub>0,i</sub><sup>2</sup>)<sup>2</sup></span>"
                 "<span style='font-size: 115%;'>)</span>"
                 "</span>",
             ),
@@ -4472,43 +4546,58 @@ class MainWindow(QMainWindow):
 
         for title, html in equation_cards:
             card = QFrame(content)
-            card.setStyleSheet(
-                "QFrame { background-color: white; border: 1px solid #d9d9d9; border-radius: 6px; }"
-            )
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(16, 14, 16, 14)
-            card_layout.setSpacing(8)
+            card.setObjectName("EquationCard")
+            card_layout = QHBoxLayout(card)
+            card_layout.setContentsMargins(16, 14, 18, 14)
+            card_layout.setSpacing(14)
 
-            title_label = QLabel(title, card)
+            accent = QFrame(card)
+            accent.setObjectName("EquationAccent")
+            card_layout.addWidget(accent)
+
+            text_panel = QWidget(card)
+            text_layout = QVBoxLayout(text_panel)
+            text_layout.setContentsMargins(0, 0, 0, 0)
+            text_layout.setSpacing(7)
+
+            title_label = QLabel(title, text_panel)
             title_label.setStyleSheet(
-                "color: #444444; font-size: 15px; font-weight: 600; font-family: 'Segoe UI', sans-serif;"
+                "color: #1f3349; font-size: 14px; font-weight: 700; font-family: 'Segoe UI', sans-serif;"
             )
-            card_layout.addWidget(title_label)
+            text_layout.addWidget(title_label)
 
-            equation_label = QLabel(card)
+            equation_label = QLabel(text_panel)
             equation_label.setTextFormat(Qt.RichText)
             equation_label.setWordWrap(True)
             equation_label.setText(html)
             equation_label.setStyleSheet(
-                "color: black; font-size: 42px; font-family: 'Times New Roman', Georgia, serif;"
+                "color: #0f172a; font-size: 31px; line-height: 118%; font-family: 'Times New Roman', Georgia, serif;"
             )
-            card_layout.addWidget(equation_label)
+            equation_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            text_layout.addWidget(equation_label)
+            card_layout.addWidget(text_panel, stretch=1)
             content_layout.addWidget(card)
 
         notes_label = QLabel(
-            "E is Young's modulus in MPa. ν is Poisson's ratio. Stress uncertainties are only computed when all three strain uncertainties are available.",
+            "E is Young's modulus in MPa. nu is Poisson's ratio. Stress uncertainties are only computed when all three strain uncertainties are available.",
             content,
         )
         notes_label.setWordWrap(True)
         notes_label.setStyleSheet(
-            "color: #444444; font-size: 14px; font-family: 'Segoe UI', sans-serif;"
+            "color: #475569; font-size: 13px; font-family: 'Segoe UI', sans-serif;"
         )
         content_layout.addWidget(notes_label)
         content_layout.addStretch(1)
 
+        footer = QFrame(dialog)
+        footer.setStyleSheet("QFrame { background-color: #eef2f7; border-top: 1px solid #d8e0ea; }")
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(16, 10, 16, 10)
+        footer_layout.addStretch(1)
         close_button = QPushButton("Close", dialog)
         close_button.clicked.connect(dialog.close)
-        layout.addWidget(close_button, alignment=Qt.AlignRight)
+        footer_layout.addWidget(close_button)
+        layout.addWidget(footer)
 
         dialog.show()
         dialog.raise_()
