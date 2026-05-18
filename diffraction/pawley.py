@@ -33,6 +33,13 @@ def fit_pawley(
     axis: str,
     calibration: Optional[InstrumentCalibration],
     polynomial_order: int = 2,
+    lattice_tolerance_percent: float = 2.0,
+    reflection_margin_percent: float = 4.0,
+    eta_initial: float = 0.5,
+    eta_bounds: tuple[float, float] = (0.0, 1.0),
+    fwhm_min_fraction: float = 0.0001,
+    fwhm_max_fraction: float = 0.5,
+    max_nfev: int = 50000,
 ) -> PawleyFitResult:
     from scipy.optimize import least_squares
 
@@ -50,7 +57,7 @@ def fit_pawley(
     else:
         raise ValueError(f"Unsupported Pawley axis: {axis}")
 
-    margin = 0.04 * max(abs(d_bounds[1] - d_bounds[0]), 1e-6)
+    margin = max(float(reflection_margin_percent), 0.0) / 100.0 * max(abs(d_bounds[1] - d_bounds[0]), 1e-6)
     reflections = generate_fcc_reflections(phase, d_bounds[0] - margin, d_bounds[1] + margin)
     if not reflections:
         raise ValueError("No Ni FCC reflections are expected in the selected range.")
@@ -71,9 +78,14 @@ def fit_pawley(
         intensity_guesses = [max(float(np.max(peak_signal)), 1.0) for _ in reflections]
 
     order = max(0, min(int(polynomial_order), 5))
-    p0 = [phase.a, fwhm_guess, 0.5] + intensity_guesses + [background_guess] + [0.0] * order
-    lower = [phase.a * 0.98, span / 10000.0, 0.0] + [0.0] * len(reflections) + [-np.inf] * (order + 1)
-    upper = [phase.a * 1.02, span / 2.0, 1.0] + [np.inf] * len(reflections) + [np.inf] * (order + 1)
+    eta_min, eta_max = sorted((float(eta_bounds[0]), float(eta_bounds[1])))
+    eta_initial = min(max(float(eta_initial), eta_min), eta_max)
+    lattice_fraction = max(float(lattice_tolerance_percent), 1e-9) / 100.0
+    fwhm_min = max(span * max(float(fwhm_min_fraction), 1e-9), 1e-12)
+    fwhm_max = max(span * max(float(fwhm_max_fraction), 1e-6), fwhm_min * 1.001)
+    p0 = [phase.a, fwhm_guess, eta_initial] + intensity_guesses + [background_guess] + [0.0] * order
+    lower = [phase.a * (1.0 - lattice_fraction), fwhm_min, eta_min] + [0.0] * len(reflections) + [-np.inf] * (order + 1)
+    upper = [phase.a * (1.0 + lattice_fraction), fwhm_max, eta_max] + [np.inf] * len(reflections) + [np.inf] * (order + 1)
 
     def model(params: np.ndarray) -> np.ndarray:
         lattice_a = float(params[0])
@@ -97,7 +109,7 @@ def fit_pawley(
         residual,
         np.asarray(p0, dtype=float),
         bounds=(np.asarray(lower, dtype=float), np.asarray(upper, dtype=float)),
-        max_nfev=50000,
+        max_nfev=max(100, int(max_nfev)),
     )
     if not result.success:
         raise ValueError(f"Pawley fit failed: {result.message}")

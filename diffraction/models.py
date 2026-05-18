@@ -219,6 +219,26 @@ class PawleyFitResult:
     observed_y: Optional[np.ndarray] = None
 
 
+@dataclass
+class FittingSettings:
+    fit_mode: str = "pseudo_voigt"
+    polynomial_order: int = 2
+    use_uncertainties: bool = True
+    max_evaluations: int = 50000
+    pseudo_voigt_eta_initial: float = 0.5
+    pseudo_voigt_eta_min: float = 0.0
+    pseudo_voigt_eta_max: float = 1.0
+    pseudo_voigt_fwhm_min_fraction: float = 0.0001
+    pseudo_voigt_fwhm_max_multiplier: float = 2.0
+    pawley_lattice_tolerance_percent: float = 2.0
+    pawley_reflection_margin_percent: float = 4.0
+    pawley_eta_initial: float = 0.5
+    pawley_eta_min: float = 0.0
+    pawley_eta_max: float = 1.0
+    pawley_fwhm_min_fraction: float = 0.0001
+    pawley_fwhm_max_fraction: float = 0.5
+
+
 @dataclass(frozen=True)
 class CalibrationPeakResult:
     reflection: Reflection

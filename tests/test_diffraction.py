@@ -97,6 +97,12 @@ class DiffractionFittingTests(unittest.TestCase):
         self.assertAlmostEqual(result.centre, 14.25, delta=0.03)
         self.assertAlmostEqual(result.fwhm, 0.7, delta=0.05)
 
+    def test_pseudo_voigt_handles_extreme_scaled_values(self) -> None:
+        x = np.array([-1.0e12, 0.0, 1.0e12])
+        with np.errstate(over="raise", invalid="raise"):
+            values = pseudo_voigt_profile(x, 0.0, 1.0e-12, 0.5)
+        self.assertTrue(np.all(np.isfinite(values)))
+
     def test_ceo2_calibration(self) -> None:
         ceo2 = load_focused_spectrum(HIST / "ENGINX373845_1.his")
         phase = parse_gsas_exp(HIST / "CEO2.EXP")[0]
@@ -159,6 +165,8 @@ class DiffractionFittingTests(unittest.TestCase):
 
         app = QApplication.instance() or QApplication([])
         tab = DiffractionTab()
+        menu_titles = [action.text() for action in tab.menu_bar.actions()]
+        self.assertEqual(menu_titles, ["File", "Calibration", "View", "Fit", "About"])
         sample = load_focused_spectrum(HIST / "ENGINX373922_1.his")
         tab.spectra.append(sample)
         tab.corrected_spectra.append(None)
@@ -206,6 +214,77 @@ class DiffractionFittingTests(unittest.TestCase):
         self.assertEqual(tab.view_max_edit.text(), "")
         self.assertEqual(tab.y_view_min_edit.text(), "")
         self.assertEqual(tab.y_view_max_edit.text(), "")
+        spectrum = tab.current_spectrum()
+        self.assertIsNotNone(spectrum)
+        self.assertIsNotNone(spectrum.calibration)
+        default_d_min = float(tof_to_d(10000.0, spectrum.calibration))
+        reset_x_limits = tab.axes.get_xlim()
+        self.assertAlmostEqual(reset_x_limits[0], default_d_min, places=3)
+        tab.range_min_edit.clear()
+        tab.range_max_edit.clear()
+        mask, selected_range = tab._fit_range_mask(x_values, spectrum)
+        self.assertGreater(int(np.count_nonzero(mask)), 8)
+        self.assertAlmostEqual(selected_range[0], default_d_min, places=3)
+        tab.close()
+        app.processEvents()
+
+    def test_diffraction_tab_auto_corrects_import_after_calibration(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PyQt5.QtWidgets import QApplication
+            from diffraction.tab import DiffractionTab
+        except Exception as exc:
+            self.skipTest(f"Qt smoke test unavailable: {exc}")
+
+        app = QApplication.instance() or QApplication([])
+        tab = DiffractionTab()
+        tab.calibration_spectrum = load_focused_spectrum(HIST / "ENGINX373845_1.his")
+        tab.calibration_phase = parse_gsas_exp(HIST / "CEO2.EXP")[0]
+        tab.vanadium_spectrum = load_focused_spectrum(HIST / "ENGINX371347_1.his")
+
+        self.assertTrue(tab.run_calibration_sequence())
+        self.assertIsNotNone(tab.calibration_result)
+        self.assertEqual(tab.spectrum_combo.count(), 0)
+
+        tab.load_spectrum_paths([HIST / "ENGINX373922_1.his"])
+
+        self.assertEqual(tab.spectrum_combo.count(), 1)
+        self.assertIsNotNone(tab.corrected_spectra[0])
+        self.assertIsNotNone(tab.normalization_results[0])
+        self.assertEqual(tab.data_combo.currentData(), "corrected")
+        self.assertIs(tab.current_spectrum(), tab.corrected_spectra[0])
+        tab.close()
+        app.processEvents()
+
+    def test_fitting_settings_dialog_updates_tab_settings(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PyQt5.QtWidgets import QApplication
+            from diffraction.tab import DiffractionTab, FittingSettingsDialog
+        except Exception as exc:
+            self.skipTest(f"Qt smoke test unavailable: {exc}")
+
+        app = QApplication.instance() or QApplication([])
+        tab = DiffractionTab()
+        dialog = FittingSettingsDialog(tab)
+        dialog.fit_mode_combo.setCurrentIndex(dialog.fit_mode_combo.findData("pawley"))
+        dialog.background_order_spin.setValue(3)
+        dialog.max_evaluations_spin.setValue(12345)
+        dialog.pawley_lattice_tolerance_spin.setValue(1.25)
+        dialog.pawley_reflection_margin_spin.setValue(6.5)
+        dialog.range_min_edit.setText("1.7")
+        dialog.range_max_edit.setText("2.1")
+        dialog.apply_settings()
+
+        self.assertEqual(tab.fitting_settings.fit_mode, "pawley")
+        self.assertEqual(tab.fit_combo.currentData(), "pawley")
+        self.assertEqual(tab.poly_order.value(), 3)
+        self.assertEqual(tab.fitting_settings.max_evaluations, 12345)
+        self.assertAlmostEqual(tab.fitting_settings.pawley_lattice_tolerance_percent, 1.25)
+        self.assertAlmostEqual(tab.fitting_settings.pawley_reflection_margin_percent, 6.5)
+        self.assertEqual(tab.range_min_edit.text(), "1.7")
+        self.assertEqual(tab.range_max_edit.text(), "2.1")
+        dialog.close()
         tab.close()
         app.processEvents()
 

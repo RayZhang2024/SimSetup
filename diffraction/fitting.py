@@ -11,8 +11,10 @@ from .models import FitQuality, PeakFitResult
 def pseudo_voigt_profile(x: np.ndarray, centre: float, fwhm: float, eta: float) -> np.ndarray:
     width = max(abs(float(fwhm)), 1e-12)
     scaled = (np.asarray(x, dtype=float) - float(centre)) / width
-    gaussian = np.exp(-4.0 * math.log(2.0) * scaled * scaled)
-    lorentzian = 1.0 / (1.0 + 4.0 * scaled * scaled)
+    gaussian_scaled = np.clip(scaled, -40.0, 40.0)
+    lorentzian_scaled = np.clip(scaled, -1.0e6, 1.0e6)
+    gaussian = np.exp(-4.0 * math.log(2.0) * gaussian_scaled * gaussian_scaled)
+    lorentzian = 1.0 / (1.0 + 4.0 * lorentzian_scaled * lorentzian_scaled)
     return float(eta) * lorentzian + (1.0 - float(eta)) * gaussian
 
 
@@ -91,6 +93,11 @@ def fit_pseudo_voigt(
     y: Sequence[float],
     e: Optional[Sequence[float]] = None,
     polynomial_order: int = 2,
+    eta_initial: float = 0.5,
+    eta_bounds: tuple[float, float] = (0.0, 1.0),
+    fwhm_min_fraction: float = 0.0001,
+    fwhm_max_multiplier: float = 2.0,
+    maxfev: int = 50000,
 ) -> PeakFitResult:
     from scipy.optimize import curve_fit
 
@@ -107,12 +114,14 @@ def fit_pseudo_voigt(
         x_input_norm = (x_input - _axis_centre) / _axis_half_span
         return height * pseudo_voigt_profile(x_input, centre, fwhm, eta) + _polyval(bg, x_input_norm)
 
-    p0 = [centre_guess, fwhm_guess, 0.5, height_guess] + [background_guess] + [0.0] * order
+    eta_min, eta_max = sorted((float(eta_bounds[0]), float(eta_bounds[1])))
+    eta_initial = min(max(float(eta_initial), eta_min), eta_max)
+    p0 = [centre_guess, fwhm_guess, eta_initial, height_guess] + [background_guess] + [0.0] * order
     span = max(float(np.max(x_values) - np.min(x_values)), 1e-9)
-    lower = [float(np.min(x_values)), span / 10000.0, 0.0, 0.0] + [-np.inf] * (order + 1)
-    upper = [float(np.max(x_values)), span * 2.0, 1.0, max(height_guess * 100.0, float(np.max(y_values)) * 100.0, 1.0)] + [
-        np.inf
-    ] * (order + 1)
+    fwhm_min = max(span * max(float(fwhm_min_fraction), 1e-9), 1e-12)
+    fwhm_max = max(span * max(float(fwhm_max_multiplier), 1e-6), fwhm_min * 1.001)
+    lower = [float(np.min(x_values)), fwhm_min, eta_min, 0.0] + [-np.inf] * (order + 1)
+    upper = [float(np.max(x_values)), fwhm_max, eta_max, max(height_guess * 100.0, float(np.max(y_values)) * 100.0, 1.0)] + [np.inf] * (order + 1)
     sigma = e_values if e_values is not None else None
     params, covariance = curve_fit(
         model,
@@ -122,7 +131,7 @@ def fit_pseudo_voigt(
         bounds=(lower, upper),
         sigma=sigma,
         absolute_sigma=sigma is not None,
-        maxfev=50000,
+        maxfev=max(100, int(maxfev)),
     )
     y_fit = model(x_values, *params)
     uncertainties = None

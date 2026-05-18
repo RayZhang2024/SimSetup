@@ -2435,6 +2435,7 @@ class MainWindow(QMainWindow):
         self.tables_splitter = None
         self.controls_scroll = None
         self.main_tabs = None
+        self.tab_menu_stack = None
         self.instrument_setup_dialog = None
         self.settings_dialog = None
         self.setup_group = None
@@ -2505,14 +2506,17 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(8)
+        self.tab_menu_stack = QStackedWidget()
+        self.tab_menu_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        main_layout.addWidget(self.tab_menu_stack)
         self.main_tabs = QTabWidget()
-        main_layout.addWidget(self.main_tabs)
+        self.main_tabs.setTabPosition(QTabWidget.West)
+        main_layout.addWidget(self.main_tabs, stretch=1)
 
         placement_tab = QWidget()
         placement_layout = QVBoxLayout(placement_tab)
         placement_layout.setContentsMargins(0, 0, 0, 0)
         placement_layout.setSpacing(0)
-        placement_layout.addWidget(self._build_tab_menu_bar("Placement"))
 
         self.top_splitter = QSplitter(Qt.Horizontal)
         self.top_splitter.setChildrenCollapsible(False)
@@ -2596,10 +2600,17 @@ class MainWindow(QMainWindow):
         self.top_splitter.setStretchFactor(0, 0)
         self.top_splitter.setStretchFactor(1, 1)
 
+        point_picker_tab = self._build_point_picker_tab()
+        diffraction_tab = self._build_diffraction_tab()
+        stress_tab = self._build_stress_tab()
+
         self.main_tabs.addTab(placement_tab, "Placement")
-        self.main_tabs.addTab(self._build_point_picker_tab(), "Pick Point")
-        self.main_tabs.addTab(self._build_stress_tab(), "Residual Stress")
-        self.main_tabs.addTab(self._build_diffraction_tab(), "Diffraction")
+        self.main_tabs.addTab(point_picker_tab, "Pick Point")
+        self.main_tabs.addTab(diffraction_tab, "Diffraction")
+        self.main_tabs.addTab(stress_tab, "Residual Stress")
+        self._build_top_tab_menus(diffraction_tab)
+        self.main_tabs.currentChanged.connect(self._sync_top_tab_menu)
+        self._sync_top_tab_menu(self.main_tabs.currentIndex())
         self.settings_dialog = self._build_settings_dialog()
 
         self.setStatusBar(QStatusBar(self))
@@ -2657,6 +2668,23 @@ class MainWindow(QMainWindow):
         column_width = max(56, digit_width + 18)
         for column in range(column_count):
             table.setColumnWidth(column, column_width)
+
+    def _build_top_tab_menus(self, diffraction_tab: QWidget) -> None:
+        if self.tab_menu_stack is None:
+            return
+        self.tab_menu_stack.addWidget(self._build_tab_menu_bar("Placement"))
+        self.tab_menu_stack.addWidget(self._build_tab_menu_bar("Pick Point"))
+        diffraction_menu = getattr(diffraction_tab, "menu_bar", None)
+        if diffraction_menu is None:
+            diffraction_menu = self._build_tab_menu_bar("Diffraction")
+        self.tab_menu_stack.addWidget(diffraction_menu)
+        self.tab_menu_stack.addWidget(self._build_tab_menu_bar("Residual Stress"))
+
+    def _sync_top_tab_menu(self, index: int) -> None:
+        if self.tab_menu_stack is None:
+            return
+        if 0 <= index < self.tab_menu_stack.count():
+            self.tab_menu_stack.setCurrentIndex(index)
 
     def _build_tab_menu_bar(self, tab_name: str) -> QMenuBar:
         menu_bar = QMenuBar()
@@ -3030,7 +3058,6 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        layout.addWidget(self._build_tab_menu_bar("Pick Point"))
 
         toolbar = QWidget()
         toolbar_layout = QHBoxLayout(toolbar)
@@ -3084,7 +3111,6 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        layout.addWidget(self._build_tab_menu_bar("Residual Stress"))
 
         metadata_group = QGroupBox("Stress Metadata")
         metadata_layout = QVBoxLayout(metadata_group)
