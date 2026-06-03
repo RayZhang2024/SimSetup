@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 
 AXIS_TOF = "tof"
 AXIS_D_SPACING = "d_spacing"
+FIT_SCOPE_PEAK = "peak"
+FIT_SCOPE_PATTERN = "pattern"
+PAWLEY_WIDTH_CONSTANT = "constant"
+PAWLEY_WIDTH_D_RESOLUTION = "d_resolution"
 
 
 @dataclass(frozen=True)
@@ -183,6 +187,17 @@ class FitQuality:
 
 
 @dataclass(frozen=True)
+class PeakComponentResult:
+    centre: float
+    fwhm: float
+    height: float
+    area: float
+    eta: float
+    centre_uncertainty: Optional[float] = None
+    fwhm_uncertainty: Optional[float] = None
+
+
+@dataclass(frozen=True)
 class PeakFitResult:
     model_name: str
     centre: float
@@ -194,6 +209,8 @@ class PeakFitResult:
     eta: float
     background_coefficients: Tuple[float, ...]
     quality: FitQuality
+    profile_parameters: Mapping[str, float] = field(default_factory=dict)
+    components: Tuple[PeakComponentResult, ...] = ()
     fit_x: Optional[np.ndarray] = None
     fit_y: Optional[np.ndarray] = None
     observed_y: Optional[np.ndarray] = None
@@ -209,11 +226,15 @@ class PawleyReflectionResult:
 @dataclass(frozen=True)
 class PawleyFitResult:
     lattice_a: float
+    lattice_a_uncertainty: Optional[float]
     fwhm: float
     eta: float
     background_coefficients: Tuple[float, ...]
     reflections: Tuple[PawleyReflectionResult, ...]
     quality: FitQuality
+    profile_key: str = "pseudo_voigt"
+    profile_name: str = "Pseudo-Voigt"
+    profile_parameters: Mapping[str, float] = field(default_factory=dict)
     fit_x: Optional[np.ndarray] = None
     fit_y: Optional[np.ndarray] = None
     observed_y: Optional[np.ndarray] = None
@@ -221,7 +242,9 @@ class PawleyFitResult:
 
 @dataclass
 class FittingSettings:
-    fit_mode: str = "pseudo_voigt"
+    fit_scope: str = FIT_SCOPE_PEAK
+    peak_profile_key: str = "exp_voigt"
+    pattern_profile_key: str = "gsas_tof"
     polynomial_order: int = 2
     use_uncertainties: bool = True
     max_evaluations: int = 50000
@@ -237,6 +260,7 @@ class FittingSettings:
     pawley_eta_max: float = 1.0
     pawley_fwhm_min_fraction: float = 0.0001
     pawley_fwhm_max_fraction: float = 0.5
+    pawley_width_model: str = PAWLEY_WIDTH_CONSTANT
 
 
 @dataclass(frozen=True)
@@ -249,18 +273,31 @@ class CalibrationPeakResult:
     prominence: Optional[float]
     accepted: bool
     rejection_reason: str = ""
+    tof_uncertainty: Optional[float] = None
+    fwhm: Optional[float] = None
+    fwhm_uncertainty: Optional[float] = None
+    height: Optional[float] = None
+    height_uncertainty: Optional[float] = None
+    exponential_decay: Optional[float] = None
+    lorentz_fraction: Optional[float] = None
 
 
 @dataclass(frozen=True)
 class CalibrationResult:
     calibration: InstrumentCalibration
     initial_calibration: InstrumentCalibration
+    single_peak_calibration: InstrumentCalibration
     phase_name: str
     source_path: Path
     run_number: Optional[str]
     bank_number: Optional[int]
     peak_results: Tuple[CalibrationPeakResult, ...]
     rms_residual_tof: float
+    single_peak_rms_residual_tof: float
+    pattern_fit: Optional[PawleyFitResult] = None
+    pattern_profile_parameters: Mapping[str, float] = field(default_factory=dict)
+    pattern_lattice_a: Optional[float] = None
+    pattern_lattice_a_uncertainty: Optional[float] = None
 
     @property
     def accepted_peaks(self) -> Tuple[CalibrationPeakResult, ...]:

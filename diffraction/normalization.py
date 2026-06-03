@@ -102,6 +102,10 @@ def apply_vanadium_normalization(
             "calibration_source": str(calibration_result.source_path),
             "calibration_phase": calibration_result.phase_name,
             "calibration_rms_tof": calibration_result.rms_residual_tof,
+            "single_peak_calibration_difc": calibration_result.single_peak_calibration.difc,
+            "single_peak_calibration_tzero": calibration_result.single_peak_calibration.tzero,
+            "single_peak_calibration_rms_tof": calibration_result.single_peak_rms_residual_tof,
+            "pattern_calibration_profile": calibration_result.pattern_fit.profile_name if calibration_result.pattern_fit is not None else "",
         }
 
     metadata = dict(sample.metadata)
@@ -129,7 +133,7 @@ def apply_vanadium_normalization(
         bank_number=sample.bank_number,
         bank_name=sample.bank_name,
         x_label=sample.x_label,
-        y_label=f"{sample.y_label} / vanadium",
+        y_label=f"{sample.y_label} / open beam",
     )
     return NormalizationResult(
         corrected_spectrum=corrected,

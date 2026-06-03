@@ -60,6 +60,13 @@ from vtkmodules.vtkFiltersCore import vtkImplicitPolyDataDistance
 from vtkmodules.vtkCommonTransforms import vtkTransform
 
 try:
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+except Exception:
+    FigureCanvas = None
+    Figure = None
+
+try:
     from astropy.io import fits
 except ImportError:
     fits = None
@@ -78,6 +85,14 @@ from placement_fit import (
     rotation_matrix_to_euler_zyx_deg,
     rotation_z_deg,
     save_json_report,
+)
+from diffraction.acquisition import (
+    AcquisitionObservation,
+    MaterialAcquisitionProfile,
+    estimate_missing_acquisition_value,
+    fit_material_acquisition_profile,
+    load_material_acquisition_profiles,
+    save_material_acquisition_profiles,
 )
 
 try:
@@ -150,9 +165,12 @@ PROJECT_ARCHIVE_VERSION = 1
 PROJECT_MANIFEST_NAME = "project.json"
 PROJECT_EMBEDDED_MESH_NAME = "mesh.stl"
 PROJECT_FILE_FILTER = "SimSetup project (*.simsetup);;All files (*.*)"
+MESH_FILE_FILTER = "Mesh/CAD files (*.stl *.sat *.ply *.obj *.off *.glb *.gltf);;All files (*.*)"
 MICROSTRAIN_SCALE = 1_000_000.0
 DEFAULT_UI_FONT_POINT_SIZE = 7.0
 MIN_UI_FONT_POINT_SIZE = 3.0
+PLACEMENT_FORM_LABEL_WIDTH = 100
+PLACEMENT_FORM_FIELD_WIDTH = 80
 
 RIETVELD_COUNT_TIME_LAWS = {
     "Al": np.array([0.8, 0.9, 1.1, 1.2], dtype=float),
@@ -241,6 +259,9 @@ def make_form_layout(parent: Optional[QWidget] = None, *, compact_fields: bool =
     if compact_fields:
         layout.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
         layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        layout.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        layout.setHorizontalSpacing(2)
+        layout.setVerticalSpacing(8)
     return layout
 
 
@@ -441,6 +462,11 @@ def render_toolbar_toggle_icon(kind: str, color: QColor, size: int = 24) -> QPix
         painter.drawEllipse(QPointF(size - 6, c), 4.0, 4.0)
         painter.drawLine(size - 10, int(c), size - 2, int(c))
         painter.drawLine(size - 6, int(c - 4), size - 6, int(c + 4))
+    elif kind == "path_lengths":
+        painter.drawLine(QPointF(4, c + 5), QPointF(size - 4, c - 5))
+        painter.drawLine(QPointF(7, c + 2), QPointF(10, c + 5))
+        painter.drawLine(QPointF(size - 10, c - 5), QPointF(size - 7, c - 8))
+        draw_center_label("L")
     elif kind == "diffraction":
         front = QRect(4, 8, 9, 9)
         back_top_left = QPointF(1, 4)
@@ -1112,6 +1138,14 @@ def format_scan_numeric(value: float, decimals: int = 3) -> str:
     return f"{float(value):.{decimals}f}"
 
 
+def ceil_exposure_uamp(value: float) -> int:
+    value = float(value)
+    nearest_integer = round(value)
+    if np.isclose(value, nearest_integer, rtol=1e-12, atol=1e-9):
+        return int(nearest_integer)
+    return int(np.ceil(value))
+
+
 def compute_lattice_strain(
     lattice_parameter: float,
     d0: float,
@@ -1605,7 +1639,222 @@ def trimesh_loaded_to_polydata(loaded, source_name: str) -> pv.PolyData:
     return pv.PolyData(vertices, faces_with_size).clean()
 
 
+def sat_record_reference(token: str) -> Optional[int]:
+    if not token.startswith("$"):
+        return None
+    try:
+        return abs(int(token[1:]))
+    except ValueError:
+        return None
+
+
+def sat_record_references(tokens: Sequence[str], end_index: Optional[int] = None) -> List[int]:
+    selected = tokens if end_index is None else tokens[:end_index]
+    refs = []
+    for token in selected:
+        ref = sat_record_reference(token)
+        if ref is not None:
+            refs.append(ref)
+    return refs
+
+
+def sat_record_float_tail(tokens: Sequence[str], count: int) -> Optional[Tuple[float, ...]]:
+    values = []
+    for token in reversed(tokens):
+        try:
+            value = float(token)
+        except ValueError:
+            continue
+        values.append(value)
+        if len(values) == count:
+            return tuple(reversed(values))
+    return None
+
+
+def read_sat_records(path: Path) -> dict[int, list[str]]:
+    records: dict[int, list[str]] = {}
+    pending: list[str] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped == "End-of-ACIS-data":
+            continue
+        pending.append(stripped)
+        if "#" not in stripped:
+            continue
+
+        record_text = " ".join(pending).split("#", 1)[0].strip()
+        pending = []
+        tokens = record_text.split()
+        if len(tokens) < 2:
+            continue
+        try:
+            record_id = abs(int(tokens[0]))
+        except ValueError:
+            continue
+        records[record_id] = tokens
+    return records
+
+
+def build_sat_loop_polygon(
+    first_coedge_id: int,
+    coedges: dict[int, dict[str, object]],
+    edges: dict[int, Tuple[int, int]],
+) -> Optional[List[int]]:
+    loop_coedges: list[int] = []
+    current_id = first_coedge_id
+    while current_id not in loop_coedges:
+        coedge = coedges.get(current_id)
+        if coedge is None:
+            return None
+        loop_coedges.append(current_id)
+        next_id = coedge.get("next")
+        if not isinstance(next_id, int):
+            return None
+        current_id = next_id
+        if current_id == first_coedge_id:
+            break
+        if len(loop_coedges) > len(coedges):
+            return None
+
+    polygon: list[int] = []
+    for coedge_id in loop_coedges:
+        coedge = coedges[coedge_id]
+        edge_id = coedge.get("edge")
+        if not isinstance(edge_id, int) or edge_id not in edges:
+            return None
+        start_vertex, end_vertex = edges[edge_id]
+        if coedge.get("sense") == "reversed":
+            start_vertex, end_vertex = end_vertex, start_vertex
+
+        if not polygon:
+            polygon.extend((start_vertex, end_vertex))
+        elif polygon[-1] == start_vertex:
+            polygon.append(end_vertex)
+        elif polygon[-1] == end_vertex:
+            polygon.append(start_vertex)
+        else:
+            return None
+
+    if len(polygon) > 1 and polygon[0] == polygon[-1]:
+        polygon.pop()
+    deduped = []
+    for vertex_id in polygon:
+        if not deduped or deduped[-1] != vertex_id:
+            deduped.append(vertex_id)
+    return deduped if len(deduped) >= 3 else None
+
+
+def load_polyhedral_sat_as_polydata(path: Path) -> pv.PolyData:
+    records = read_sat_records(path)
+    if not records:
+        raise ValueError(f"{path.name} did not contain readable ACIS SAT records.")
+
+    record_types = {record_id: tokens[1] for record_id, tokens in records.items()}
+    curved_faces = [
+        record_id
+        for record_id, tokens in records.items()
+        if record_types[record_id] == "face"
+        and any(
+            record_types.get(ref, "").endswith("-surface") and record_types.get(ref) != "plane-surface"
+            for ref in sat_record_references(tokens)
+        )
+    ]
+    curved_edges = [
+        record_id
+        for record_id, tokens in records.items()
+        if record_types[record_id] == "edge"
+        and any(
+            record_types.get(ref, "").endswith("-curve") and record_types.get(ref) != "straight-curve"
+            for ref in sat_record_references(tokens)
+        )
+    ]
+    if curved_faces or curved_edges:
+        raise ValueError(
+            f"{path.name} contains curved ACIS geometry. "
+            "Convert curved or complex SAT files to STL before loading."
+        )
+
+    points: dict[int, Tuple[float, float, float]] = {}
+    for record_id, tokens in records.items():
+        if record_types[record_id] != "point":
+            continue
+        coords = sat_record_float_tail(tokens, 3)
+        if coords is not None:
+            points[record_id] = coords
+
+    vertices: dict[int, Tuple[float, float, float]] = {}
+    for record_id, tokens in records.items():
+        if record_types[record_id] != "vertex":
+            continue
+        point_refs = [ref for ref in sat_record_references(tokens) if record_types.get(ref) == "point"]
+        if point_refs and point_refs[-1] in points:
+            vertices[record_id] = points[point_refs[-1]]
+
+    edges: dict[int, Tuple[int, int]] = {}
+    for record_id, tokens in records.items():
+        if record_types[record_id] != "edge":
+            continue
+        vertex_refs = [ref for ref in sat_record_references(tokens) if record_types.get(ref) == "vertex"]
+        if len(vertex_refs) >= 2 and vertex_refs[0] in vertices and vertex_refs[1] in vertices:
+            edges[record_id] = (vertex_refs[0], vertex_refs[1])
+
+    coedges: dict[int, dict[str, object]] = {}
+    for record_id, tokens in records.items():
+        if record_types[record_id] != "coedge":
+            continue
+        try:
+            sense_index = next(index for index, token in enumerate(tokens) if token in {"forward", "reversed"})
+        except StopIteration:
+            continue
+
+        refs_before_sense = sat_record_references(tokens, sense_index)
+        edge_refs = [ref for ref in refs_before_sense if record_types.get(ref) == "edge"]
+        coedge_refs = [ref for ref in refs_before_sense if record_types.get(ref) == "coedge"]
+        if not edge_refs or not coedge_refs:
+            continue
+
+        coedges[record_id] = {
+            "next": coedge_refs[0],
+            "edge": edge_refs[-1],
+            "sense": tokens[sense_index],
+        }
+
+    vertex_indices: dict[int, int] = {}
+    point_array: list[Tuple[float, float, float]] = []
+    face_array: list[int] = []
+    for record_id, tokens in records.items():
+        if record_types[record_id] != "loop":
+            continue
+        coedge_refs = [ref for ref in sat_record_references(tokens) if record_types.get(ref) == "coedge"]
+        if not coedge_refs:
+            continue
+
+        polygon = build_sat_loop_polygon(coedge_refs[0], coedges, edges)
+        if polygon is None:
+            continue
+        face_array.append(len(polygon))
+        for vertex_id in polygon:
+            if vertex_id not in vertex_indices:
+                vertex_indices[vertex_id] = len(point_array)
+                point_array.append(vertices[vertex_id])
+            face_array.append(vertex_indices[vertex_id])
+
+    if not point_array or not face_array:
+        raise ValueError(
+            f"{path.name} could not be tessellated as a polyhedral SAT model. "
+            "Convert curved or complex ACIS SAT files to STL before loading."
+        )
+
+    mesh = pv.PolyData(np.asarray(point_array, dtype=float), np.asarray(face_array, dtype=np.int64))
+    mesh = mesh.triangulate().clean()
+    if mesh.n_points == 0 or mesh.n_cells == 0:
+        raise ValueError(f"{path.name} did not contain usable SAT face geometry.")
+    return mesh
+
+
 def load_mesh_as_polydata(path: Path) -> pv.PolyData:
+    if path.suffix.lower() == ".sat":
+        return load_polyhedral_sat_as_polydata(path)
     loaded = trimesh.load(path, force="scene")
     return trimesh_loaded_to_polydata(loaded, path.name)
 
@@ -2419,7 +2668,7 @@ class MainWindow(QMainWindow):
         self.report_body_text = (
             "Fit report will appear here.\n\n"
             "Workflow:\n"
-            "1. Load an STL/mesh.\n"
+            "1. Load a mesh or SAT model.\n"
             "2. Either run Fit placement or enable Manual Sample Placement.\n"
             "3. Adjust the live stage pose to inspect the setup.\n"
             "4. Compute the imaging map if needed."
@@ -2438,6 +2687,7 @@ class MainWindow(QMainWindow):
         self.tab_menu_stack = None
         self.instrument_setup_dialog = None
         self.settings_dialog = None
+        self.count_time_material_proxy = None
         self.setup_group = None
         self.point_picker_panel = None
         self._initial_sizes_applied = False
@@ -2459,6 +2709,9 @@ class MainWindow(QMainWindow):
         self.detector_map_mesh = None
         self.diffraction_bank_1_map_mesh = None
         self.diffraction_bank_2_map_mesh = None
+        self.diffraction_incident_path_mesh = None
+        self.diffraction_bank_1_path_mesh = None
+        self.diffraction_bank_2_path_mesh = None
         self.sight_line_mesh = None
         self.crosshair_h_mesh = None
         self.crosshair_v_mesh = None
@@ -2484,6 +2737,7 @@ class MainWindow(QMainWindow):
         self.show_sample_triad_checkbox = None
         self.show_theodolite_sight_line_checkbox = None
         self.show_diffraction_vectors_checkbox = None
+        self.show_path_lengths_checkbox = None
         self.model_axes_actor = None
         self.beam_inside_mesh = None
         self.measurement_points_mesh = None
@@ -2493,6 +2747,8 @@ class MainWindow(QMainWindow):
         self.detector_map_state = None
         self.diffraction_bank_1_map_state = None
         self.diffraction_bank_2_map_state = None
+        self.custom_acquisition_profiles: dict[str, MaterialAcquisitionProfile] = {}
+        self.load_material_acquisition_library()
 
         self._build_ui()
         self.update_placement_status()
@@ -2546,9 +2802,10 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self._build_manual_placement_group())
         controls_layout.addWidget(self._build_pose_group())
         controls_layout.addStretch(1)
-        controls_container.setMinimumWidth(300)
+        controls_container.setMinimumWidth(PLACEMENT_FORM_LABEL_WIDTH + PLACEMENT_FORM_FIELD_WIDTH + 48)
         self.controls_scroll = QScrollArea()
         self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.controls_scroll.setFrameShape(QFrame.NoFrame)
         self.controls_scroll.setWidget(controls_container)
         self.left_splitter.addWidget(self.controls_scroll)
@@ -2560,14 +2817,20 @@ class MainWindow(QMainWindow):
         self.top_splitter.addWidget(left_panel)
 
         right_panel = QWidget()
+        right_panel.setMinimumWidth(0)
+        right_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
         self.bottom_splitter = QSplitter(Qt.Vertical)
         self.bottom_splitter.setChildrenCollapsible(False)
+        self.bottom_splitter.setMinimumWidth(0)
+        self.bottom_splitter.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         right_layout.addWidget(self.bottom_splitter)
 
         view_panel = QWidget()
+        view_panel.setMinimumWidth(0)
+        view_panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         view_layout = QVBoxLayout(view_panel)
         view_layout.setContentsMargins(0, 0, 0, 0)
         view_layout.setSpacing(6)
@@ -2590,8 +2853,15 @@ class MainWindow(QMainWindow):
 
         self.tables_splitter = QSplitter(Qt.Horizontal)
         self.tables_splitter.setChildrenCollapsible(False)
-        self.tables_splitter.addWidget(self._build_measurement_section())
-        self.tables_splitter.addWidget(self._build_prediction_section())
+        self.tables_splitter.setMinimumWidth(0)
+        self.tables_splitter.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        measurement_section = self._build_measurement_section()
+        prediction_section = self._build_prediction_section()
+        for section in (measurement_section, prediction_section):
+            section.setMinimumWidth(0)
+            section.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.tables_splitter.addWidget(measurement_section)
+        self.tables_splitter.addWidget(prediction_section)
 
         self.bottom_splitter.addWidget(self.tables_splitter)
         self.bottom_splitter.setStretchFactor(0, 3)
@@ -2615,6 +2885,157 @@ class MainWindow(QMainWindow):
 
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Load a mesh, then use Fit placement or Manual Sample Placement.")
+
+    def _placement_form_label(self, text: str = "") -> QLabel:
+        label = QLabel(text)
+        label.setMinimumWidth(PLACEMENT_FORM_LABEL_WIDTH)
+        label.setMaximumWidth(PLACEMENT_FORM_LABEL_WIDTH)
+        label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        return label
+
+    def _set_placement_field_width(self, *widgets: QWidget) -> None:
+        for widget in widgets:
+            widget.setMinimumWidth(PLACEMENT_FORM_FIELD_WIDTH)
+            widget.setMaximumWidth(PLACEMENT_FORM_FIELD_WIDTH)
+            widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def _add_placement_form_row(self, layout: QFormLayout, label: str, field: QWidget) -> None:
+        self._set_placement_field_width(field)
+        layout.addRow(self._placement_form_label(label), field)
+
+    def _add_placement_form_layout_row(self, layout: QFormLayout, row_layout: QLayout) -> None:
+        layout.addRow(row_layout)
+
+    def _wrap_toolbar_for_narrow_panel(self, toolbar: QWidget) -> QScrollArea:
+        toolbar.adjustSize()
+        toolbar.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setMinimumWidth(0)
+        scroll.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        scroll.setWidget(toolbar)
+
+        toolbar_height = toolbar.sizeHint().height()
+        scrollbar_height = scroll.horizontalScrollBar().sizeHint().height()
+        scroll.setMinimumHeight(toolbar_height)
+        scroll.setMaximumHeight(toolbar_height + scrollbar_height + 2)
+        return scroll
+
+    def _remove_diffraction_path_visuals(self) -> None:
+        for attr_name, actor_name, label_name in (
+            ("diffraction_incident_path_mesh", "diffraction_incident_path", "diffraction_incident_path_label"),
+            ("diffraction_bank_1_path_mesh", "diffraction_path_bank_1", "diffraction_path_bank_1_label"),
+            ("diffraction_bank_2_path_mesh", "diffraction_path_bank_2", "diffraction_path_bank_2_label"),
+        ):
+            if getattr(self, attr_name) is not None:
+                self.plotter.remove_actor(actor_name, render=False)
+                setattr(self, attr_name, None)
+            self.plotter.remove_actor(label_name, render=False)
+
+    def _set_diffraction_path_visual(
+        self,
+        attr_name: str,
+        actor_name: str,
+        label_name: Optional[str],
+        label: str,
+        total_path_length: float,
+        segments: Sequence[Tuple[np.ndarray, np.ndarray]],
+        *,
+        color: str,
+        text_color: str,
+    ) -> None:
+        if not segments:
+            if getattr(self, attr_name) is not None:
+                self.plotter.remove_actor(actor_name, render=False)
+                setattr(self, attr_name, None)
+            if label_name is not None:
+                self.plotter.remove_actor(label_name, render=False)
+            return
+
+        self.set_or_add_mesh(
+            attr_name,
+            make_multi_line_polydata(segments),
+            actor_name,
+            color=color,
+            line_width=6,
+        )
+        if label_name is None:
+            return
+        if not label:
+            self.plotter.remove_actor(label_name, render=False)
+            return
+        longest_segment = max(segments, key=lambda segment: float(np.linalg.norm(segment[1] - segment[0])))
+        label_position = (np.asarray(longest_segment[0], dtype=float) + np.asarray(longest_segment[1], dtype=float)) / 2.0
+        self.plotter.remove_actor(label_name, render=False)
+        self.plotter.add_point_labels(
+            pv.PolyData(np.array([label_position], dtype=float)),
+            [f"{label}: {total_path_length:.1f} mm"],
+            font_size=self.viewer_font_size(max(gui_like_label_font_size(self) - 1, 13)),
+            shape=None,
+            text_color=text_color,
+            always_visible=True,
+            name=label_name,
+            render=False,
+        )
+
+    def _update_diffraction_path_visuals(
+        self,
+        show_diffraction_detectors: bool,
+        pivot: np.ndarray,
+        slit_origin: np.ndarray,
+        bank_geometries: Sequence[Tuple[str, dict, str, str, str, str, str]],
+        bank_states: Optional[Sequence[dict]] = None,
+    ) -> None:
+        if (
+            not show_diffraction_detectors
+            or self.model_world_mesh is None
+            or self.model_world_mesh.n_points == 0
+        ):
+            self._remove_diffraction_path_visuals()
+            return
+
+        signed_distance_evaluator = build_mesh_signed_distance_evaluator(self.model_world_mesh)
+        incoming_path_length, incoming_segments = compute_segment_path_length(
+            self.model_world_mesh,
+            slit_origin,
+            pivot,
+            signed_distance_evaluator=signed_distance_evaluator,
+        )
+        self._set_diffraction_path_visual(
+            "diffraction_incident_path_mesh",
+            "diffraction_incident_path",
+            "diffraction_incident_path_label",
+            "",
+            incoming_path_length,
+            incoming_segments,
+            color="#dc2626",
+            text_color="#8f1d1d",
+        )
+        state_list = list(bank_states or [])
+        for index, (attr_name, geometry, actor_name, label_name, label, color, text_color) in enumerate(bank_geometries):
+            outgoing_path_length, outgoing_segments = compute_segment_path_length(
+                self.model_world_mesh,
+                pivot,
+                np.asarray(geometry["center"], dtype=float),
+                signed_distance_evaluator=signed_distance_evaluator,
+            )
+            display_path_length = incoming_path_length + outgoing_path_length
+            if index < len(state_list) and state_list[index] is not None:
+                display_path_length = float(state_list[index]["average_length"])
+            self._set_diffraction_path_visual(
+                attr_name,
+                actor_name,
+                label_name,
+                label,
+                display_path_length,
+                outgoing_segments,
+                color=color,
+                text_color=text_color,
+            )
 
     def _apply_initial_splitter_sizes(self) -> None:
         if self.top_splitter is not None:
@@ -2778,7 +3199,7 @@ class MainWindow(QMainWindow):
         self._add_tab_menu_action(menu, "Load Project", self.load_project_dialog)
         self._add_tab_menu_action(menu, "Save Project", self.save_project_dialog)
         menu.addSeparator()
-        self._add_tab_menu_action(menu, "Load STL/mesh", self.load_mesh_dialog)
+        self._add_tab_menu_action(menu, "Load mesh/SAT", self.load_mesh_dialog)
         self._add_tab_menu_action(menu, "Clear Mesh", self.clear_mesh)
         menu.addSeparator()
         self._add_tab_menu_action(menu, "Export Fit JSON", self.export_json_dialog)
@@ -2788,6 +3209,8 @@ class MainWindow(QMainWindow):
     def _populate_placement_setting_menu(self, menu) -> None:
         self._add_tab_menu_action(menu, "Open Settings", self.open_settings_tab)
         self._add_tab_menu_action(menu, "Instrument Setup", self.open_instrument_setup_dialog)
+        self._add_tab_menu_action(menu, "Manage Materials", self.open_material_acquisition_calibration_dialog)
+        self._add_tab_menu_action(menu, "Acquisition Estimation", self.open_acquisition_estimation_dialog)
 
     def _populate_placement_view_menu(self, menu) -> None:
         preset_actions = []
@@ -2838,7 +3261,7 @@ class MainWindow(QMainWindow):
         menu.aboutToShow.connect(lambda: self.sync_placement_view_menu_actions(preset_actions, toggle_actions))
 
     def _populate_pick_point_file_menu(self, menu) -> None:
-        self._add_tab_menu_action(menu, "Load STL/mesh", self.load_mesh_dialog)
+        self._add_tab_menu_action(menu, "Load mesh/SAT", self.load_mesh_dialog)
         self._add_tab_menu_action(menu, "Clear Mesh", self.clear_mesh)
         menu.addSeparator()
         self._add_tab_menu_action(menu, "Save Picked Points", self.save_picked_points_dialog)
@@ -2953,7 +3376,7 @@ class MainWindow(QMainWindow):
 
         load_mesh_button = make_toolbar_icon_button(
             QIcon(str(icons_dir / "import-stl-mesh.svg")),
-            "Load STL/mesh",
+            "Load mesh/SAT",
             self.load_mesh_dialog,
             button_size=30,
             icon_size=18,
@@ -3011,16 +3434,27 @@ class MainWindow(QMainWindow):
         for index in range(self.count_time_material.count()):
             material_proxy.addItem(self.count_time_material.itemText(index))
         material_proxy.setCurrentText(self.count_time_material.currentText())
+        self.count_time_material_proxy = material_proxy
+
+        uncertainty_proxy = make_spin_box(
+            self.target_uncertainty.value(),
+            self.target_uncertainty.minimum(),
+            self.target_uncertainty.maximum(),
+        )
+        uncertainty_proxy.setDecimals(self.target_uncertainty.decimals())
+        uncertainty_proxy.setSingleStep(self.target_uncertainty.singleStep())
 
         self._bind_spin_box_proxy(slit_width_proxy, self.slit_width)
         self._bind_spin_box_proxy(slit_height_proxy, self.slit_height)
         self._bind_combo_box_proxy(collimator_proxy, self.collimator)
         self._bind_combo_box_proxy(material_proxy, self.count_time_material)
+        self._bind_spin_box_proxy(uncertainty_proxy, self.target_uncertainty)
 
-        layout.addRow("Slit width", slit_width_proxy)
-        layout.addRow("Slit height", slit_height_proxy)
-        layout.addRow("Collimator", collimator_proxy)
-        layout.addRow("Material", material_proxy)
+        self._add_placement_form_row(layout, "Slit width", slit_width_proxy)
+        self._add_placement_form_row(layout, "Slit height", slit_height_proxy)
+        self._add_placement_form_row(layout, "Collimator", collimator_proxy)
+        self._add_placement_form_row(layout, "Material", material_proxy)
+        self._add_placement_form_row(layout, "Target uncertainty", uncertainty_proxy)
         return group
 
     def _bind_spin_box_proxy(self, proxy, target) -> None:
@@ -3084,7 +3518,7 @@ class MainWindow(QMainWindow):
         )
         load_mesh_button = make_toolbar_action_button(
             "act_mesh_load",
-            "Load STL/mesh",
+            "Load mesh/SAT",
             self.load_mesh_dialog,
             button_size=30,
             icon_size=18,
@@ -3288,7 +3722,7 @@ class MainWindow(QMainWindow):
         self.theodolite_x = make_spin_box(-250.0, -100000.0, 100000.0)
         self.theodolite_y = make_spin_box(-250.0, -100000.0, 100000.0)
         self.theodolite_z = make_spin_box(0.0, -100000.0, 100000.0)
-        self.slit_x = make_spin_box(-300.0, -100000.0, 100000.0)
+        self.slit_x = make_spin_box(-500.0, -100000.0, 100000.0)
         self.slit_y = make_spin_box(0.0, -100000.0, 100000.0)
         self.slit_z = make_spin_box(0.0, -100000.0, 100000.0)
         self.slit_width = make_spin_box(4.0, 0.001, 100000.0)
@@ -3297,14 +3731,19 @@ class MainWindow(QMainWindow):
         self.collimator.addItems(["0.5", "1", "2", "3", "4"])
         self.collimator.setCurrentText("4")
         self.count_time_material = NoWheelComboBox()
-        self.count_time_material.addItems(list(RIETVELD_COUNT_TIME_LAWS.keys()))
-        self.beam_length = make_spin_box(700.0, 1.0, 100000.0)
+        self.count_time_material.addItems(list(RIETVELD_COUNT_TIME_LAWS.keys()) + sorted(self.custom_acquisition_profiles))
+        self.target_uncertainty = make_spin_box(100.0, 0.001, 1_000_000_000.0, step=10.0)
+        self.target_uncertainty.setDecimals(3)
+        self.target_uncertainty.setToolTip(
+            "Used for calibrated custom materials. Built-in materials retain their reference exposure law."
+        )
+        self.beam_length = make_spin_box(500.0, 1.0, 100000.0)
         self.detector_width_y = make_spin_box(100.0, 10.0, 200.0)
         self.detector_height_z = make_spin_box(100.0, 10.0, 200.0)
         self.detector_map_pixel_size_y = make_spin_box(0.1, 0.01, 10.0, step=0.01)
         self.detector_map_pixel_size_z = make_spin_box(0.1, 0.01, 10.0, step=0.01)
-        self.stage_size_x = make_spin_box(500.0, 1.0, 100000.0)
-        self.stage_size_y = make_spin_box(500.0, 1.0, 100000.0)
+        self.stage_size_x = make_spin_box(300.0, 1.0, 100000.0)
+        self.stage_size_y = make_spin_box(300.0, 1.0, 100000.0)
         self.stage_size_z = make_spin_box(50.0, 1.0, 100000.0)
         self.stage_offset_x = make_spin_box(0.0, -100000.0, 100000.0)
         self.stage_offset_y = make_spin_box(0.0, -100000.0, 100000.0)
@@ -3354,6 +3793,7 @@ class MainWindow(QMainWindow):
         layout.addRow("Slit height", self.slit_height)
         layout.addRow("Collimator", self.collimator)
         layout.addRow("Material", self.count_time_material)
+        layout.addRow("Target uncertainty", self.target_uncertainty)
         self.instrument_setup_dialog = self._build_instrument_setup_dialog()
         return group
 
@@ -3403,6 +3843,637 @@ class MainWindow(QMainWindow):
         self.instrument_setup_dialog.raise_()
         self.instrument_setup_dialog.activateWindow()
 
+    def material_acquisition_library_path(self) -> Path:
+        application_data = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        base_path = Path(application_data) if application_data else Path.home() / ".simsetup"
+        return base_path / "SimSetup" / "acquisition_materials.json"
+
+    def load_material_acquisition_library(self) -> None:
+        try:
+            self.custom_acquisition_profiles = load_material_acquisition_profiles(
+                self.material_acquisition_library_path()
+            )
+        except Exception:
+            self.custom_acquisition_profiles = {}
+
+    def save_material_acquisition_library(self) -> None:
+        save_material_acquisition_profiles(
+            self.material_acquisition_library_path(),
+            list(self.custom_acquisition_profiles.values()),
+        )
+
+    def refresh_count_time_material_items(self, selected_material: Optional[str] = None) -> None:
+        names = list(RIETVELD_COUNT_TIME_LAWS.keys()) + sorted(self.custom_acquisition_profiles)
+        selected = selected_material or self.count_time_material.currentText()
+        for combo in (self.count_time_material, self.count_time_material_proxy):
+            if combo is None:
+                continue
+            previous_state = combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(names)
+            if selected in names:
+                combo.setCurrentText(selected)
+            combo.blockSignals(previous_state)
+
+    def open_material_acquisition_calibration_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manage Material Acquisition Calibrations")
+        dialog.setModal(True)
+        dialog.setWindowFlags(
+            dialog.windowFlags()
+            | Qt.WindowMinMaxButtonsHint
+            | Qt.WindowMaximizeButtonHint
+        )
+        dialog.resize(1040, 560)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        content_splitter = QSplitter(Qt.Horizontal)
+        content_splitter.setChildrenCollapsible(False)
+        layout.addWidget(content_splitter, stretch=1)
+
+        left_panel = QWidget()
+        left_panel.setMinimumWidth(360)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 6, 0)
+        left_layout.setSpacing(8)
+        content_splitter.addWidget(left_panel)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(6, 0, 0, 0)
+        right_layout.setSpacing(8)
+        content_splitter.addWidget(right_panel)
+        content_splitter.setStretchFactor(0, 0)
+        content_splitter.setStretchFactor(1, 1)
+        content_splitter.setSizes([380, 660])
+
+        current_name = self.count_time_material.currentText()
+        current_profile = self.custom_acquisition_profiles.get(current_name)
+        loaded_custom_name: dict[str, Optional[str]] = {
+            "value": current_profile.name if current_profile is not None else None
+        }
+        profile_group = QGroupBox("Material Profile")
+        profile_layout = QVBoxLayout(profile_group)
+        profile_layout.setContentsMargins(10, 10, 10, 10)
+        selector_row = QHBoxLayout()
+        selector_row.addWidget(QLabel("Material profile"))
+        profile_selector = NoWheelComboBox()
+        profile_selector.setMaximumWidth(300)
+        selector_row.addWidget(profile_selector)
+        selector_row.addStretch(1)
+        profile_layout.addLayout(selector_row)
+        form = QFormLayout()
+        material_edit = QLineEdit(current_profile.name if current_profile is not None else "")
+        metric_edit = QLineEdit(
+            current_profile.uncertainty_metric if current_profile is not None else "Microstrain uncertainty"
+        )
+        bank_combo = NoWheelComboBox()
+        bank_combo.addItems(["Both banks independently", "Bank 1", "Bank 2", "Combined fit"])
+        if current_profile is not None:
+            if bank_combo.findText(current_profile.bank_scope) < 0:
+                bank_combo.addItem(current_profile.bank_scope)
+            bank_combo.setCurrentText(current_profile.bank_scope)
+        exposure_unit_edit = QLineEdit(current_profile.exposure_unit if current_profile is not None else "uAmp")
+        supplied_mu_edit = QLineEdit()
+        if current_profile is not None and current_profile.mode == "supplied_mu" and current_profile.mu_per_mm is not None:
+            supplied_mu_edit.setText(f"{current_profile.mu_per_mm:.8g}")
+        supplied_mu_edit.setPlaceholderText("Optional for a single path length")
+        form.addRow("Material name", material_edit)
+        form.addRow("Uncertainty metric", metric_edit)
+        form.addRow("Detector/bank basis", bank_combo)
+        form.addRow("Exposure unit", exposure_unit_edit)
+        form.addRow("Effective mu (mm^-1)", supplied_mu_edit)
+        profile_layout.addLayout(form)
+        left_layout.addWidget(profile_group)
+
+        measurements_group = QGroupBox("Calibration Measurements")
+        measurements_layout = QVBoxLayout(measurements_group)
+        measurements_layout.setContentsMargins(8, 10, 8, 8)
+        table = QTableWidget(0, 5)
+        table.setHorizontalHeaderLabels(
+            ["Run / label", "Gauge volume (mm3)", "Path length (mm)", "Exposure (uAmp)", "Fitting uncertainty"]
+        )
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        table.setAlternatingRowColors(True)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setMinimumHeight(120)
+        measurements_layout.addWidget(table)
+        left_layout.addWidget(measurements_group, stretch=1)
+
+        fit_axes = None
+        residual_axes = None
+        fit_canvas = None
+        plot_group = QGroupBox("Calibration Fit")
+        plot_layout = QVBoxLayout(plot_group)
+        plot_layout.setContentsMargins(8, 10, 8, 8)
+        if FigureCanvas is None or Figure is None:
+            plot_placeholder = QLabel("matplotlib is required to display the calibration fit plot.")
+            plot_placeholder.setAlignment(Qt.AlignCenter)
+            plot_layout.addWidget(plot_placeholder)
+        else:
+            fit_figure = Figure(figsize=(8, 4))
+            fit_canvas = FigureCanvas(fit_figure)
+            grid = fit_figure.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.05)
+            fit_axes = fit_figure.add_subplot(grid[0])
+            residual_axes = fit_figure.add_subplot(grid[1], sharex=fit_axes)
+            fit_figure.subplots_adjust(left=0.12, right=0.98, top=0.88, bottom=0.17, hspace=0.08)
+            fit_canvas.setMinimumHeight(220)
+            plot_layout.addWidget(fit_canvas)
+        right_layout.addWidget(plot_group, stretch=1)
+
+        def add_row(observation: Optional[AcquisitionObservation] = None) -> None:
+            row = table.rowCount()
+            table.insertRow(row)
+            values = (
+                observation.label if observation is not None else f"Run {row + 1}",
+                observation.gauge_volume_mm3 if observation is not None else "",
+                observation.path_length_mm if observation is not None else "",
+                observation.exposure_uamp if observation is not None else "",
+                observation.uncertainty if observation is not None else "",
+            )
+            for column, value in enumerate(values):
+                table.setItem(row, column, QTableWidgetItem("" if value == "" else str(value)))
+
+        if current_profile is None:
+            add_row()
+        else:
+            for observation in current_profile.observations:
+                add_row(observation)
+
+        status = QPlainTextEdit()
+        status.setReadOnly(True)
+        status.setMinimumHeight(62)
+        status.setMaximumHeight(88)
+        status.setPlainText(
+            "Enter one or more calibration runs. A single path length only predicts that same path unless "
+            "effective mu is supplied; two or more distinct path lengths fit mu."
+        )
+        summary_group = QGroupBox("Calibration Summary")
+        summary_layout = QVBoxLayout(summary_group)
+        summary_layout.setContentsMargins(8, 10, 8, 8)
+        summary_layout.addWidget(status)
+        left_layout.addWidget(summary_group)
+
+        def build_profile_from_table() -> MaterialAcquisitionProfile:
+            observations = []
+            for row in range(table.rowCount()):
+                texts = [
+                    "" if table.item(row, column) is None else table.item(row, column).text().strip()
+                    for column in range(table.columnCount())
+                ]
+                if not any(texts):
+                    continue
+                if any(text == "" for text in texts[1:]):
+                    raise ValueError(f"Calibration row {row + 1} is incomplete.")
+                try:
+                    observations.append(
+                        AcquisitionObservation(
+                            label=texts[0] or f"Run {row + 1}",
+                            gauge_volume_mm3=float(texts[1]),
+                            path_length_mm=float(texts[2]),
+                            exposure_uamp=float(texts[3]),
+                            uncertainty=float(texts[4]),
+                        )
+                    )
+                except ValueError as exc:
+                    raise ValueError(f"Calibration row {row + 1}: {exc}") from exc
+            supplied_mu_text = supplied_mu_edit.text().strip()
+            supplied_mu = None if supplied_mu_text == "" else float(supplied_mu_text)
+            return fit_material_acquisition_profile(
+                material_edit.text(),
+                observations,
+                uncertainty_metric=metric_edit.text(),
+                bank_scope=bank_combo.currentText(),
+                exposure_unit=exposure_unit_edit.text(),
+                supplied_mu_per_mm=supplied_mu,
+            )
+
+        def profile_status_text(profile: MaterialAcquisitionProfile) -> str:
+            path_min, path_max = profile.path_range_mm
+            mode_names = {
+                "single_path": "Single-path calibration",
+                "supplied_mu": "Single-path calibration with supplied mu",
+                "two_point_fit": "Two-point path calibration",
+                "multi_point_fit": "Multi-point path calibration",
+            }
+            lines = [
+                mode_names.get(profile.mode, profile.mode),
+                f"Measurements: {len(profile.observations)}; calibrated path range: {path_min:g} to {path_max:g} mm",
+            ]
+            if profile.mu_per_mm is None:
+                lines.append("Path prediction unavailable outside the measured path length until mu is supplied or fitted.")
+            else:
+                lines.append(f"Effective mu: {profile.mu_per_mm:.8g} mm^-1")
+                if profile.rms_log_residual is not None and profile.mode == "multi_point_fit":
+                    lines.append(f"RMS log residual: {profile.rms_log_residual:.5g}")
+                if profile.mu_per_mm < 0.0:
+                    lines.append("Warning: fitted mu is negative; check calibration measurements before use.")
+            return "\n".join(lines)
+
+        def clear_fit_plot(message: str) -> None:
+            if fit_axes is None or residual_axes is None or fit_canvas is None:
+                return
+            fit_axes.clear()
+            residual_axes.clear()
+            fit_axes.set_title(message)
+            fit_axes.set_ylabel("log(UAmp * V * uncertainty^2)")
+            residual_axes.set_xlabel("Path length (mm)")
+            residual_axes.set_ylabel("Residual")
+            residual_axes.axhline(0.0, color="#94a3b8", linewidth=0.8)
+            fit_canvas.draw_idle()
+
+        def plot_profile_fit(profile: MaterialAcquisitionProfile) -> None:
+            if fit_axes is None or residual_axes is None or fit_canvas is None:
+                return
+            path_values = np.asarray(
+                [observation.path_length_mm for observation in profile.observations],
+                dtype=float,
+            )
+            normalized_values = np.asarray(
+                [observation.normalized_log_exposure() for observation in profile.observations],
+                dtype=float,
+            )
+            fit_axes.clear()
+            residual_axes.clear()
+            fit_axes.plot(
+                path_values,
+                normalized_values,
+                color="#2563a9",
+                linestyle="None",
+                marker="o",
+                markersize=6,
+                label="Calibration observations",
+            )
+            for observation, path_value, normalized_value in zip(
+                profile.observations,
+                path_values,
+                normalized_values,
+            ):
+                fit_axes.annotate(
+                    observation.label,
+                    (path_value, normalized_value),
+                    xytext=(6, 6),
+                    textcoords="offset points",
+                    color="#1f2937",
+                    fontsize=8,
+                )
+            if profile.mu_per_mm is not None and profile.log_scale is not None:
+                path_min = float(np.min(path_values))
+                path_max = float(np.max(path_values))
+                margin = max((path_max - path_min) * 0.08, 1.0)
+                line_paths = np.linspace(path_min - margin, path_max + margin, 100)
+                line_values = float(profile.log_scale) + float(profile.mu_per_mm) * line_paths
+                fitted_values = float(profile.log_scale) + float(profile.mu_per_mm) * path_values
+                residuals = normalized_values - fitted_values
+                fit_axes.plot(
+                    line_paths,
+                    line_values,
+                    color="#dc2626",
+                    linewidth=1.5,
+                    label=f"Fit: mu={profile.mu_per_mm:.6g} mm^-1",
+                )
+                residual_axes.plot(
+                    path_values,
+                    residuals,
+                    color="#475569",
+                    linestyle="None",
+                    marker="o",
+                    markersize=5,
+                )
+                fit_axes.legend(loc="best")
+            else:
+                residual_axes.text(
+                    0.5,
+                    0.5,
+                    "No path-length fit without effective mu",
+                    transform=residual_axes.transAxes,
+                    ha="center",
+                    va="center",
+                )
+            residual_axes.axhline(0.0, color="#94a3b8", linewidth=0.8)
+            fit_axes.set_title(f"Acquisition calibration fit: {profile.name}")
+            fit_axes.set_ylabel("log(UAmp * V * uncertainty^2)")
+            fit_axes.tick_params(axis="x", labelbottom=False)
+            residual_axes.set_xlabel("Path length (mm)")
+            residual_axes.set_ylabel("Residual")
+            fit_canvas.draw_idle()
+
+        def fit_preview() -> None:
+            try:
+                profile = build_profile_from_table()
+                status.setPlainText(profile_status_text(profile))
+                plot_profile_fit(profile)
+            except Exception as exc:
+                status.setPlainText(f"Calibration invalid: {exc}")
+                clear_fit_plot("Calibration input is invalid")
+
+        def save_profile() -> None:
+            try:
+                profile = build_profile_from_table()
+                if profile.name in RIETVELD_COUNT_TIME_LAWS:
+                    raise ValueError("Choose a new name; built-in reference materials cannot be overwritten.")
+                previous_name = loaded_custom_name["value"]
+                if profile.name in self.custom_acquisition_profiles and profile.name != previous_name:
+                    raise ValueError("A calibrated material with this name already exists. Select it to edit it.")
+                if previous_name is not None and previous_name != profile.name:
+                    del self.custom_acquisition_profiles[previous_name]
+                self.custom_acquisition_profiles[profile.name] = profile
+                self.save_material_acquisition_library()
+                self.refresh_count_time_material_items(profile.name)
+                populate_profile_selector("custom", profile.name)
+                load_selected_profile()
+                self.statusBar().showMessage(f"Saved acquisition calibration for {profile.name}.", 5000)
+            except Exception as exc:
+                self.show_error("Save material calibration failed", str(exc))
+
+        add_button = QPushButton("Add Measurement")
+        add_button.clicked.connect(lambda: add_row())
+        remove_button = QPushButton("Remove Selected")
+
+        def remove_selected_rows() -> None:
+            rows = sorted({index.row() for index in table.selectedIndexes()}, reverse=True)
+            for row in rows:
+                table.removeRow(row)
+
+        remove_button.clicked.connect(remove_selected_rows)
+        measurement_button_row = QHBoxLayout()
+        measurement_button_row.addWidget(add_button)
+        measurement_button_row.addWidget(remove_button)
+        measurement_button_row.addStretch(1)
+        measurements_layout.addLayout(measurement_button_row)
+
+        action_row = QHBoxLayout()
+        fit_button = QPushButton("Fit Calibration")
+        fit_button.clicked.connect(fit_preview)
+        save_button = QPushButton("Save Material")
+        save_button.clicked.connect(save_profile)
+        delete_button = QPushButton("Delete Material")
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.reject)
+        for button in (fit_button, save_button, delete_button, close_button):
+            action_row.addWidget(button)
+        action_row.addStretch(1)
+        left_layout.addLayout(action_row)
+
+        def set_calibration_editable(editable: bool) -> None:
+            for widget in (material_edit, metric_edit, bank_combo, exposure_unit_edit, supplied_mu_edit, table):
+                widget.setEnabled(editable)
+            for button in (add_button, remove_button, fit_button, save_button):
+                button.setEnabled(editable)
+
+        def clear_calibration_inputs() -> None:
+            table.setRowCount(0)
+            material_edit.setText("")
+            metric_edit.setText("Microstrain uncertainty")
+            bank_combo.setCurrentText("Both banks independently")
+            exposure_unit_edit.setText("uAmp")
+            supplied_mu_edit.setText("")
+
+        def populate_profile_selector(selected_kind: str = "new", selected_name: Optional[str] = None) -> None:
+            previous_state = profile_selector.blockSignals(True)
+            profile_selector.clear()
+            profile_selector.addItem("New calibrated material...", ("new", None))
+            for name in RIETVELD_COUNT_TIME_LAWS:
+                profile_selector.addItem(f"{name} (built-in reference)", ("builtin", name))
+            for name in sorted(self.custom_acquisition_profiles):
+                profile_selector.addItem(f"{name} (calibrated)", ("custom", name))
+            target = (selected_kind, selected_name)
+            for index in range(profile_selector.count()):
+                if profile_selector.itemData(index) == target:
+                    profile_selector.setCurrentIndex(index)
+                    break
+            profile_selector.blockSignals(previous_state)
+
+        def load_selected_profile() -> None:
+            kind, name = profile_selector.currentData() or ("new", None)
+            clear_calibration_inputs()
+            if kind == "builtin":
+                loaded_custom_name["value"] = None
+                set_calibration_editable(False)
+                delete_button.setEnabled(False)
+                material_edit.setText(str(name))
+                metric_edit.setText("Reference exposure law; uncertainty not recorded")
+                exposure_unit_edit.setText("Reference exposure")
+                count_times = RIETVELD_COUNT_TIME_LAWS[str(name)]
+                for path_length, exposure in zip(COUNT_TIME_REFERENCE_PATHS_MM, count_times):
+                    row = table.rowCount()
+                    table.insertRow(row)
+                    for column, value in enumerate(
+                        (f"Reference {path_length:g} mm", 64.0, path_length, exposure, "")
+                    ):
+                        item = QTableWidgetItem(str(value))
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        table.setItem(row, column, item)
+                mu = float(
+                    np.log(count_times[3] / count_times[2])
+                    / (COUNT_TIME_REFERENCE_PATHS_MM[3] - COUNT_TIME_REFERENCE_PATHS_MM[2])
+                )
+                status.setPlainText(
+                    f"Built-in reference material (view only)\nEffective mu: {mu:.8g} mm^-1, derived from "
+                    "the 40 mm and 50 mm reference exposures at 64 mm3 gauge volume.\n"
+                    "No fitting-uncertainty calibration records exist for this material. Create a calibrated "
+                    "material to predict against a target uncertainty."
+                )
+                clear_fit_plot("No uncertainty calibration plot for built-in reference material")
+                return
+            set_calibration_editable(True)
+            if kind == "custom":
+                profile = self.custom_acquisition_profiles[str(name)]
+                loaded_custom_name["value"] = profile.name
+                delete_button.setEnabled(True)
+                material_edit.setText(profile.name)
+                metric_edit.setText(profile.uncertainty_metric)
+                if bank_combo.findText(profile.bank_scope) < 0:
+                    bank_combo.addItem(profile.bank_scope)
+                bank_combo.setCurrentText(profile.bank_scope)
+                exposure_unit_edit.setText(profile.exposure_unit)
+                if profile.mode == "supplied_mu" and profile.mu_per_mm is not None:
+                    supplied_mu_edit.setText(f"{profile.mu_per_mm:.8g}")
+                for observation in profile.observations:
+                    add_row(observation)
+                status.setPlainText(profile_status_text(profile))
+                plot_profile_fit(profile)
+                return
+            loaded_custom_name["value"] = None
+            delete_button.setEnabled(False)
+            add_row()
+            status.setPlainText(
+                "Enter one or more calibration runs. A single path length only predicts that same path unless "
+                "effective mu is supplied; two or more distinct path lengths fit mu."
+            )
+            clear_fit_plot("Enter calibration observations, then select Fit Calibration")
+
+        def delete_profile() -> None:
+            name = loaded_custom_name["value"]
+            if name is None:
+                return
+            response = QMessageBox.question(
+                dialog,
+                "Delete material calibration",
+                f"Delete the calibrated material '{name}'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if response != QMessageBox.Yes:
+                return
+            del self.custom_acquisition_profiles[name]
+            self.save_material_acquisition_library()
+            selected_name = self.count_time_material.currentText()
+            if selected_name == name:
+                selected_name = next(iter(RIETVELD_COUNT_TIME_LAWS))
+            self.refresh_count_time_material_items(selected_name)
+            populate_profile_selector()
+            load_selected_profile()
+            self.statusBar().showMessage(f"Deleted acquisition calibration for {name}.", 5000)
+
+        profile_selector.currentIndexChanged.connect(lambda _index: load_selected_profile())
+        delete_button.clicked.connect(delete_profile)
+        if current_name in self.custom_acquisition_profiles:
+            populate_profile_selector("custom", current_name)
+        elif current_name in RIETVELD_COUNT_TIME_LAWS:
+            populate_profile_selector("builtin", current_name)
+        else:
+            populate_profile_selector()
+        load_selected_profile()
+        dialog.exec_()
+
+    def open_acquisition_estimation_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Acquisition Estimation")
+        dialog.setModal(True)
+        dialog.setWindowFlags(
+            dialog.windowFlags()
+            | Qt.WindowMinMaxButtonsHint
+            | Qt.WindowMaximizeButtonHint
+        )
+        dialog.resize(900, 420)
+        layout = QVBoxLayout(dialog)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Material"))
+        material_combo = NoWheelComboBox()
+        material_combo.setMaximumWidth(320)
+        for name in sorted(self.custom_acquisition_profiles):
+            material_combo.addItem(name)
+        if self.count_time_material.currentText() in self.custom_acquisition_profiles:
+            material_combo.setCurrentText(self.count_time_material.currentText())
+        top_row.addWidget(material_combo)
+        top_row.addStretch(1)
+        layout.addLayout(top_row)
+
+        help_label = QLabel(
+            "Fill exactly three numeric values in each row; leave one of gauge volume, path length, "
+            "exposure, or fitting uncertainty blank to estimate it from the selected calibrated material."
+        )
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+
+        table = QTableWidget(0, 5)
+        table.setHorizontalHeaderLabels(
+            ["Run / label", "Gauge volume (mm3)", "Path length (mm)", "Exposure (uAmp)", "Fitting uncertainty"]
+        )
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        table.setAlternatingRowColors(True)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(table, stretch=1)
+
+        status = QPlainTextEdit()
+        status.setReadOnly(True)
+        status.setMaximumHeight(82)
+        layout.addWidget(status)
+
+        def add_row() -> None:
+            row = table.rowCount()
+            table.insertRow(row)
+            values = (f"Run {row + 1}", "", "", "", "")
+            for column, value in enumerate(values):
+                table.setItem(row, column, QTableWidgetItem(value))
+
+        def remove_selected_rows() -> None:
+            rows = sorted({index.row() for index in table.selectedIndexes()}, reverse=True)
+            for row in rows:
+                table.removeRow(row)
+
+        def optional_float(row: int, column: int, label: str) -> Optional[float]:
+            item = table.item(row, column)
+            text = "" if item is None else item.text().strip()
+            if text == "":
+                return None
+            try:
+                return float(text)
+            except ValueError as exc:
+                raise ValueError(f"Row {row + 1}: {label} is not numeric.") from exc
+
+        def estimate_rows() -> None:
+            material_name = material_combo.currentText()
+            if material_name not in self.custom_acquisition_profiles:
+                status.setPlainText("Select a calibrated material first. Built-in reference materials do not include uncertainty calibration records.")
+                return
+            profile = self.custom_acquisition_profiles[material_name]
+            messages = []
+            previous_state = table.blockSignals(True)
+            try:
+                for row in range(table.rowCount()):
+                    row_values = [
+                        "" if table.item(row, column) is None else table.item(row, column).text().strip()
+                        for column in range(table.columnCount())
+                    ]
+                    if not any(row_values):
+                        continue
+                    try:
+                        missing_name, value = estimate_missing_acquisition_value(
+                            profile,
+                            gauge_volume_mm3=optional_float(row, 1, "Gauge volume"),
+                            path_length_mm=optional_float(row, 2, "Path length"),
+                            exposure_uamp=optional_float(row, 3, "Exposure"),
+                            uncertainty=optional_float(row, 4, "Fitting uncertainty"),
+                        )
+                    except Exception as exc:
+                        messages.append(f"Row {row + 1}: {exc}")
+                        continue
+                    column_by_name = {
+                        "gauge_volume_mm3": 1,
+                        "path_length_mm": 2,
+                        "exposure_uamp": 3,
+                        "uncertainty": 4,
+                    }
+                    column = column_by_name[missing_name]
+                    item = table.item(row, column)
+                    if item is None:
+                        item = QTableWidgetItem()
+                        table.setItem(row, column, item)
+                    item.setText(format_trimmed_decimal(value, decimals=6))
+                    messages.append(f"Row {row + 1}: estimated {table.horizontalHeaderItem(column).text()} = {format_trimmed_decimal(value, decimals=6)}")
+            finally:
+                table.blockSignals(previous_state)
+            status.setPlainText("\n".join(messages) if messages else "No rows to estimate.")
+
+        button_row = QHBoxLayout()
+        add_button = QPushButton("Add Row")
+        add_button.clicked.connect(add_row)
+        remove_button = QPushButton("Remove Selected")
+        remove_button.clicked.connect(remove_selected_rows)
+        estimate_button = QPushButton("Estimate Missing")
+        estimate_button.clicked.connect(estimate_rows)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.reject)
+        for button in (add_button, remove_button, estimate_button, close_button):
+            button_row.addWidget(button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+
+        add_row()
+        if self.custom_acquisition_profiles:
+            status.setPlainText("Add rows and leave exactly one numeric cell blank in each row.")
+        else:
+            material_combo.setEnabled(False)
+            estimate_button.setEnabled(False)
+            status.setPlainText("No calibrated materials are available. Use Setting > Manage Materials to add one first.")
+        dialog.exec_()
+
     def _build_pose_group(self) -> QGroupBox:
         group = QGroupBox("Live Stage Pose")
         layout = make_form_layout(group, compact_fields=True)
@@ -3415,10 +4486,10 @@ class MainWindow(QMainWindow):
         for widget in (self.pose_x, self.pose_y, self.pose_z, self.pose_omega):
             widget.valueChanged.connect(self.on_view_parameter_changed)
 
-        layout.addRow("Stage X", self.pose_x)
-        layout.addRow("Stage Y", self.pose_y)
-        layout.addRow("Stage Z", self.pose_z)
-        layout.addRow("Omega", self.pose_omega)
+        self._add_placement_form_row(layout, "Stage X", self.pose_x)
+        self._add_placement_form_row(layout, "Stage Y", self.pose_y)
+        self._add_placement_form_row(layout, "Stage Z", self.pose_z)
+        self._add_placement_form_row(layout, "Omega", self.pose_omega)
 
         button_row = QHBoxLayout()
         reset_pose_button = QPushButton("Reset pose")
@@ -3427,7 +4498,7 @@ class MainWindow(QMainWindow):
         reset_pose_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         button_row.addWidget(reset_pose_button)
         button_row.addStretch(1)
-        layout.addRow(button_row)
+        self._add_placement_form_layout_row(layout, button_row)
         return group
 
     def _build_manual_placement_group(self) -> QGroupBox:
@@ -3500,14 +4571,14 @@ class MainWindow(QMainWindow):
         button_row.addWidget(load_fit_button)
         button_row.addStretch(1)
 
-        layout.addRow(checkbox_row)
-        layout.addRow("Model->Stage X", self.manual_tx)
-        layout.addRow("Model->Stage Y", self.manual_ty)
-        layout.addRow("Model->Stage Z", self.manual_tz)
-        layout.addRow("Local Rot X", self.manual_rx)
-        layout.addRow("Local Rot Y", self.manual_ry)
-        layout.addRow("Local Rot Z", self.manual_rz)
-        layout.addRow(button_row)
+        self._add_placement_form_layout_row(layout, checkbox_row)
+        self._add_placement_form_row(layout, "Model->Stage X", self.manual_tx)
+        self._add_placement_form_row(layout, "Model->Stage Y", self.manual_ty)
+        self._add_placement_form_row(layout, "Model->Stage Z", self.manual_tz)
+        self._add_placement_form_row(layout, "Local Rot X", self.manual_rx)
+        self._add_placement_form_row(layout, "Local Rot Y", self.manual_ry)
+        self._add_placement_form_row(layout, "Local Rot Z", self.manual_rz)
+        self._add_placement_form_layout_row(layout, button_row)
         self.sync_manual_rotation_spin_boxes_from_matrix()
         return group
 
@@ -3579,6 +4650,7 @@ class MainWindow(QMainWindow):
             ("show_sample_triad_checkbox", "triad", "Show sample triad", True, self.on_overlay_visibility_changed),
             ("show_theodolite_sight_line_checkbox", "sight", "Show sight line", True, self.on_overlay_visibility_changed),
             ("show_diffraction_vectors_checkbox", "diffraction_vectors", "Show diffraction vectors", True, self.on_overlay_visibility_changed),
+            ("show_path_lengths_checkbox", "path_lengths", "Show path length overlays", True, self.on_overlay_visibility_changed),
         ]
         for attribute_name, icon_kind, tooltip, checked, slot in toggle_specs:
             button = make_toolbar_toggle_button(icon_kind, tooltip, checked, slot)
@@ -3605,7 +4677,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(export_detector_map_button)
         layout.addStretch(1)
         self.sync_view_button_states()
-        return toolbar
+        return self._wrap_toolbar_for_narrow_panel(toolbar)
 
     def _build_measurement_toolbar(self) -> QWidget:
         toolbar = QWidget()
@@ -3659,7 +4731,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(clear_placement_button)
         layout.addWidget(self.auto_move_to_pivot_checkbox)
         layout.addStretch(1)
-        return toolbar
+        return self._wrap_toolbar_for_narrow_panel(toolbar)
 
     def _build_section_title(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -3725,7 +4797,7 @@ class MainWindow(QMainWindow):
         )
         estimate_time_button = make_toolbar_action_button(
             "act_time",
-            "Estimate time",
+            "Estimate UAmp",
             self.generate_prediction_estimated_times,
         )
         create_scan_file_button = make_toolbar_action_button(
@@ -3743,7 +4815,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(estimate_time_button)
         layout.addWidget(create_scan_file_button)
         layout.addStretch(1)
-        return toolbar
+        return self._wrap_toolbar_for_narrow_panel(toolbar)
 
     def _build_prediction_section(self) -> QWidget:
         section = QWidget()
@@ -4726,7 +5798,12 @@ class MainWindow(QMainWindow):
                 "stage_offset_z": self.stage_offset_z.value(),
                 "collimator": self.collimator.currentText(),
                 "count_time_material": self.count_time_material.currentText(),
+                "target_uncertainty": self.target_uncertainty.value(),
             },
+            "acquisition_profiles": [
+                profile.to_dict()
+                for profile in sorted(self.custom_acquisition_profiles.values(), key=lambda item: item.name.casefold())
+            ],
             "stage_pose": {
                 "x": self.pose_x.value(),
                 "y": self.pose_y.value(),
@@ -4765,6 +5842,7 @@ class MainWindow(QMainWindow):
                 "show_sample_triad": self.show_sample_triad_checkbox.isChecked(),
                 "show_theodolite_sight_line": self.show_theodolite_sight_line_checkbox.isChecked(),
                 "show_diffraction_vectors": self.show_diffraction_vectors_checkbox.isChecked(),
+                "show_path_lengths": self.show_path_lengths_checkbox.isChecked(),
             },
         }
 
@@ -4865,6 +5943,7 @@ class MainWindow(QMainWindow):
             (self.stage_offset_x, setup.get("stage_offset_x")),
             (self.stage_offset_y, setup.get("stage_offset_y")),
             (self.stage_offset_z, setup.get("stage_offset_z")),
+            (self.target_uncertainty, setup.get("target_uncertainty")),
             (self.pose_x, stage_pose.get("x")),
             (self.pose_y, stage_pose.get("y")),
             (self.pose_z, stage_pose.get("z")),
@@ -4911,6 +5990,12 @@ class MainWindow(QMainWindow):
             )
         self.sync_manual_rotation_spin_boxes_from_matrix()
 
+        for profile_payload in payload.get("acquisition_profiles", []):
+            profile = MaterialAcquisitionProfile.from_dict(profile_payload)
+            if profile.name not in RIETVELD_COUNT_TIME_LAWS:
+                self.custom_acquisition_profiles[profile.name] = profile
+        self.refresh_count_time_material_items()
+
         combo_states = [
             (self.collimator, self.collimator.blockSignals(True)),
             (self.count_time_material, self.count_time_material.blockSignals(True)),
@@ -4940,6 +6025,7 @@ class MainWindow(QMainWindow):
             (self.show_sample_triad_checkbox, view.get("show_sample_triad")),
             (self.show_theodolite_sight_line_checkbox, view.get("show_theodolite_sight_line")),
             (self.show_diffraction_vectors_checkbox, view.get("show_diffraction_vectors")),
+            (self.show_path_lengths_checkbox, view.get("show_path_lengths")),
         )
         checkbox_signal_states = [(checkbox, checkbox.blockSignals(True)) for checkbox, _value in checkbox_values]
         try:
@@ -5187,7 +6273,7 @@ class MainWindow(QMainWindow):
             self,
             "Load sample mesh",
             str(Path.cwd()),
-            "Mesh files (*.stl *.ply *.obj *.off *.glb *.gltf);;All files (*.*)",
+            MESH_FILE_FILTER,
         )
         if not path_str:
             return
@@ -5380,6 +6466,8 @@ class MainWindow(QMainWindow):
 
         gauge_volume_mm3 = self.slit_width.value() * self.slit_height.value() * float(self.collimator.currentText())
         count_time_material = self.count_time_material.currentText()
+        custom_profile = self.custom_acquisition_profiles.get(count_time_material)
+        target_uncertainty = self.target_uncertainty.value()
         was_blocked = self.prediction_table.blockSignals(True)
         try:
             for row in range(self.prediction_table.rowCount()):
@@ -5392,25 +6480,33 @@ class MainWindow(QMainWindow):
                             f"Prediction row {row + 1} is missing Path {column - 6}. Generate paths first."
                         )
                     path_values.append(float(text))
-                for index, value in enumerate(
-                    (
+                if custom_profile is None:
+                    values = (
                         enginx_rietveld_count_time_minutes(path_values[0], gauge_volume_mm3, count_time_material),
                         enginx_rietveld_count_time_minutes(path_values[1], gauge_volume_mm3, count_time_material),
-                    ),
-                    start=9,
-                ):
+                    )
+                else:
+                    values = (
+                        custom_profile.required_uamp(path_values[0], gauge_volume_mm3, target_uncertainty),
+                        custom_profile.required_uamp(path_values[1], gauge_volume_mm3, target_uncertainty),
+                    )
+                for index, value in enumerate(values, start=9):
                     item = self.prediction_table.item(row, index)
                     if item is None:
                         item = QTableWidgetItem()
                         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                         self.prediction_table.setItem(row, index, item)
-                    item.setText(str(int(np.ceil(float(value)))))
-            self.statusBar().showMessage(
-                f"Estimated Rietveld count times using {count_time_material} and the current gauge volume.",
-                5000,
-            )
+                    item.setText(str(ceil_exposure_uamp(value)))
+            if custom_profile is None:
+                message = f"Estimated reference Rietveld exposure using built-in {count_time_material} data."
+            else:
+                message = (
+                    f"Estimated {custom_profile.exposure_unit} using {count_time_material} for "
+                    f"{target_uncertainty:g} {custom_profile.uncertainty_metric}."
+                )
+            self.statusBar().showMessage(message, 5000)
         except Exception as exc:
-            self.show_error("Estimate time failed", str(exc))
+            self.show_error("Estimate UAmp failed", str(exc))
         finally:
             self.prediction_table.blockSignals(was_blocked)
 
@@ -5467,16 +6563,16 @@ class MainWindow(QMainWindow):
                     text = "" if item is None else item.text().strip()
                     if text == "":
                         raise ValueError(
-                            f"Prediction row {row + 1} is missing {label}. Estimate time first."
+                            f"Prediction row {row + 1} is missing {label}. Estimate UAmp first."
                         )
                     uamp_values.append(float(text))
 
                 if bank_selection == "Bank 1":
-                    selected_uamp = int(np.ceil(uamp_values[0]))
+                    selected_uamp = ceil_exposure_uamp(uamp_values[0])
                 elif bank_selection == "Bank 2":
-                    selected_uamp = int(np.ceil(uamp_values[1]))
+                    selected_uamp = ceil_exposure_uamp(uamp_values[1])
                 else:
-                    selected_uamp = int(np.ceil(max(uamp_values)))
+                    selected_uamp = ceil_exposure_uamp(max(uamp_values))
                 scan_rows.append((stage_values[0], stage_values[1], stage_values[2], omega_deg, selected_uamp))
         except Exception as exc:
             self.show_error("Create scan file failed", str(exc))
@@ -6583,6 +7679,7 @@ class MainWindow(QMainWindow):
         beam_length = self.beam_length.value()
         show_beam = self.show_beam_checkbox is None or self.show_beam_checkbox.isChecked()
         show_gauge_volume = self.show_gauge_volume_checkbox is None or self.show_gauge_volume_checkbox.isChecked()
+        show_path_lengths = self.show_path_lengths_checkbox is None or self.show_path_lengths_checkbox.isChecked()
         slit_thickness = max(min(self.scene_scale() * 0.01, 8.0), 2.0)
         slit_plate = pv.Box(
             bounds=(
@@ -6791,6 +7888,7 @@ class MainWindow(QMainWindow):
                 self.diffraction_bank_2_detector_mesh = None
             self.plotter.remove_actor("diffraction_detector_bank_1_label", render=False)
             self.plotter.remove_actor("diffraction_detector_bank_2_label", render=False)
+
         if self.detector_map_state is not None:
             remove_scalar_bar_if_present(self.plotter, "Imaging path")
             detector_map_mesh = self.detector_map_state["mesh"]
@@ -7209,7 +8307,7 @@ class MainWindow(QMainWindow):
                 beam_direction,
                 beam_trace_distance,
             )
-        if show_beam:
+        if show_imaging_detector and show_path_lengths:
             self.set_or_add_mesh(
                 "beam_inside_mesh",
                 make_multi_line_polydata(beam_inside_segments),
@@ -7220,6 +8318,47 @@ class MainWindow(QMainWindow):
         elif self.beam_inside_mesh is not None:
             self.plotter.remove_actor("beam_inside", render=False)
             self.beam_inside_mesh = None
+
+        live_diffraction_bank_states = None
+        if (
+            show_diffraction_detectors
+            and show_path_lengths
+            and self.model_world_mesh is not None
+            and self.model_world_mesh.n_points > 0
+        ):
+            try:
+                live_diffraction_bank_states = self.compute_diffraction_bank_states_for_pose(
+                    stage_readout_local,
+                    omega_deg,
+                )
+            except Exception:
+                live_diffraction_bank_states = None
+        self._update_diffraction_path_visuals(
+            show_diffraction_detectors and show_path_lengths,
+            pivot,
+            slit_origin,
+            (
+                (
+                    "diffraction_bank_1_path_mesh",
+                    diffraction_bank_1_geometry,
+                    "diffraction_path_bank_1",
+                    "diffraction_path_bank_1_label",
+                    "Bank 1 path",
+                    "#dc2626",
+                    "#8f1d1d",
+                ),
+                (
+                    "diffraction_bank_2_path_mesh",
+                    diffraction_bank_2_geometry,
+                    "diffraction_path_bank_2",
+                    "diffraction_path_bank_2_label",
+                    "Bank 2 path",
+                    "#dc2626",
+                    "#8f1d1d",
+                ),
+            ),
+            live_diffraction_bank_states,
+        )
 
         if camera_state is not None:
             restore_camera_state(self.plotter, camera_state)

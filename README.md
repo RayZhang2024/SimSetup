@@ -16,7 +16,7 @@ The GUI implementation targets this environment and uses:
 
 - `PyQt5` for the desktop application shell
 - `pyvista` and `pyvistaqt` for embedded 3D rendering
-- `trimesh` for STL and mesh loading
+- `trimesh` for STL and mesh loading, with built-in tessellation for simple polyhedral ACIS SAT files
 
 This workspace now contains a standalone tool that reconstructs how a physical sample is mounted on the stage from point correspondences.
 
@@ -37,7 +37,7 @@ python .\gui_app.py --csv .\example_measurements.csv --mesh .\sample.stl
 The GUI supports:
 
 - loading or editing measurement rows
-- loading an STL or other mesh format supported by `trimesh`
+- loading STL, simple polyhedral SAT, or other mesh formats supported by `trimesh`
 - fitting the model-to-stage transform
 - inspecting the beam, theodolite view, stage, and fitted sample in 3D
 - jumping the camera to `Iso`, axis-aligned, and theodolite views
