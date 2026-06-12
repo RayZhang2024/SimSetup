@@ -524,6 +524,16 @@ def render_toolbar_toggle_icon(kind: str, color: QColor, size: int = 24) -> QPix
         draw_center_label("+Z")
     elif kind == "cam_nz":
         draw_center_label("-Z")
+    elif kind == "cam_home":
+        roof = QPolygonF(
+            [
+                QPointF(4, c),
+                QPointF(c, 5),
+                QPointF(size - 4, c),
+            ]
+        )
+        painter.drawPolyline(roof)
+        painter.drawRect(QRect(7, int(c), size - 14, size - int(c) - 5))
     elif kind == "cam_theodolite":
         painter.drawEllipse(QPointF(c, 8), 3.5, 3.5)
         painter.drawLine(QPointF(c, 11.5), QPointF(c, size - 4))
@@ -1934,6 +1944,8 @@ class PointPickerPanel(QWidget):
         self.clipped_mesh = None
         self.picked_points_mesh = None
         self.picked_points: List[Tuple[str, np.ndarray]] = []
+        self.view_buttons: dict[str, QToolButton] = {}
+        self.view_button_group: Optional[QButtonGroup] = None
         self._surface_picking_initialized = False
 
         self._build_ui()
@@ -2105,13 +2117,14 @@ class PointPickerPanel(QWidget):
         viewer_panel = QWidget()
         viewer_layout = QVBoxLayout(viewer_panel)
         viewer_layout.setContentsMargins(0, 0, 0, 0)
-        viewer_layout.setSpacing(0)
+        viewer_layout.setSpacing(6)
         if self.enable_3d:
             self.plotter = CursorZoomQtInteractor(self)
             self.plotter.set_background("white")
             self.plotter.add_axes()
             self.plotter.enable_parallel_projection()
             self.plotter.interactor.installEventFilter(self)
+            viewer_layout.addWidget(self._build_view_toolbar())
             viewer_layout.addWidget(self.plotter.interactor)
         else:
             self.plotter = None
@@ -2127,6 +2140,53 @@ class PointPickerPanel(QWidget):
         main_splitter.setSizes([560, 720])
         if self.enable_3d:
             QTimer.singleShot(0, self.initialize_surface_point_picking)
+
+    def _build_view_toolbar(self) -> QWidget:
+        toolbar = QWidget()
+        layout = QHBoxLayout(toolbar)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        toolbar.setStyleSheet(
+            """
+            QToolButton {
+                padding: 0px;
+                min-width: 24px;
+                min-height: 24px;
+                border: 1px solid #b9c2ce;
+                border-radius: 6px;
+                background-color: #ffffff;
+            }
+            QToolButton:hover {
+                background-color: #f3f7fb;
+                border-color: #8da2bd;
+            }
+            QToolButton:checked {
+                background-color: #1f6fca;
+                border: 1px solid #1f6fca;
+            }
+            """
+        )
+        self.view_button_group = QButtonGroup(toolbar)
+        self.view_button_group.setExclusive(True)
+
+        for icon_kind, tooltip, axis in (
+            ("cam_px", "View along X", "x"),
+            ("cam_py", "View along Y", "y"),
+            ("cam_pz", "View along Z", "z"),
+        ):
+            button = make_toolbar_preset_button(
+                icon_kind,
+                tooltip,
+                lambda _checked=False, target_axis=axis: self.view_axis(target_axis),
+            )
+            self.view_button_group.addButton(button)
+            self.view_buttons[axis] = button
+            layout.addWidget(button)
+
+        home_button = make_toolbar_action_button("cam_home", "Home view", self.home_view)
+        layout.addWidget(home_button)
+        layout.addStretch(1)
+        return toolbar
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -2360,6 +2420,78 @@ class PointPickerPanel(QWidget):
         plane_size = max(float(np.linalg.norm(spans)), 1.0) * 1.35
         return origin, normal, plane_size
 
+    def mesh_camera_reference(self) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
+        if self.model_mesh is None or self.model_mesh.n_points == 0:
+            return None
+        bounds = np.array(self.model_mesh.bounds, dtype=float)
+        mesh_min = np.array([bounds[0], bounds[2], bounds[4]], dtype=float)
+        mesh_max = np.array([bounds[1], bounds[3], bounds[5]], dtype=float)
+        center = 0.5 * (mesh_min + mesh_max)
+        spans = mesh_max - mesh_min
+        diagonal = max(float(np.linalg.norm(spans)), 1.0)
+        return center, spans, diagonal
+
+    def sync_view_button_states(self, selected_axis: Optional[str]) -> None:
+        group_was_exclusive = None
+        if self.view_button_group is not None:
+            group_was_exclusive = self.view_button_group.exclusive()
+            self.view_button_group.setExclusive(False)
+        for axis, button in self.view_buttons.items():
+            was_blocked = button.blockSignals(True)
+            button.setChecked(axis == selected_axis)
+            button.blockSignals(was_blocked)
+        if self.view_button_group is not None and group_was_exclusive is not None:
+            self.view_button_group.setExclusive(group_was_exclusive)
+
+    def view_axis(self, axis: str) -> None:
+        if self.plotter is None:
+            return
+        reference = self.mesh_camera_reference()
+        if reference is None:
+            return
+        center, spans, diagonal = reference
+        axis_specs = {
+            "x": (
+                np.array([1.0, 0.0, 0.0], dtype=float),
+                np.array([0.0, 0.0, 1.0], dtype=float),
+                (spans[1], spans[2]),
+            ),
+            "y": (
+                np.array([0.0, 1.0, 0.0], dtype=float),
+                np.array([0.0, 0.0, 1.0], dtype=float),
+                (spans[0], spans[2]),
+            ),
+            "z": (
+                np.array([0.0, 0.0, 1.0], dtype=float),
+                np.array([0.0, 1.0, 0.0], dtype=float),
+                (spans[0], spans[1]),
+            ),
+        }
+        if axis not in axis_specs:
+            return
+        direction, view_up, perpendicular_spans = axis_specs[axis]
+        distance = max(diagonal * 1.5, 10.0)
+        position = center + direction * distance
+        self.plotter.camera_position = [tuple(position), tuple(center), tuple(view_up)]
+        self.plotter.enable_parallel_projection()
+        self.plotter.camera.SetParallelScale(max(float(max(perpendicular_spans)) * 0.6, 1.0))
+        self.plotter.reset_camera_clipping_range()
+        self.sync_view_button_states(axis)
+        self.plotter.render()
+
+    def home_view(self) -> None:
+        if self.plotter is None:
+            return
+        self.sync_view_button_states(None)
+        if self.model_mesh is None or self.model_mesh.n_points == 0:
+            self.plotter.reset_camera()
+            self.plotter.render()
+            return
+        try:
+            self.refresh_scene(reset_camera=True)
+        except ValueError as exc:
+            self.status_label.setText(str(exc))
+
     def view_plane_normal(self) -> None:
         if self.model_mesh is None or self.model_mesh.n_points == 0:
             return
@@ -2379,6 +2511,7 @@ class PointPickerPanel(QWidget):
         self.plotter.enable_parallel_projection()
         self.plotter.camera.SetParallelScale(max(plane_size * 0.45, 1.0))
         self.plotter.reset_camera_clipping_range()
+        self.sync_view_button_states(None)
         self.plotter.render()
 
     def eventFilter(self, watched, event) -> bool:
