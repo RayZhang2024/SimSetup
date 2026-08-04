@@ -1,0 +1,92 @@
+     VERSION    6     Tue May 28 12:26:34 2002                                  
+      DESCR   Calcium fluoride                                                  
+    HSTRY  1 EXPEDT  Win32  May 28 14:00:42 2002 P PH        LA  O              
+    HSTRY  2 POWPREF Win32  May 28 14:00:50 2002                                
+  DSGL CDAT1  DRAD ARAD NOFO                                                    
+  GNLS CDAT1  MXCY  3                                                           
+ AFAC  F     3.539210.2825 2.6412 4.2944 1.5170  .2615 1.024326.1476  .2776 RHF 
+ AFAC  F_    18.998 .5654       .0096                                           
+ AFAC  F_SIZ      1.30      1.10 1.35   67                                      
+ AFAC  F_XAB   1676  1008 503.2 49.99 26.84                                     
+ AFAC  F_XAN   .129  .119  .100  .085  .069  .053  .014  .010  .006  .006       
+ AFAC CA     8.626610.4421 7.3873  .6599 1.589985.7484 1.0211178.437 1.3751 RHF 
+ AFAC CA_     40.08  .470         .43                                           
+ AFAC CA_SIZ      2.17      1.97 2.00  007                                      
+ AFAC CA_XAB  33250 21230 11410  1264 637.1                                     
+ AFAC CA_XAN  -.221 2.514  .163 1.904  .341 1.286  .203  .306  .137  .193       
+ EXPR  HTYP1  PNT                                                               
+ EXPR  NATYP    2                                                               
+ EXPR  NHST     1                                                               
+ EXPR ATYP 1  CA          1      2.17      1.97 2.00  007                       
+ EXPR ATYP 2  F           1      1.30      1.10 1.35   67                       
+ EXPR NPHAS     1    0    0    0    0    0    0    0    0                       
+CRS1    PNAM  Calcium Fluoride                                                  
+CRS1   ABSCO   897.56   570.04   304.48    33.45    16.94     0.00     0.01     
+CRS1   ATYPS    2                                                               
+CRS1   F000      6.403   151.994                                                
+CRS1   FRML1CA          4.00F           8.00                                    
+CRS1   NATOM    2                                                               
+CRS1  ABC     5.463861  5.463861  5.463861    N    0                            
+CRS1  ANGLES   90.0000   90.0000   90.0000                                      
+CRS1  AT  1A  CA        0.000000  0.000000  0.000000  1.000000           4 000  
+CRS1  AT  1B  0.025000                                                    I     
+CRS1  AT  2A  F         0.250000  0.250000  0.250000  1.000000F2         8 000  
+CRS1  AT  2B  0.025000                                                    I     
+CRS1  CELVOL   163.117                                                          
+CRS1  DENSTY     3.179                                                          
+CRS1  SG SYM  F m 3 m                                                           
+CRS1  SPAXIS    0    0    1                                                     
+HAP1 1 ZONE     0    0    0    0                                                
+HAP1 1EXTPOW    0.00000E+00    N    0                                           
+HAP1 1NAXIS     1                                                               
+HAP1 1PHSFR      1.0000        N    0                                           
+HAP1 1PRCF      3   21   0.00500                                                
+HAP1 1PRCF 1   0.425565E+00   0.263286E-01   0.296905E-01   0.404614E+02        
+HAP1 1PRCF 2   0.404614E+02   0.000000E+00   0.000000E+00   0.529470E+01        
+HAP1 1PRCF 3   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HAP1 1PRCF 4   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HAP1 1PRCF 5   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HAP1 1PRCF 6   0.000000E+00                                                     
+HAP1 1PREFO1   1.00000   1.00000   0.00000   0.00000   1.00000   NN    0        
+HAP1 1RADDAM    0.00000E+00    N    0      0.00                                 
+HST  1  HNAM  Dummy histogram data set                                          
+HST  1  IFIL  par_file.par                                                      
+HST  1 BANK     1                                                               
+HST  1 CHANS         0         1      2996         1      2996                  
+HST  1 DUMMY      2996  SLOG       1000.00  20000.00  0.001000                  
+HST  1 EPHAS    0    0    0    0    0    0    0    0    0    Y                  
+HST  1 ICONR   5664.98     -3.55     -8.29                                      
+HST  1 ICONS   5664.98     -3.55     -8.29                                      
+HST  1 MAXRF  174                                                               
+HST  1 NEXC     2                                                               
+HST  1 NPHAS    1    0    0    0    0    0    0    0    0                       
+HST  1 NREF   910    0.1780    Y    Y                                           
+HST  1 TRNGE   1.00100  20.00536                                                
+HST  1 WREXP    1.0000                                                          
+HST  1ABSCOR   0.000000E+00   0.000000E+00    N    0                            
+HST  1BAKGD     4    4    Y    0    Y                                           
+HST  1BAKGD1   0.100000E+01                                                     
+HST  1BNKPAR     0.742    90.000      0.00    .00000     .3000    1    1        
+HST  1CHI      90.0000                                                          
+HST  1EXC  1     0.000     0.999                                                
+HST  1EXC  2    20.020                                                          
+HST  1HSCALE     10000.        Y    0                                           
+HST  1I ITYP    0    1.000    20.000       9                                    
+HST  1MNREF     0    1.0000                                                     
+HST  1OMEGA     0.0000                                                          
+HST  1PHI       0.0000                                                          
+HST  1PRCF1     3   21   0.00500                                                
+HST  1PRCF11   0.425565E+00   0.263286E-01   0.296905E-01   0.404614E+02        
+HST  1PRCF12   0.404614E+02   0.000000E+00   0.000000E+00   0.529470E+01        
+HST  1PRCF13   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HST  1PRCF14   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HST  1PRCF15   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HST  1PRCF16   0.000000E+00                                                     
+ZZZZZZZZZZZZ  Last EXP file record                                              
+    HSTRY  3 GENLES  Win32  May 28 14:00:58 2002                                
+HST  1 BIGFO   0.000000E+00                                                     
+HST  1 RPOWD    0.2109    0.0706                                                
+ REFN STATS  Cycle   1 There were     0 observations. Total CHI**2 = 0.0000E+00 
+ REFN GDNFT  Reduced CHI**2 =  0.000     for    5 variables                     
+HST  1 R-FAC  909  99.99990   1.841845E+06                                      
+  GNLS  RUN on May 28 14:00:59 2002    Total cycles run   1       0.0000        

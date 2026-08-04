@@ -12,6 +12,7 @@ from .models import (
     InstrumentCalibration,
     NormalizationResult,
 )
+from .profile_metadata import calibration_profile_metadata
 
 
 def _validate_bank_match(sample: FocusedSpectrum, vanadium: FocusedSpectrum) -> None:
@@ -105,7 +106,7 @@ def apply_vanadium_normalization(
             "single_peak_calibration_difc": calibration_result.single_peak_calibration.difc,
             "single_peak_calibration_tzero": calibration_result.single_peak_calibration.tzero,
             "single_peak_calibration_rms_tof": calibration_result.single_peak_rms_residual_tof,
-            "pattern_calibration_profile": calibration_result.pattern_fit.profile_name if calibration_result.pattern_fit is not None else "",
+            **calibration_profile_metadata(calibration_result),
         }
 
     metadata = dict(sample.metadata)

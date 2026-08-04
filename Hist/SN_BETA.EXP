@@ -1,0 +1,82 @@
+     VERSION    6     Tue May 28 15:17:48 2002                                  
+      DESCR   Beta Sn                                                           
+    HSTRY  1 EXPEDT  Win32  Jun 21 13:31:30 2002 P PH        LA  O              
+    HSTRY  2 POWPREF Win32  Jun 21 13:34:15 2002                                
+  DSGL CDAT1  DRAD ARAD NOFO                                                    
+  GNLS CDAT1  MXCY  3                                                           
+ AFAC SN    19.1889 5.830319.1005  .5031 4.458526.8909 2.466383.9571 4.7821 RHF 
+ AFAC SN_    118.69 .6225        .626                                           
+ AFAC SN_SIZ      1.82      1.62 2.30  007                                      
+ AFAC SN_XAB 139700 90600 49930  6145  3191                                     
+ AFAC SN_XAN -2.40110.380 -.888 7.943 -.194 5.459 -.873 1.424-1.378  .930       
+ EXPR  HTYP1  PNT                                                               
+ EXPR  NATYP    1                                                               
+ EXPR  NHST     1                                                               
+ EXPR ATYP 1  SN          1      1.82      1.62 2.30  007                       
+ EXPR NPHAS     1    0    0    0    0    0    0    0    0                       
+CRS1    PNAM  Sn Beta                                                           
+CRS1   ABSCO  5165.08  3349.72  1846.05   227.20   117.98     0.00     0.02     
+CRS1   ATYPS    1                                                               
+CRS1   F000      2.490   199.985                                                
+CRS1   FRML1SN          4.00                                                    
+CRS1   NATOM    1                                                               
+CRS1  ABC     5.831600  5.831600  3.181300    N    0                            
+CRS1  ANGLES   90.0000   90.0000   90.0000                                      
+CRS1  AT  1A  SN        0.000000  0.000000  0.000000  1.000000SN1        4 000  
+CRS1  AT  1B  0.025000                                                    I     
+CRS1  AT  1C    291.00     5.199    10.087     2.480     0.499      0.02      50
+CRS1  CELVOL   108.188                                                          
+CRS1  DENSTY     7.286                                                          
+CRS1  SG SYM  I42/amd                                                           
+CRS1  SPAXIS    0    0    1                                                     
+HAP1 1 ZONE     0    0    0    0                                                
+HAP1 1EXTPOW    0.00000E+00    N    0                                           
+HAP1 1NAXIS     1                                                               
+HAP1 1PHSFR      1.0000        N    0                                           
+HAP1 1PRCF      3   14   0.00500                                                
+HAP1 1PRCF 1   0.336479E+00   0.257533E-01   0.284093E-01    .000000E+00        
+HAP1 1PRCF 2   0.790612E+02   0.000000E+00   0.000000E+00   0.564135E+01        
+HAP1 1PRCF 3   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HAP1 1PRCF 4   0.000000E+00   0.000000E+00                                      
+HAP1 1PREFO1   1.00000   1.00000   0.00000   0.00000   1.00000   NN    0        
+HAP1 1RADDAM    0.00000E+00    N    0      0.00                                 
+HST  1  HNAM  Dummy histogram data set                                          
+HST  1  IFIL  par_file.par                                                      
+HST  1 BANK     1                                                               
+HST  1 CHANS         0         1      2996         1      2996                  
+HST  1 DUMMY      2996  SLOG       1000.00  20000.00  0.001000                  
+HST  1 EPHAS    0    0    0    0    0    0    0    0    0    Y                  
+HST  1 ICONR   5649.97      0.13      1.60                                      
+HST  1 ICONS   5649.97      0.13      1.60                                      
+HST  1 MAXRF  426                                                               
+HST  1 NEXC     2                                                               
+HST  1 NPHAS    1    0    0    0    0    0    0    0    0                       
+HST  1 NREF  3096    0.1767    Y    Y                                           
+HST  1 TRNGE   1.00100  20.00536                                                
+HST  1 WREXP    1.0000                                                          
+HST  1ABSCOR   0.000000E+00   0.000000E+00    N    0                            
+HST  1BAKGD     4    4    Y    0    Y                                           
+HST  1BAKGD1   0.100000E+01                                                     
+HST  1BNKPAR    0.75       90.00      0.00    .00000     .3000    1    1        
+HST  1CHI      90.0000                                                          
+HST  1EXC  1     0.000     0.999                                                
+HST  1EXC  2    20.020                                                          
+HST  1HSCALE     10000.        Y    0                                           
+HST  1I HEAD   SI 34228 on PRL                                                  
+HST  1I ITYP    0    1.000    21.000       1                                    
+HST  1MNREF     0    1.0000                                                     
+HST  1OMEGA     0.0000                                                          
+HST  1PHI       0.0000                                                          
+HST  1PRCF1     3   14   0.00500    0                                           
+HST  1PRCF11   0.336479E+00   0.257533E-01   0.284093E-01    .000000E+00        
+HST  1PRCF12   0.790612E+02   0.000000E+00   0.000000E+00   0.564135E+01        
+HST  1PRCF13   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HST  1PRCF14   0.000000E+00   0.000000E+00                                      
+ZZZZZZZZZZZZ  Last EXP file record                                              
+    HSTRY  3 GENLES  Win32  Jun 21 13:34:23 2002                                
+HST  1 BIGFO   0.000000E+00                                                     
+HST  1 RPOWD    0.3346    0.1314                                                
+ REFN STATS  Cycle   1 There were     0 observations. Total CHI**2 = 0.0000E+00 
+ REFN GDNFT  Reduced CHI**2 =  0.000     for    5 variables                     
+HST  1 R-FAC 3093  99.99990   1.102625E+06                                      
+  GNLS  RUN on Jun 21 13:34:25 2002    Total cycles run   1       0.0000        

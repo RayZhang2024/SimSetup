@@ -20,12 +20,14 @@ PROFILE_GSAS_TOF = "gsas_tof"
 PROFILE_GSAS_TOF_3 = PROFILE_GSAS_TOF
 PROFILE_GSAS_TOF_4 = "gsas_tof_4"
 PROFILE_GSAS_TOF_5 = "gsas_tof_5"
+PROFILE_GSAS2_TOF_PV = "gsas2_tof_pv"
 GSAS_TOF_PROFILE_KEYS = (
     PROFILE_GSAS_TOF_1,
     PROFILE_GSAS_TOF_2,
     PROFILE_GSAS_TOF_3,
     PROFILE_GSAS_TOF_4,
     PROFILE_GSAS_TOF_5,
+    PROFILE_GSAS2_TOF_PV,
 )
 
 
@@ -39,6 +41,7 @@ class PeakProfileSpec:
     gsas_tof_function: Optional[int] = None
     uses_hkl_broadening: bool = False
     uses_position_shift: bool = False
+    uses_gsas2_tof_widths: bool = False
 
 
 PEAK_PROFILE_SPECS: tuple[PeakProfileSpec, ...] = (
@@ -84,6 +87,12 @@ PEAK_PROFILE_SPECS: tuple[PeakProfileSpec, ...] = (
         uses_back_to_back=True,
         gsas_tof_function=5,
         uses_position_shift=True,
+    ),
+    PeakProfileSpec(
+        PROFILE_GSAS2_TOF_PV,
+        "GSAS-II TOF double-exponential PV",
+        gsas_tof_function=6,
+        uses_gsas2_tof_widths=True,
     ),
 )
 
@@ -142,6 +151,78 @@ def _axis_step(x: np.ndarray) -> float:
     if finite.size == 0:
         return 1.0
     return float(np.median(np.abs(finite)))
+
+
+def back_to_back_tail_bounds(
+    axis_span: float,
+    fwhm_guess: float,
+    fwhm_min: float,
+    fwhm_max: float,
+) -> tuple[float, float, float]:
+    """Return bounded back-to-back exponential tail parameters in axis units.
+
+    The back-to-back Gaussian/PV alpha and beta values are decay lengths, so
+    allowing them to grow to multiples of the entire selected range makes them
+    absorb background and peak-position errors. Keep them broad enough for TOF
+    asymmetry but tied to the current peak-width scale.
+    """
+    span = max(abs(float(axis_span)), 1e-12)
+    lower = max(abs(float(fwhm_min)), span * 1e-5, 1e-12)
+    width_scale = max(abs(float(fwhm_guess)), lower)
+    width_ceiling = max(abs(float(fwhm_max)), lower)
+    upper = min(span * 0.25, max(width_scale * 20.0, width_ceiling * 2.0, lower * 1.001))
+    upper = max(upper, lower * 1.001)
+    guess = min(max(max(width_scale, span * 0.01), lower), upper)
+    return guess, lower, upper
+
+
+def gsas2_tof_profile_initial_bounds(
+    axis_span: float,
+    fwhm_guess: float,
+    fwhm_min: float,
+    fwhm_max: float,
+) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+    """Initial values and bounds for a native GSAS-II-style TOF eps-Voigt profile.
+
+    ``sig`` is treated as a Gaussian variance in axis units squared, ``gam`` as
+    a Lorentzian FWHM-like width in axis units, and ``alp``/``bet`` as positive
+    exponential rate coefficients in inverse axis units.
+    """
+    span = max(abs(float(axis_span)), 1e-12)
+    fwhm_min_value = max(abs(float(fwhm_min)), span * 1e-5, 1e-12)
+    fwhm_max_value = max(abs(float(fwhm_max)), fwhm_min_value * 1.001)
+    fwhm_guess_value = min(max(abs(float(fwhm_guess)), fwhm_min_value), fwhm_max_value)
+    sigma_to_fwhm = 2.0 * math.sqrt(2.0 * math.log(2.0))
+    sig_guess = (0.6 * fwhm_guess_value / sigma_to_fwhm) ** 2
+    gam_guess = max(0.4 * fwhm_guess_value, fwhm_min_value)
+    sig_lower = (fwhm_min_value / sigma_to_fwhm) ** 2
+    sig_upper = (fwhm_max_value / sigma_to_fwhm) ** 2
+    gam_lower = fwhm_min_value
+    gam_upper = fwhm_max_value
+    tail_length_guess, tail_length_lower, tail_length_upper = back_to_back_tail_bounds(
+        span, fwhm_guess_value, fwhm_min_value, fwhm_max_value
+    )
+    # Convert length-like existing bounds to GSAS-II-style positive rates.
+    rate_guess = 1.0 / max(tail_length_guess, 1e-12)
+    rate_lower = 1.0 / max(tail_length_upper, 1e-12)
+    rate_upper = 1.0 / max(tail_length_lower, 1e-12)
+    return (
+        {"sig": sig_guess, "gam": gam_guess, "alp": rate_guess, "bet": rate_guess},
+        {"sig": sig_lower, "gam": gam_lower, "alp": rate_lower, "bet": rate_lower},
+        {"sig": sig_upper, "gam": gam_upper, "alp": rate_upper, "bet": rate_upper},
+    )
+
+
+def gsas2_tof_effective_fwhm(sig: float, gam: float, alp: float, bet: float) -> float:
+    sigma_fwhm = 2.0 * math.sqrt(2.0 * math.log(2.0)) * math.sqrt(max(float(sig), 0.0))
+    gamma_fwhm = max(abs(float(gam)), 0.0)
+    voigt_fwhm = 0.5346 * gamma_fwhm + math.sqrt(
+        max(0.2166 * gamma_fwhm * gamma_fwhm + sigma_fwhm * sigma_fwhm, 0.0)
+    )
+    asymmetry_fwhm = math.log(2.0) * (
+        1.0 / max(abs(float(alp)), 1e-12) + 1.0 / max(abs(float(bet)), 1e-12)
+    )
+    return float(max(voigt_fwhm + asymmetry_fwhm, 1e-12))
 
 
 def _normalise_peak(values: np.ndarray) -> np.ndarray:
@@ -203,6 +284,35 @@ def _back_to_back_exponential_profile(x: np.ndarray, base: np.ndarray, alpha: fl
     return _convolve_profile(x, base, kernel)
 
 
+def _gsas2_double_exponential_pseudo_voigt_profile(
+    x: np.ndarray,
+    centre: float,
+    sig: float,
+    gam: float,
+    alp: float,
+    bet: float,
+) -> np.ndarray:
+    from scipy.special import voigt_profile as scipy_voigt_profile
+
+    x_values = np.asarray(x, dtype=float)
+    sigma = max(math.sqrt(max(float(sig), 0.0)), _axis_step(x_values) * 1e-3, 1e-12)
+    gamma = max(abs(float(gam)) / 2.0, _axis_step(x_values) * 1e-3, 1e-12)
+    base_values = scipy_voigt_profile(x_values - float(centre), sigma, gamma)
+    base_peak = float(scipy_voigt_profile(np.array([0.0], dtype=float), sigma, gamma)[0])
+    if not np.isfinite(base_peak) or base_peak <= 0.0:
+        return np.zeros_like(x_values)
+    base_values = base_values / base_peak
+    dx = _axis_step(x_values)
+    n = int(x_values.size)
+    offsets = (np.arange(n, dtype=float) - n // 2) * dx
+    alpha_rate = max(abs(float(alp)), 1e-12)
+    beta_rate = max(abs(float(bet)), 1e-12)
+    left = alpha_rate * np.exp(np.clip(alpha_rate * offsets, -80.0, 0.0))
+    right = beta_rate * np.exp(np.clip(-beta_rate * offsets, -80.0, 0.0))
+    kernel = np.where(offsets < 0.0, left, right)
+    return _convolve_profile(x_values, base_values, kernel)
+
+
 def evaluate_peak_profile(
     profile_key: str,
     x: Sequence[float] | np.ndarray,
@@ -213,6 +323,10 @@ def evaluate_peak_profile(
     tail: float = 1.0,
     alpha: float = 1.0,
     beta: float = 1.0,
+    sig: Optional[float] = None,
+    gam: Optional[float] = None,
+    alp: Optional[float] = None,
+    bet: Optional[float] = None,
 ) -> np.ndarray:
     x_values = np.asarray(x, dtype=float)
     key = peak_profile_spec(profile_key).key
@@ -249,5 +363,14 @@ def evaluate_peak_profile(
             pseudo_voigt_profile(x_values, centre, fwhm, eta),
             alpha,
             beta,
+        )
+    if key == PROFILE_GSAS2_TOF_PV:
+        return _gsas2_double_exponential_pseudo_voigt_profile(
+            x_values,
+            centre,
+            fwhm if sig is None else sig,
+            fwhm if gam is None else gam,
+            alpha if alp is None else alp,
+            beta if bet is None else bet,
         )
     raise ValueError(f"Unsupported peak profile: {profile_key}")

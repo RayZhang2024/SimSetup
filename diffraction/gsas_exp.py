@@ -3,8 +3,11 @@ from __future__ import annotations
 import itertools
 import math
 import re
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
 
 from .models import AtomRecord, PhaseModel, Reflection
 
@@ -151,3 +154,120 @@ def generate_fcc_reflections(phase: PhaseModel, d_min: float, d_max: float) -> L
                         multiplicity=_multiplicity(h, k, l),
                     )
     return sorted(reflections.values(), key=lambda reflection: reflection.d_spacing)
+
+
+@lru_cache(maxsize=512)
+def _reciprocal_metric(
+    a: float,
+    b: float,
+    c: float,
+    alpha: float,
+    beta: float,
+    gamma: float,
+) -> tuple[tuple[float, ...], ...]:
+    angles = np.radians([alpha, beta, gamma])
+    cos_alpha, cos_beta, cos_gamma = np.cos(angles)
+    metric = np.array(
+        [
+            [a * a, a * b * cos_gamma, a * c * cos_beta],
+            [a * b * cos_gamma, b * b, b * c * cos_alpha],
+            [a * c * cos_beta, b * c * cos_alpha, c * c],
+        ],
+        dtype=float,
+    )
+    try:
+        reciprocal = np.linalg.inv(metric)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("The phase unit cell is singular.") from exc
+    return tuple(tuple(float(value) for value in row) for row in reciprocal)
+
+
+def unit_cell_d_spacing(
+    h: int,
+    k: int,
+    l: int,
+    a: float,
+    b: float,
+    c: float,
+    alpha: float,
+    beta: float,
+    gamma: float,
+) -> float:
+    reciprocal_metric = np.asarray(_reciprocal_metric(a, b, c, alpha, beta, gamma), dtype=float)
+    hkl = np.array([h, k, l], dtype=float)
+    inverse_d_squared = float(hkl @ reciprocal_metric @ hkl)
+    if inverse_d_squared <= 0.0:
+        raise ValueError("The phase unit cell produced a non-positive reciprocal spacing.")
+    return 1.0 / math.sqrt(inverse_d_squared)
+
+
+def _centering_allows(space_group: str, h: int, k: int, l: int) -> bool:
+    symbol = _normalize_space_group(space_group)
+    centering = symbol[:1] or "P"
+    if centering == "F":
+        return len({h % 2, k % 2, l % 2}) == 1
+    if centering == "I":
+        return (h + k + l) % 2 == 0
+    if centering == "A":
+        return (k + l) % 2 == 0
+    if centering == "B":
+        return (h + l) % 2 == 0
+    if centering == "C":
+        return (h + k) % 2 == 0
+    if centering == "R":
+        return (-h + k + l) % 3 == 0
+    return True
+
+
+def generate_phase_reflections(
+    phase: PhaseModel,
+    d_min: float,
+    d_max: float,
+    abort_check: Optional[Callable[[], Optional[str]]] = None,
+) -> List[Reflection]:
+    """Generate powder lines for a general unit cell using lattice-centering absences.
+
+    Screw-axis and glide-plane absences are not inferred from the compact GSAS EXP
+    phase record, so their candidate intensities are left for the Pawley fit to drive
+    to zero.
+    """
+    low = min(float(d_min), float(d_max))
+    high = max(float(d_min), float(d_max))
+    if low <= 0.0:
+        raise ValueError("d_min must be positive.")
+    max_index = max(1, int(math.ceil(max(phase.a, phase.b, phase.c) / low)) + 1)
+    if max_index > 50:
+        raise ValueError(
+            f"The selected d-spacing range requires reflection indices up to {max_index}; the limit is 50. "
+            "Increase the lower d-spacing bound."
+        )
+    grouped: Dict[float, Reflection] = {}
+    multiplicities: Dict[float, int] = {}
+    for h in range(-max_index, max_index + 1):
+        if abort_check is not None:
+            reason = abort_check()
+            if reason:
+                raise RuntimeError(reason)
+        for k in range(-max_index, max_index + 1):
+            for l in range(-max_index, max_index + 1):
+                if h == 0 and k == 0 and l == 0:
+                    continue
+                first_nonzero = next(value for value in (h, k, l) if value != 0)
+                if first_nonzero < 0 or not _centering_allows(phase.space_group, h, k, l):
+                    continue
+                d_spacing = unit_cell_d_spacing(
+                    h, k, l, phase.a, phase.b, phase.c,
+                    phase.alpha, phase.beta, phase.gamma,
+                )
+                if not low <= d_spacing <= high:
+                    continue
+                key = round(d_spacing, 9)
+                multiplicities[key] = multiplicities.get(key, 0) + 2
+                grouped.setdefault(key, Reflection(h=h, k=k, l=l, d_spacing=d_spacing, multiplicity=1))
+    return sorted(
+        (
+            Reflection(item.h, item.k, item.l, item.d_spacing, multiplicities[key])
+            for key, item in grouped.items()
+        ),
+        key=lambda reflection: reflection.d_spacing,
+    )

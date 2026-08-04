@@ -1,0 +1,71 @@
+     VERSION    6     Tue May 28 15:17:48 2002                                  
+      DESCR   Lithium Beta template                                             
+    HSTRY  1 EXPEDT  Win32  Jul 15 14:11:19 2002 P PH        LA  O              
+  DSGL CDAT1  DRAD ARAD NOFO                                                    
+  GNLS CDAT1  MXCY  3                                                           
+ AFAC LI     1.1282 3.9546  .7508 1.0524  .617585.3905  .4653168.261  .0377 RHF 
+ AFAC LI_     6.939 -.190        70.5                                           
+ AFAC LI_SIZ      1.76      1.56 1.60   91                                      
+ AFAC LI_XAB  14.32 9.193 5.496 2.268 2.061                                     
+ AFAC LI_XAN   .002  .001  .002  .001  .001 0.000 0.000 0.000 0.000 0.000       
+ EXPR  HTYP1  PNTD                                                              
+ EXPR  NATYP    1                                                               
+ EXPR  NHST     1                                                               
+ EXPR ATYP 1  LI          1      1.76      1.56 1.60   91                       
+ EXPR NPHAS     1    0    0    0    0    0    0    0    0                       
+CRS1    PNAM  LI_Beta                                                           
+CRS1   ABSCO     0.68     0.44     0.26     0.11     0.10     0.00     3.36     
+CRS1   ATYPS    1                                                               
+CRS1   F000     -0.760    11.998                                                
+CRS1   FRML1LI          4.00                                                    
+CRS1   NATOM    1                                                               
+CRS1  ABC     4.379000  4.379000  4.379000    N    0                            
+CRS1  ANGLES   90.0000   90.0000   90.0000                                      
+CRS1  AT  1A  LI        0.000000  0.000000  0.000000  1.000000LI1        4 000  
+CRS1  AT  1B  0.025000                                                    I     
+CRS1  AT  1C    357.00     3.585     3.453     1.608     0.543       0.92      3
+CRS1  CELVOL    83.970                                                          
+CRS1  DENSTY     0.549                                                          
+CRS1  SG SYM  F m 3 m                                                           
+CRS1  SPAXIS    0    0    1                                                     
+HAP1 1 ZONE     0    0    0    0                                                
+HAP1 1EXTPOW    0.00000E+00    N    0                                           
+HAP1 1NAXIS     1                                                               
+HAP1 1PHSFR      1.0000        N    0                                           
+HAP1 1PRCF      3   14   0.00500                                                
+HAP1 1PRCF 1   0.336479E+00   0.257533E-01   0.284093E-01    .000000E+00        
+HAP1 1PRCF 2   0.790612E+02   0.000000E+00   0.000000E+00   0.564135E+01        
+HAP1 1PRCF 3   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HAP1 1PRCF 4   0.000000E+00   0.000000E+00                                      
+HAP1 1PREFO1   1.00000   1.00000   0.00000   0.00000   1.00000   NN    0        
+HAP1 1RADDAM    0.00000E+00    N    0      0.00                                 
+HAP1 1MECPRO      5.10     324.8     0.293                                      
+HST  1  HNAM  Dummy histogram data set                                          
+HST  1  IFIL  par_file.par                                                      
+HST  1 BANK     1                                                               
+HST  1 CHANS         0         1         0         1      2996                  
+HST  1 DUMMY      2996  SLOG       1000.00  20000.00  0.001000                  
+HST  1 EPHAS    0    0    0    0    0    0    0    0    0    Y                  
+HST  1 ICONR   5649.97      0.13      1.60                                      
+HST  1 ICONS   5649.97      0.13      1.60                                      
+HST  1 NEXC     2                                                               
+HST  1 NPHAS    1    0    0    0    0    0    0    0    0                       
+HST  1 NREF     0    0.1767    N                                                
+HST  1ABSCOR   0.000000E+00   0.000000E+00    N    0                            
+HST  1BAKGD     4    4    Y    0    Y                                           
+HST  1BAKGD1   0.100000E+01                                                     
+HST  1BNKPAR    0.75       90.00      0.00    .00000     .3000    1    1        
+HST  1CHI      90.0000                                                          
+HST  1EXC  1     0.000     0.999                                                
+HST  1EXC  2    20.020                                                          
+HST  1HSCALE     10000.        Y    0                                           
+HST  1I HEAD   SI 34228 on PRL                                                  
+HST  1I ITYP    0    1.000    21.000       1                                    
+HST  1OMEGA     0.0000                                                          
+HST  1PHI       0.0000                                                          
+HST  1PRCF1     3   14   0.00500    0                                           
+HST  1PRCF11   0.336479E+00   0.257533E-01   0.284093E-01    .000000E+00        
+HST  1PRCF12   0.790612E+02   0.000000E+00   0.000000E+00   0.564135E+01        
+HST  1PRCF13   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HST  1PRCF14   0.000000E+00   0.000000E+00                                      
+ZZZZZZZZZZZZ  Last EXP file record                                              

@@ -1,0 +1,76 @@
+     VERSION    6     Fri May 24 10:34:00 2002                                  
+      DESCR   Gamma Iron template                                               
+    HSTRY  1 EXPEDT  Win32  May 24 11:00:25 2002 P PH        LA  O              
+  DSGL CDAT1  DRAD ARAD NOFO                                                    
+  GNLS CDAT1  MXCY  3                                                           
+ AFAC FE    11.7695 4.7611 7.3573  .3072 3.522215.3535 2.304576.8805 1.0369 RHF 
+ AFAC FE   M  .0706 35.008  .3589 15.358  .5819  5.561  .0000   .000 -.0114     
+ AFAC FE   N 1.9405 18.473 1.9566  6.323  .5166  2.161  .0000   .000  .0036 2.00
+ AFAC FE_    55.847  .945        2.56                                           
+ AFAC FE_SIZ      1.47      1.27 2.15   32                                      
+ AFAC FE_XAB  10490  6528 28230  3500  1791                                     
+ AFAC FE_XAN -1.339  .764-2.095  .566-1.179 3.204  .301  .845  .244  .545       
+ EXPR  HTYP1  PNTD                                                              
+ EXPR  NATYP    1                                                               
+ EXPR  NHST     1                                                               
+ EXPR ATYP 1  FE          1      1.47      1.27 2.15   32                       
+ EXPR NPHAS     1    0    0    0    0    0    0    0    0                       
+CRS1    PNAM  Fe_gamma                                                          
+CRS1   ABSCO   891.53   554.81  2399.24   297.46   152.22     0.00     0.22     
+CRS1   ATYPS    1                                                               
+CRS1   F000      3.780   103.962                                                
+CRS1   FRML1FE          4.00                                                    
+CRS1   NATOM    1                                                               
+CRS1  ABC     3.610500  3.610500  3.610500    N    0                            
+CRS1  ANGLES   90.0000   90.0000   90.0000                                      
+CRS1  AT  1A  FE        0.000000  0.000000  0.000000  1.000000FE1        4 000  
+CRS1  AT  1B  0.025000                                                    I     
+CRS1  AT  1C    357.00     3.585     3.453     1.608     0.543       0.4      26
+CRS1  CELVOL    47.065                                                          
+CRS1  DENSTY     7.881                                                          
+CRS1  SG SYM  F m 3 m                                                           
+CRS1  SPAXIS    0    0    1                                                     
+HAP1 1 ZONE     0    0    0    0                                                
+HAP1 1EXTPOW    0.00000E+00    N    0                                           
+HAP1 1NAXIS     1                                                               
+HAP1 1PHSFR      1.0000        N    0                                           
+HAP1 1MECPRO      5.10     324.8     0.293                                      
+HAP1 1PRCF      3   21   0.00500                                                
+HAP1 1PRCF 1   0.425565E+00   0.263286E-01   0.296905E-01   0.404614E+02        
+HAP1 1PRCF 2   0.404614E+02   0.000000E+00   0.000000E+00   0.529470E+01        
+HAP1 1PRCF 3   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HAP1 1PRCF 4   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HAP1 1PRCF 5   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HAP1 1PRCF 6   0.000000E+00                                                     
+HAP1 1PREFO1   1.00000   1.00000   0.00000   0.00000   1.00000   NN    0        
+HAP1 1RADDAM    0.00000E+00    N    0      0.00                                 
+HST  1  HNAM  Dummy histogram data set                                          
+HST  1  IFIL  par_file.par                                                      
+HST  1 BANK     1                                                               
+HST  1 CHANS         0         1         0         1      2996                  
+HST  1 DUMMY      2996  SLOG       1000.00  20000.00  0.001000                  
+HST  1 EPHAS    0    0    0    0    0    0    0    0    0    Y                  
+HST  1 ICONR   5664.98     -3.55     -8.29                                      
+HST  1 ICONS   5664.98     -3.55     -8.29                                      
+HST  1 NEXC     2                                                               
+HST  1 NPHAS    1    0    0    0    0    0    0    0    0                       
+HST  1 NREF     0    0.1780    N                                                
+HST  1ABSCOR   0.000000E+00   0.000000E+00    N    0                            
+HST  1BAKGD     4    4    Y    0    Y                                           
+HST  1BAKGD1   0.100000E+01                                                     
+HST  1BNKPAR     0.742    90.000      0.00    .00000     .3000    1    1        
+HST  1CHI      90.0000                                                          
+HST  1EXC  1     0.000     0.999                                                
+HST  1EXC  2    20.020                                                          
+HST  1HSCALE     10000.        Y    0                                           
+HST  1I ITYP    0    1.000    20.000       9                                    
+HST  1OMEGA     0.0000                                                          
+HST  1PHI       0.0000                                                          
+HST  1PRCF1     3   21   0.00500                                                
+HST  1PRCF11   0.425565E+00   0.263286E-01   0.296905E-01   0.404614E+02        
+HST  1PRCF12   0.404614E+02   0.000000E+00   0.000000E+00   0.529470E+01        
+HST  1PRCF13   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HST  1PRCF14   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HST  1PRCF15   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HST  1PRCF16   0.000000E+00                                                     
+ZZZZZZZZZZZZ  Last EXP file record                                              

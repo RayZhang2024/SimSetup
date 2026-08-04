@@ -1,0 +1,83 @@
+     VERSION    6     Fri Sep 05 13:26:27 2003                                  
+      DESCR   Co6W6C template                                                   
+    HSTRY  1 EXPEDT  Win32  Sep 05 14:19:58 2003 P PH        LA  O              
+  DSGL CDAT1  DRAD ARAD NOFO                                                    
+  GNLS CDAT1  MXCY  3                                                           
+ AFAC  C     2.310020.8439 1.020010.2075 1.5886  .5687  .865051.6512  .2156 RHF 
+ AFAC  C_    12.011 .6646       .0035                                           
+ AFAC  C_SIZ      1.12      0.92 1.60    3                                      
+ AFAC  C_XAB  288.3 170.4 84.13 10.67 7.054                                     
+ AFAC  C_XAN   .035  .021  .026  .015  .017  .009  .002  .002 0.000  .001       
+ AFAC  W    29.08181.7202915.43009.2259014.4327.3217035.1198257.05609.88750*RHF 
+ AFAC  W_    183.85  .486        18.4                                           
+ AFAC  W_SIZ      1.61      1.41 2.40    8                                      
+ AFAC  W_XAB 143600 93350 52070 29240 15690                                     
+ AFAC  W_XAN -4.49910.364-4.823 7.996-6.048 5.577-1.421 6.872 -.993 4.643       
+ AFAC CO    12.2841 4.2791 7.3409  .2784 4.003413.5359 2.348871.1692 1.0118 RHF 
+ AFAC CO   M  .4139 16.162  .6013  4.780 -.1518   .021  .0000   .000  .1345     
+ AFAC CO   N 1.9678 14.170 1.4911  4.948  .3844  1.797  .0000   .000  .0027 2.00
+ AFAC CO_    58.933  .249       37.18                                           
+ AFAC CO_SIZ      1.45      1.25 2.10   97                                      
+ AFAC CO_XAB  12190  7661 33130  4014  1891                                     
+ AFAC CO_XAN -1.124  .893-1.623  .662-2.464 3.608  .299  .973  .256  .630       
+ EXPR  HTYP1  PNTD                                                              
+ EXPR  NATYP    3                                                               
+ EXPR  NHST     1                                                               
+ EXPR ATYP 1  CO          0      1.45      1.25 2.10   97                       
+ EXPR ATYP 2  W           1      1.61      1.41 2.40    8                       
+ EXPR ATYP 3  C           0      1.12      0.92 1.60    3                       
+ EXPR NPHAS     1    0    0    0    0    0    0    0    0                       
+CRS1    PNAM  Co6W6C                                                            
+CRS1   ABSCO   722.41   468.38   395.02   154.16    81.50     0.00     0.26     
+CRS1   ATYPS    3                                                               
+CRS1   F000      5.075   611.644                                                
+CRS1   FRML1CO          6.00W           6.00C           1.00                    
+CRS1   NATOM    1                                                               
+CRS1  ABC    10.898001 10.898001 10.898001    N    0                            
+CRS1  ANGLES   90.0000   90.0000   90.0000                                      
+CRS1  AT  1A  W         0.000000  0.000000  0.000000  1.000000W1        16 000  
+CRS1  AT  1B  0.025000                                                    I     
+CRS1  CELVOL  1294.317                                                          
+CRS1  DENSTY     1.884                                                          
+CRS1  SG SYM  F d 3 m                                                           
+CRS1  SPAXIS    0    0    1                                                     
+HAP1 1 ZONE     0    0    0    0                                                
+HAP1 1EXTPOW    0.00000E+00    N    0                                           
+HAP1 1NAXIS     1                                                               
+HAP1 1PHSFR      1.0000        N    0                                           
+HAP1 1PRCF      3   14   0.00500                                                
+HAP1 1PRCF 1   0.336479E+00   0.257533E-01   0.284093E-01    .000000E+00        
+HAP1 1PRCF 2   0.790612E+02   0.000000E+00   0.000000E+00   0.564135E+01        
+HAP1 1PRCF 3   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HAP1 1PRCF 4   0.000000E+00   0.000000E+00                                      
+HAP1 1PREFO1   1.00000   1.00000   0.00000   0.00000   1.00000   NN    0        
+HAP1 1RADDAM    0.00000E+00    N    0      0.00                                 
+HST  1  HNAM  Dummy histogram data set                                          
+HST  1  IFIL  par_file.par                                                      
+HST  1 BANK     1                                                               
+HST  1 CHANS         0         1         0         1      2996                  
+HST  1 DUMMY      2996  SLOG       1000.00  20000.00  0.001000                  
+HST  1 EPHAS    0    0    0    0    0    0    0    0    0    Y                  
+HST  1 ICONR   5649.97      0.13      1.60                                      
+HST  1 ICONS   5649.97      0.13      1.60                                      
+HST  1 NEXC     2                                                               
+HST  1 NPHAS    1    0    0    0    0    0    0    0    0                       
+HST  1 NREF     0    0.1767    N                                                
+HST  1ABSCOR   0.000000E+00   0.000000E+00    N    0                            
+HST  1BAKGD     4    4    Y    0    Y                                           
+HST  1BAKGD1   0.100000E+01                                                     
+HST  1BNKPAR    0.75       90.00      0.00    .00000     .3000    1    1        
+HST  1CHI      90.0000                                                          
+HST  1EXC  1     0.000     0.999                                                
+HST  1EXC  2    20.020                                                          
+HST  1HSCALE     10000.        Y    0                                           
+HST  1I HEAD   SI 34228 on PRL                                                  
+HST  1I ITYP    0    1.000    40.000       1                                    
+HST  1OMEGA     0.0000                                                          
+HST  1PHI       0.0000                                                          
+HST  1PRCF1     3   14   0.00500    0                                           
+HST  1PRCF11   0.336479E+00   0.257533E-01   0.284093E-01    .000000E+00        
+HST  1PRCF12   0.790612E+02   0.000000E+00   0.000000E+00   0.564135E+01        
+HST  1PRCF13   0.000000E+00   0.000000E+00   0.000000E+00   0.000000E+00        
+HST  1PRCF14   0.000000E+00   0.000000E+00                                      
+ZZZZZZZZZZZZ  Last EXP file record                                              

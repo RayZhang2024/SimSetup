@@ -76,6 +76,24 @@ try:
 except ImportError:
     tifffile = None
 
+
+def resize_dialog_to_available_screen(
+    dialog: QDialog,
+    preferred_width: int,
+    preferred_height: int,
+    margin: int = 80,
+) -> None:
+    """Keep a dialog inside the usable desktop area on smaller displays."""
+    screen = QApplication.primaryScreen()
+    if screen is None:
+        dialog.resize(preferred_width, preferred_height)
+        return
+    available = screen.availableGeometry()
+    dialog.resize(
+        min(int(preferred_width), max(1, available.width() - int(margin))),
+        min(int(preferred_height), max(1, available.height() - int(margin))),
+    )
+
 from placement_fit import (
     Measurement,
     Transform,
@@ -191,6 +209,35 @@ DETECTOR_THICKNESS = 10.0
 
 def format_decimal(value: float) -> str:
     return f"{value:.3f}"
+
+
+def round_decimal(value: float) -> float:
+    return round(float(value), 3)
+
+
+def round_decimal_array(values: Sequence[float]) -> np.ndarray:
+    return np.round(np.asarray(values, dtype=float), 3)
+
+
+def format_table_value(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text == "":
+        return ""
+    try:
+        return format_decimal(float(text))
+    except ValueError:
+        return text
+
+
+def optional_decimal(value: object) -> object:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text == "":
+        return ""
+    return round_decimal(text)
 
 
 def format_trimmed_decimal(value: float, decimals: int = 6) -> str:
@@ -534,6 +581,23 @@ def render_toolbar_toggle_icon(kind: str, color: QColor, size: int = 24) -> QPix
         )
         painter.drawPolyline(roof)
         painter.drawRect(QRect(7, int(c), size - 14, size - int(c) - 5))
+    elif kind == "nav_rotate":
+        painter.drawArc(QRect(5, 5, size - 10, size - 10), 35 * 16, 280 * 16)
+        draw_arrow(QPointF(size - 7, 9), QPointF(size - 4, 5), QPointF(size - 9, 5), QPointF(size - 5, 10))
+    elif kind == "nav_pan":
+        draw_arrow(QPointF(c, c), QPointF(c, 4), QPointF(c - 4, 8), QPointF(c + 4, 8))
+        draw_arrow(QPointF(c, c), QPointF(c, size - 4), QPointF(c - 4, size - 8), QPointF(c + 4, size - 8))
+        draw_arrow(QPointF(c, c), QPointF(4, c), QPointF(8, c - 4), QPointF(8, c + 4))
+        draw_arrow(QPointF(c, c), QPointF(size - 4, c), QPointF(size - 8, c - 4), QPointF(size - 8, c + 4))
+    elif kind == "nav_zoom_in":
+        painter.drawEllipse(QPointF(c - 2, c - 2), 6.0, 6.0)
+        painter.drawLine(QPointF(c + 3, c + 3), QPointF(size - 4, size - 4))
+        painter.drawLine(QPointF(c - 6, c - 2), QPointF(c + 2, c - 2))
+        painter.drawLine(QPointF(c - 2, c - 6), QPointF(c - 2, c + 2))
+    elif kind == "nav_zoom_out":
+        painter.drawEllipse(QPointF(c - 2, c - 2), 6.0, 6.0)
+        painter.drawLine(QPointF(c + 3, c + 3), QPointF(size - 4, size - 4))
+        painter.drawLine(QPointF(c - 6, c - 2), QPointF(c + 2, c - 2))
     elif kind == "cam_theodolite":
         painter.drawEllipse(QPointF(c, 8), 3.5, 3.5)
         painter.drawLine(QPointF(c, 11.5), QPointF(c, size - 4))
@@ -811,11 +875,13 @@ def make_toolbar_icon_button(
 
 def gui_like_label_font_size(widget: QWidget) -> int:
     font = widget.font()
-    if font.pixelSize() > 0:
-        return max(font.pixelSize(), 16)
     if font.pointSizeF() > 0:
-        return max(int(round(font.pointSizeF() * 1.6)), 16)
-    return 16
+        return int(round(font.pointSizeF()))
+    if font.pointSize() > 0:
+        return int(round(font.pointSize()))
+    if font.pixelSize() > 0:
+        return int(round(font.pixelSize() * 72.0 / 96.0))
+    return int(round(DEFAULT_UI_FONT_POINT_SIZE))
 
 
 def stage_local_to_world(
@@ -824,7 +890,7 @@ def stage_local_to_world(
     omega_deg: float,
     pivot_world: np.ndarray,
 ) -> np.ndarray:
-    rotation = np.array(rotation_z_deg(omega_deg), dtype=float)
+    rotation = np.array(rotation_z_deg(-omega_deg), dtype=float)
     return pivot_world + (rotation @ (points + stage_readout_local).T).T
 
 
@@ -940,6 +1006,59 @@ def make_multi_line_polydata(segments: Sequence[Tuple[np.ndarray, np.ndarray]]) 
         points.append(np.asarray(end, dtype=float))
         lines.extend([2, start_idx, start_idx + 1])
     return pv.PolyData(np.array(points, dtype=float), lines=np.array(lines, dtype=np.int64))
+
+
+def line_mesh_intersection_segments(
+    mesh: pv.PolyData,
+    origin: np.ndarray,
+    end: np.ndarray,
+    tolerance: float = 1e-6,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    if mesh is None or mesh.n_points == 0:
+        return []
+    origin = np.asarray(origin, dtype=float)
+    end = np.asarray(end, dtype=float)
+    direction = end - origin
+    max_distance = float(np.linalg.norm(direction))
+    if max_distance < tolerance:
+        return []
+
+    unit_direction = direction / max_distance
+    intersection_points, _ = mesh.ray_trace(origin, end, first_point=False)
+    distances = sorted(
+        float(np.dot(np.asarray(point, dtype=float) - origin, unit_direction))
+        for point in intersection_points
+    )
+    merged_distances: List[float] = []
+    for distance in distances:
+        if distance < 0.0 or distance > max_distance:
+            continue
+        if not merged_distances or abs(distance - merged_distances[-1]) > tolerance:
+            merged_distances.append(distance)
+
+    if not merged_distances:
+        return []
+
+    boundaries = list(merged_distances)
+    if point_on_or_inside_mesh(mesh, origin, probe_direction=unit_direction, tolerance=tolerance):
+        boundaries.insert(0, 0.0)
+    if point_on_or_inside_mesh(mesh, end, probe_direction=-unit_direction, tolerance=tolerance):
+        boundaries.append(max_distance)
+    if len(boundaries) < 2:
+        return []
+    if len(boundaries) % 2 == 1:
+        boundaries = boundaries[:-1]
+
+    segments: List[Tuple[np.ndarray, np.ndarray]] = []
+    for start_distance, end_distance in zip(boundaries[:-1:2], boundaries[1::2]):
+        if end_distance > start_distance + tolerance:
+            segments.append(
+                (
+                    origin + unit_direction * start_distance,
+                    origin + unit_direction * end_distance,
+                )
+            )
+    return segments
 
 
 def make_oriented_box(
@@ -1408,6 +1527,10 @@ class SpreadsheetTableWidget(QTableWidget):
             self.paste_from_clipboard()
             event.accept()
             return
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.clear_selected_cells()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def copy_selection_to_clipboard(self) -> None:
@@ -1482,6 +1605,19 @@ class SpreadsheetTableWidget(QTableWidget):
         if not (item.flags() & Qt.ItemIsEditable):
             return
         item.setText(value)
+
+    def clear_selected_cells(self) -> None:
+        indexes = self.selectedIndexes()
+        if not indexes:
+            return
+        was_blocked = self.blockSignals(True)
+        try:
+            for index in indexes:
+                self._set_cell_text(index.row(), index.column(), "")
+        finally:
+            self.blockSignals(was_blocked)
+        if self.after_paste is not None:
+            self.after_paste()
 
 
 class StressTableHeaderView(QHeaderView):
@@ -1893,6 +2029,131 @@ def polydata_to_stl_bytes(mesh: pv.PolyData) -> bytes:
     return bytes(exported)
 
 
+def transform_polydata_to_local_frame(mesh: pv.PolyData, origin: np.ndarray, basis: np.ndarray) -> pv.PolyData:
+    if mesh is None or mesh.n_points == 0:
+        raise ValueError("No mesh is available to transform.")
+    origin = np.asarray(origin, dtype=float)
+    basis = np.asarray(basis, dtype=float)
+    if origin.shape != (3,) or basis.shape != (3, 3):
+        raise ValueError("The local coordinate frame is invalid.")
+    if abs(float(np.linalg.det(basis))) < 1e-9:
+        raise ValueError("The local coordinate axes do not define a valid coordinate frame.")
+    transformed_mesh = mesh.copy(deep=True)
+    transformed_mesh.points = np.linalg.solve(basis, np.asarray(mesh.points, dtype=float).T - origin[:, None]).T
+    return transformed_mesh
+
+
+def mesh_region_cell_counts(mesh: pv.PolyData) -> List[int]:
+    if mesh is None or mesh.n_cells == 0:
+        return []
+    connected = mesh.connectivity("all")
+    if "RegionId" not in connected.array_names:
+        return []
+    region_ids = np.asarray(connected["RegionId"], dtype=int)
+    if region_ids.size == 0:
+        return []
+    return sorted((int(value) for value in np.bincount(region_ids)), reverse=True)
+
+
+def mesh_repair_diagnostics(mesh: pv.PolyData) -> dict:
+    if mesh is None or mesh.n_points == 0:
+        return {
+            "points": 0,
+            "cells": 0,
+            "boundary_edges": 0,
+            "non_manifold_edges": 0,
+            "regions": 0,
+            "largest_region_cells": 0,
+            "smallest_region_cells": 0,
+            "bounds": None,
+            "diagonal": 0.0,
+        }
+    triangle_mesh = mesh.triangulate()
+    boundary_edges = triangle_mesh.extract_feature_edges(
+        boundary_edges=True,
+        non_manifold_edges=False,
+        feature_edges=False,
+        manifold_edges=False,
+    )
+    non_manifold_edges = triangle_mesh.extract_feature_edges(
+        boundary_edges=False,
+        non_manifold_edges=True,
+        feature_edges=False,
+        manifold_edges=False,
+    )
+    region_counts = mesh_region_cell_counts(triangle_mesh)
+    bounds = np.array(triangle_mesh.bounds, dtype=float)
+    mesh_min = np.array([bounds[0], bounds[2], bounds[4]], dtype=float)
+    mesh_max = np.array([bounds[1], bounds[3], bounds[5]], dtype=float)
+    return {
+        "points": int(triangle_mesh.n_points),
+        "cells": int(triangle_mesh.n_cells),
+        "boundary_edges": int(boundary_edges.n_cells),
+        "non_manifold_edges": int(non_manifold_edges.n_cells),
+        "regions": len(region_counts),
+        "largest_region_cells": int(region_counts[0]) if region_counts else 0,
+        "smallest_region_cells": int(region_counts[-1]) if region_counts else 0,
+        "bounds": tuple(float(value) for value in triangle_mesh.bounds),
+        "diagonal": float(np.linalg.norm(mesh_max - mesh_min)),
+    }
+
+
+def format_mesh_repair_diagnostics(title: str, diagnostics: dict) -> str:
+    bounds = diagnostics.get("bounds")
+    if bounds is None:
+        bounds_text = "-"
+    else:
+        bounds_text = (
+            f"X {format_decimal(bounds[0])} to {format_decimal(bounds[1])}, "
+            f"Y {format_decimal(bounds[2])} to {format_decimal(bounds[3])}, "
+            f"Z {format_decimal(bounds[4])} to {format_decimal(bounds[5])}"
+        )
+    lines = [
+        title,
+        f"Points: {diagnostics.get('points', 0)}",
+        f"Triangles/cells: {diagnostics.get('cells', 0)}",
+        f"Boundary/open edges: {diagnostics.get('boundary_edges', 0)}",
+        f"Non-manifold edges: {diagnostics.get('non_manifold_edges', 0)}",
+        f"Connected regions: {diagnostics.get('regions', 0)}",
+        f"Largest region cells: {diagnostics.get('largest_region_cells', 0)}",
+        f"Smallest region cells: {diagnostics.get('smallest_region_cells', 0)}",
+        f"Bounds: {bounds_text}",
+        f"Diagonal: {format_decimal(diagnostics.get('diagonal', 0.0))}",
+    ]
+    if diagnostics.get("boundary_edges", 0) > 0:
+        lines.append("Path lengths may be unreliable until open boundaries are capped.")
+    else:
+        lines.append("No open boundary edges were detected.")
+    return "\n".join(lines)
+
+
+def repair_mesh_flat_openings(
+    mesh: pv.PolyData,
+    *,
+    clean_tolerance: float,
+    keep_largest_region: bool,
+    fill_holes: bool,
+    hole_size: float,
+    orient_normals: bool,
+) -> pv.PolyData:
+    if mesh is None or mesh.n_points == 0:
+        raise ValueError("No mesh is available to repair.")
+    repaired = mesh.copy(deep=True).triangulate().clean(tolerance=max(float(clean_tolerance), 0.0))
+    if keep_largest_region and repaired.n_cells > 0:
+        repaired = repaired.connectivity("largest").extract_surface(algorithm="dataset_surface").triangulate()
+    if fill_holes:
+        repaired = repaired.fill_holes(max(float(hole_size), 0.0)).triangulate()
+    repaired = repaired.clean(tolerance=max(float(clean_tolerance), 0.0)).triangulate()
+    if orient_normals and repaired.n_cells > 0:
+        repaired = repaired.compute_normals(
+            consistent_normals=True,
+            auto_orient_normals=True,
+            split_vertices=False,
+            inplace=False,
+        )
+    return repaired
+
+
 def table_to_serializable_rows(table: QTableWidget, headers: Sequence[str]) -> List[dict]:
     rows: List[dict] = []
     for row_index in range(table.rowCount()):
@@ -1901,6 +2162,8 @@ def table_to_serializable_rows(table: QTableWidget, headers: Sequence[str]) -> L
         for column_index, header in enumerate(headers):
             item = table.item(row_index, column_index)
             text = "" if item is None else item.text().strip()
+            if column_index != 0:
+                text = format_table_value(text)
             row_data[header] = text
             if text != "":
                 has_value = True
@@ -1924,7 +2187,10 @@ def populate_table_from_serialized_rows(
             table.insertRow(row_index)
             for column_index, header in enumerate(headers):
                 value = row_data.get(header, "")
-                item = QTableWidgetItem("" if value is None else str(value))
+                display_value = "" if value is None else str(value)
+                if column_index != 0:
+                    display_value = format_table_value(display_value)
+                item = QTableWidgetItem(display_value)
                 if column_index in read_only:
                     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 table.setItem(row_index, column_index, item)
@@ -1940,15 +2206,36 @@ class PointPickerPanel(QWidget):
         self.model_mesh: Optional[pv.PolyData] = None
         self.mesh_path: Optional[Path] = None
         self.plane_mesh = None
+        self.grid_mesh = None
         self.slice_mesh = None
         self.clipped_mesh = None
         self.picked_points_mesh = None
+        self.local_origin_mesh = None
+        self.local_axes_mesh = None
         self.picked_points: List[Tuple[str, np.ndarray]] = []
+        self.active_local_origin = np.zeros(3, dtype=float)
+        self.active_local_basis = np.eye(3, dtype=float)
+        self.draft_local_origin: Optional[np.ndarray] = None
+        self.draft_local_axis_point: Optional[np.ndarray] = None
+        self.draft_plane_normal: Optional[np.ndarray] = None
         self.view_buttons: dict[str, QToolButton] = {}
         self.view_button_group: Optional[QButtonGroup] = None
+        self.interaction_buttons: dict[str, QToolButton] = {}
+        self.interaction_button_group: Optional[QButtonGroup] = None
+        self.interaction_mode = "rotate"
+        self.show_coordinate_triad_button: Optional[QToolButton] = None
+        self.pending_frame_pick: Optional[str] = None
         self._surface_picking_initialized = False
+        self._right_pick_press_pos: Optional[QPointF] = None
+        self._right_pick_dragged = False
 
         self._build_ui()
+
+    def viewer_font_size(self, base_size: int) -> int:
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "viewer_font_size"):
+            return int(parent.viewer_font_size(base_size))
+        return max(8, min(48, int(base_size)))
 
     def _build_ui(self) -> None:
         outer_layout = QVBoxLayout(self)
@@ -1967,10 +2254,19 @@ class PointPickerPanel(QWidget):
         controls_layout.setSpacing(8)
 
         self.instructions_label = QLabel(
-            "Pick in model coordinates. Use direct XYZ entry or define a slice plane and click on the plane within the model."
+            "Pick in model coordinates. Use direct XYZ entry or define a slice plane and right-click on the plane within the model."
         )
         self.instructions_label.setWordWrap(True)
         controls_layout.addWidget(self.instructions_label)
+
+        mesh_tools_group = QGroupBox("Mesh Tools")
+        mesh_tools_layout = QVBoxLayout(mesh_tools_group)
+        mesh_tools_layout.setContentsMargins(8, 8, 8, 8)
+        mesh_tools_layout.setSpacing(6)
+        repair_mesh_button = QPushButton("Check / repair mesh")
+        repair_mesh_button.clicked.connect(self.open_mesh_repair_dialog)
+        mesh_tools_layout.addWidget(repair_mesh_button)
+        controls_layout.addWidget(mesh_tools_group)
 
         slice_group = QGroupBox("Slice Plane Picking")
         slice_layout = QVBoxLayout(slice_group)
@@ -1981,7 +2277,9 @@ class PointPickerPanel(QWidget):
         slice_form.addRow("Plane mode", self.plane_mode_combo)
 
         self.plane_mode_stack = QStackedWidget()
+        self.plane_mode_stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         axis_mode_widget = QWidget()
+        axis_mode_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         axis_mode_layout = QFormLayout(axis_mode_widget)
         self.plane_axis_combo = NoWheelComboBox()
         self.plane_axis_combo.addItems(["X", "Y", "Z"])
@@ -1993,6 +2291,7 @@ class PointPickerPanel(QWidget):
         self.plane_mode_stack.addWidget(axis_mode_widget)
 
         point_normal_widget = QWidget()
+        point_normal_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         point_normal_layout = QFormLayout(point_normal_widget)
         self.plane_origin_x_spin = make_spin_box(0.0, -100000.0, 100000.0)
         self.plane_origin_y_spin = make_spin_box(0.0, -100000.0, 100000.0)
@@ -2018,6 +2317,7 @@ class PointPickerPanel(QWidget):
         self.plane_mode_stack.addWidget(point_normal_widget)
 
         three_points_widget = QWidget()
+        three_points_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         three_points_layout = QFormLayout(three_points_widget)
         self.plane_p1_x_spin = make_spin_box(0.0, -100000.0, 100000.0)
         self.plane_p1_y_spin = make_spin_box(0.0, -100000.0, 100000.0)
@@ -2064,7 +2364,75 @@ class PointPickerPanel(QWidget):
         shared_controls.addRow(self.require_inside_checkbox)
         shared_controls.addRow(normal_view_button)
         slice_layout.addLayout(shared_controls)
+        self.update_plane_mode_stack_height()
+
+        grid_group = QGroupBox("Plane Grid")
+        grid_layout = QFormLayout(grid_group)
+        self.grid_enabled_checkbox = QCheckBox("Show grid")
+        self.grid_enabled_checkbox.setChecked(True)
+        self.grid_enabled_checkbox.toggled.connect(self.on_grid_definition_changed)
+        self.grid_snap_checkbox = QCheckBox("Snap picks to grid")
+        self.grid_snap_checkbox.setChecked(True)
+        self.grid_snap_checkbox.toggled.connect(self.on_grid_definition_changed)
+        self.grid_offset_u_spin = make_spin_box(0.0, -100000.0, 100000.0)
+        self.grid_offset_v_spin = make_spin_box(0.0, -100000.0, 100000.0)
+        self.grid_rotation_spin = make_spin_box(0.0, -3600.0, 3600.0)
+        self.grid_u_size_spin = make_spin_box(100.0, 0.001, 100000.0)
+        self.grid_v_size_spin = make_spin_box(100.0, 0.001, 100000.0)
+        self.grid_u_spacing_spin = make_spin_box(10.0, 0.001, 100000.0)
+        self.grid_v_spacing_spin = make_spin_box(10.0, 0.001, 100000.0)
+        for spin_box in (
+            self.grid_offset_u_spin,
+            self.grid_offset_v_spin,
+            self.grid_rotation_spin,
+            self.grid_u_size_spin,
+            self.grid_v_size_spin,
+            self.grid_u_spacing_spin,
+            self.grid_v_spacing_spin,
+        ):
+            spin_box.valueChanged.connect(self.on_grid_definition_changed)
+        grid_layout.addRow(self.grid_enabled_checkbox)
+        grid_layout.addRow(self.grid_snap_checkbox)
+        grid_layout.addRow("Move U", self.grid_offset_u_spin)
+        grid_layout.addRow("Move V", self.grid_offset_v_spin)
+        grid_layout.addRow("Rotation deg", self.grid_rotation_spin)
+        grid_layout.addRow("U side", self.grid_u_size_spin)
+        grid_layout.addRow("V side", self.grid_v_size_spin)
+        grid_layout.addRow("U spacing", self.grid_u_spacing_spin)
+        grid_layout.addRow("V spacing", self.grid_v_spacing_spin)
+        slice_layout.addWidget(grid_group)
         controls_layout.addWidget(slice_group)
+
+        coordinate_group = QGroupBox("Local Coordinate Frame")
+        coordinate_layout = QFormLayout(coordinate_group)
+        self.normal_axis_combo = NoWheelComboBox()
+        self.normal_axis_combo.addItems(["X", "Y", "Z"])
+        self.normal_axis_combo.currentTextChanged.connect(self.on_frame_axis_selection_changed)
+        self.in_plane_axis_combo = NoWheelComboBox()
+        self.in_plane_axis_combo.currentTextChanged.connect(self.on_frame_axis_selection_changed)
+        self.sync_in_plane_axis_options()
+        self.frame_origin_label = QLabel("Origin: -")
+        self.frame_axis_point_label = QLabel("Axis point: -")
+        pick_origin_button = QPushButton("Pick origin on plane")
+        pick_origin_button.clicked.connect(self.begin_pick_frame_origin)
+        pick_axis_button = QPushButton("Pick in-plane axis point")
+        pick_axis_button.clicked.connect(self.begin_pick_frame_axis_point)
+        confirm_frame_button = QPushButton("Confirm and apply")
+        confirm_frame_button.clicked.connect(self.confirm_local_coordinate_frame)
+        reset_frame_button = QPushButton("Reset")
+        reset_frame_button.clicked.connect(self.reset_local_coordinate_frame)
+        save_frame_model_button = QPushButton("Save model with frame")
+        save_frame_model_button.clicked.connect(self.save_model_with_local_coordinate_frame)
+        coordinate_layout.addRow("Plane normal axis", self.normal_axis_combo)
+        coordinate_layout.addRow("Plane point axis", self.in_plane_axis_combo)
+        coordinate_layout.addRow(self.frame_origin_label)
+        coordinate_layout.addRow(self.frame_axis_point_label)
+        coordinate_layout.addRow(pick_origin_button)
+        coordinate_layout.addRow(pick_axis_button)
+        coordinate_layout.addRow(confirm_frame_button)
+        coordinate_layout.addRow(save_frame_model_button)
+        coordinate_layout.addRow(reset_frame_button)
+        controls_layout.addWidget(coordinate_group)
 
         manual_group = QGroupBox("Direct Coordinates")
         manual_layout = QFormLayout(manual_group)
@@ -2112,7 +2480,16 @@ class PointPickerPanel(QWidget):
         self.live_coordinate_label = QLabel("Cursor: -")
         self.live_coordinate_label.setWordWrap(True)
         controls_layout.addWidget(self.live_coordinate_label)
-        main_splitter.addWidget(controls_panel)
+
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        controls_scroll.setFrameShape(QFrame.NoFrame)
+        controls_scroll.setMinimumWidth(360)
+        controls_scroll.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        controls_scroll.setWidget(controls_panel)
+        main_splitter.addWidget(controls_scroll)
 
         viewer_panel = QWidget()
         viewer_layout = QVBoxLayout(viewer_panel)
@@ -2121,7 +2498,6 @@ class PointPickerPanel(QWidget):
         if self.enable_3d:
             self.plotter = CursorZoomQtInteractor(self)
             self.plotter.set_background("white")
-            self.plotter.add_axes()
             self.plotter.enable_parallel_projection()
             self.plotter.interactor.installEventFilter(self)
             viewer_layout.addWidget(self._build_view_toolbar())
@@ -2137,7 +2513,7 @@ class PointPickerPanel(QWidget):
         main_splitter.addWidget(viewer_panel)
         main_splitter.setStretchFactor(0, 0)
         main_splitter.setStretchFactor(1, 1)
-        main_splitter.setSizes([560, 720])
+        main_splitter.setSizes([460, 820])
         if self.enable_3d:
             QTimer.singleShot(0, self.initialize_surface_point_picking)
 
@@ -2168,6 +2544,34 @@ class PointPickerPanel(QWidget):
         )
         self.view_button_group = QButtonGroup(toolbar)
         self.view_button_group.setExclusive(True)
+        self.interaction_button_group = QButtonGroup(toolbar)
+        self.interaction_button_group.setExclusive(True)
+
+        for icon_kind, tooltip, mode in (
+            ("nav_rotate", "Rotate view", "rotate"),
+            ("nav_pan", "Pan view", "pan"),
+        ):
+            button = make_toolbar_preset_button(
+                icon_kind,
+                tooltip,
+                lambda _checked=False, target_mode=mode: self.set_interaction_mode(target_mode),
+            )
+            self.interaction_button_group.addButton(button)
+            self.interaction_buttons[mode] = button
+            layout.addWidget(button)
+
+        zoom_in_button = make_toolbar_action_button("nav_zoom_in", "Zoom in", lambda: self.zoom_view(1.25))
+        zoom_out_button = make_toolbar_action_button("nav_zoom_out", "Zoom out", lambda: self.zoom_view(0.8))
+        layout.addWidget(zoom_in_button)
+        layout.addWidget(zoom_out_button)
+
+        self.show_coordinate_triad_button = make_toolbar_toggle_button(
+            "triad",
+            "Show coordinate axis triad",
+            True,
+            lambda _checked=False: self.refresh_scene(reset_camera=False),
+        )
+        layout.addWidget(self.show_coordinate_triad_button)
 
         for icon_kind, tooltip, axis in (
             ("cam_px", "View along X", "x"),
@@ -2186,6 +2590,7 @@ class PointPickerPanel(QWidget):
         home_button = make_toolbar_action_button("cam_home", "Home view", self.home_view)
         layout.addWidget(home_button)
         layout.addStretch(1)
+        self.sync_interaction_button_states()
         return toolbar
 
     def showEvent(self, event) -> None:
@@ -2221,9 +2626,10 @@ class PointPickerPanel(QWidget):
             callback=self.on_plane_picked,
             show_message=False,
             show_point=False,
-            left_clicking=True,
+            left_clicking=False,
             clear_on_no_selection=False,
         )
+        self.set_interaction_mode(self.interaction_mode)
         self._surface_picking_initialized = True
 
     def set_mesh(self, mesh: Optional[pv.PolyData], mesh_path: Optional[Path] = None) -> None:
@@ -2231,27 +2637,165 @@ class PointPickerPanel(QWidget):
         next_path = None if mesh_path is None else str(mesh_path)
         if previous_path != next_path:
             self.picked_points = []
+            self.active_local_origin = np.zeros(3, dtype=float)
+            self.active_local_basis = np.eye(3, dtype=float)
+            self.draft_local_origin = None
+            self.draft_local_axis_point = None
+            self.draft_plane_normal = None
+            self.pending_frame_pick = None
+            self.update_frame_status_labels()
             self.refresh_points_table()
         self.mesh_path = mesh_path
         self.model_mesh = mesh.copy(deep=True) if mesh is not None else None
         if self.model_mesh is None or self.model_mesh.n_points == 0:
             self.clear_scene()
-            self.status_label.setText("Load a mesh from this tab or the Placement tab, then use the plane or direct coordinates to add model points.")
+            self.status_label.setText(
+                "Load a mesh in this tab, then use the plane or direct coordinates to add model points."
+            )
             self.live_coordinate_label.setText("Cursor: -")
             return
         self.configure_coordinate_ranges()
-        self.refresh_scene(reset_camera=True)
-        self.view_plane_normal()
+        if self.plotter is not None:
+            self.refresh_scene(reset_camera=True)
+            self.view_plane_normal()
+
+    def update_parent_pick_point_mesh_state(self) -> None:
+        parent = self.parent()
+        if parent is None:
+            return
+        if hasattr(parent, "pick_point_mesh"):
+            parent.pick_point_mesh = None if self.model_mesh is None else self.model_mesh.copy(deep=True)
+        if hasattr(parent, "pick_point_mesh_path"):
+            parent.pick_point_mesh_path = self.mesh_path
+
+    def open_mesh_repair_dialog(self) -> None:
+        if self.model_mesh is None or self.model_mesh.n_points == 0:
+            QMessageBox.warning(self, "No mesh", "Load a mesh in the Pick Point tab before repairing it.")
+            return
+
+        before_diagnostics = mesh_repair_diagnostics(self.model_mesh)
+        default_hole_size = max(float(before_diagnostics.get("diagonal", 0.0)), 1.0)
+        repaired_mesh: Optional[pv.PolyData] = None
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Check / Repair Mesh")
+        layout = QVBoxLayout(dialog)
+
+        report = QPlainTextEdit(dialog)
+        report.setReadOnly(True)
+        report.setMinimumHeight(260)
+        report.setPlainText(format_mesh_repair_diagnostics("Current mesh", before_diagnostics))
+        layout.addWidget(report)
+
+        options_group = QGroupBox("Repair Options", dialog)
+        options_layout = QFormLayout(options_group)
+        clean_tolerance_spin = make_spin_box(0.0, 0.0, 100000.0, step=0.001)
+        keep_largest_checkbox = QCheckBox("Keep largest connected region")
+        keep_largest_checkbox.setChecked(True)
+        fill_holes_checkbox = QCheckBox("Cap flat/open boundary holes")
+        fill_holes_checkbox.setChecked(True)
+        orient_normals_checkbox = QCheckBox("Re-orient normals")
+        orient_normals_checkbox.setChecked(True)
+        hole_size_spin = make_spin_box(default_hole_size, 0.0, 1000000.0, step=max(default_hole_size / 20.0, 1.0))
+        options_layout.addRow("Clean tolerance", clean_tolerance_spin)
+        options_layout.addRow("Max cap size", hole_size_spin)
+        options_layout.addRow(keep_largest_checkbox)
+        options_layout.addRow(fill_holes_checkbox)
+        options_layout.addRow(orient_normals_checkbox)
+        layout.addWidget(options_group)
+
+        button_row = QHBoxLayout()
+        repair_button = QPushButton("Repair and apply")
+        save_button = QPushButton("Save repaired STL")
+        save_button.setEnabled(False)
+        close_button = QPushButton("Close")
+        button_row.addWidget(repair_button)
+        button_row.addWidget(save_button)
+        button_row.addStretch(1)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        def apply_repair() -> None:
+            nonlocal repaired_mesh
+            try:
+                repaired_mesh = repair_mesh_flat_openings(
+                    self.model_mesh,
+                    clean_tolerance=clean_tolerance_spin.value(),
+                    keep_largest_region=keep_largest_checkbox.isChecked(),
+                    fill_holes=fill_holes_checkbox.isChecked(),
+                    hole_size=hole_size_spin.value(),
+                    orient_normals=orient_normals_checkbox.isChecked(),
+                )
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Mesh repair failed", str(exc))
+                return
+
+            after_diagnostics = mesh_repair_diagnostics(repaired_mesh)
+            self.set_mesh(repaired_mesh, self.mesh_path)
+            self.update_parent_pick_point_mesh_state()
+            save_button.setEnabled(True)
+            report.setPlainText(
+                format_mesh_repair_diagnostics("Before repair", before_diagnostics)
+                + "\n\n"
+                + format_mesh_repair_diagnostics("After repair", after_diagnostics)
+            )
+            self.status_label.setText("Applied repaired mesh to the Pick Point viewer.")
+
+        def save_repaired_mesh() -> None:
+            mesh_to_save = repaired_mesh if repaired_mesh is not None else self.model_mesh
+            if mesh_to_save is None or mesh_to_save.n_points == 0:
+                QMessageBox.warning(dialog, "No repaired mesh", "Repair the mesh before saving it.")
+                return
+            default_stem = "mesh" if self.mesh_path is None else self.mesh_path.stem
+            path_str, _ = QFileDialog.getSaveFileName(
+                dialog,
+                "Save repaired mesh",
+                str(Path.cwd() / f"{default_stem}_repaired.stl"),
+                "STL files (*.stl)",
+            )
+            if not path_str:
+                return
+            path = Path(path_str)
+            if path.suffix.lower() != ".stl":
+                path = path.with_suffix(".stl")
+            try:
+                path.write_bytes(polydata_to_stl_bytes(mesh_to_save))
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Save repaired mesh failed", str(exc))
+                return
+            self.mesh_path = path
+            self.update_parent_pick_point_mesh_state()
+            self.status_label.setText(f"Saved repaired mesh to {path}.")
+
+        repair_button.clicked.connect(apply_repair)
+        save_button.clicked.connect(save_repaired_mesh)
+        close_button.clicked.connect(dialog.accept)
+        resize_dialog_to_available_screen(dialog, 720, 560)
+        dialog.exec_()
 
     def clear_scene(self) -> None:
         if self.plotter is None:
             return
-        for actor_name in ("picker_clipped_mesh", "picker_slice_contour", "picker_plane", "picker_points", "picker_point_labels"):
+        for actor_name in (
+            "picker_clipped_mesh",
+            "picker_slice_contour",
+            "picker_plane",
+            "picker_grid",
+            "picker_local_origin",
+            "picker_local_origin_label",
+            "picker_local_axes",
+            "picker_local_axes_labels",
+            "picker_points",
+            "picker_point_labels",
+        ):
             self.plotter.remove_actor(actor_name, render=False)
         self.plane_mesh = None
+        self.grid_mesh = None
         self.slice_mesh = None
         self.clipped_mesh = None
         self.picked_points_mesh = None
+        self.local_origin_mesh = None
+        self.local_axes_mesh = None
         self.plotter.render()
 
     def configure_coordinate_ranges(self) -> None:
@@ -2292,19 +2836,30 @@ class PointPickerPanel(QWidget):
             if abs(spin_box.value()) < 1e-12:
                 spin_box.setValue(center_value)
             spin_box.blockSignals(was_blocked)
+        self.configure_grid_defaults(diag)
         self.initialize_three_point_plane_defaults(mesh_min, mesh_max, center)
         self.update_plane_value_range()
+
+    def configure_grid_defaults(self, mesh_diagonal: float) -> None:
+        grid_side = max(float(mesh_diagonal) * 0.75, 1.0)
+        grid_spacing = max(grid_side / 10.0, 0.001)
+        defaults = (
+            (self.grid_u_size_spin, grid_side),
+            (self.grid_v_size_spin, grid_side),
+            (self.grid_u_spacing_spin, grid_spacing),
+            (self.grid_v_spacing_spin, grid_spacing),
+        )
+        for spin_box, value in defaults:
+            was_blocked = spin_box.blockSignals(True)
+            spin_box.setValue(float(value))
+            spin_box.blockSignals(was_blocked)
 
     def update_plane_value_range(self) -> None:
         if self.model_mesh is None or self.model_mesh.n_points == 0:
             return
-        bounds = np.array(self.model_mesh.bounds, dtype=float)
+        active_points = np.array([self.model_to_local_point(point) for point in self.model_mesh.points], dtype=float)
         axis_index = {"X": 0, "Y": 1, "Z": 2}[self.plane_axis_combo.currentText()]
-        axis_bounds = [
-            (bounds[0], bounds[1]),
-            (bounds[2], bounds[3]),
-            (bounds[4], bounds[5]),
-        ][axis_index]
+        axis_bounds = (float(np.min(active_points[:, axis_index])), float(np.max(active_points[:, axis_index])))
         center_value = 0.5 * (axis_bounds[0] + axis_bounds[1])
         was_blocked = self.plane_value_spin.blockSignals(True)
         self.plane_value_spin.setRange(float(axis_bounds[0]), float(axis_bounds[1]))
@@ -2352,7 +2907,15 @@ class PointPickerPanel(QWidget):
     def on_plane_mode_changed(self, mode_text: str) -> None:
         mode_index = {"Axis aligned": 0, "Point + normal": 1, "Three points": 2}[mode_text]
         self.plane_mode_stack.setCurrentIndex(mode_index)
+        self.update_plane_mode_stack_height()
         self.on_plane_definition_changed()
+
+    def update_plane_mode_stack_height(self) -> None:
+        current_widget = self.plane_mode_stack.currentWidget()
+        if current_widget is None:
+            return
+        height = current_widget.sizeHint().height()
+        self.plane_mode_stack.setFixedHeight(max(height, 1))
 
     def on_plane_definition_changed(self, *_args) -> None:
         self.update_plane_value_range()
@@ -2361,6 +2924,207 @@ class PointPickerPanel(QWidget):
         except ValueError as exc:
             self.status_label.setText(str(exc))
             self.live_coordinate_label.setText("Cursor: -")
+
+    def on_grid_definition_changed(self, *_args) -> None:
+        try:
+            self.refresh_scene(reset_camera=False)
+        except ValueError as exc:
+            self.status_label.setText(str(exc))
+            self.live_coordinate_label.setText("Cursor: -")
+
+    def axis_name_to_index(self, axis_name: str) -> int:
+        return {"X": 0, "Y": 1, "Z": 2}[axis_name]
+
+    def sync_in_plane_axis_options(self) -> None:
+        if not hasattr(self, "in_plane_axis_combo"):
+            return
+        normal_axis = self.normal_axis_combo.currentText() if hasattr(self, "normal_axis_combo") else "X"
+        previous_axis = self.in_plane_axis_combo.currentText()
+        available_axes = [axis for axis in ("X", "Y", "Z") if axis != normal_axis]
+        was_blocked = self.in_plane_axis_combo.blockSignals(True)
+        self.in_plane_axis_combo.clear()
+        self.in_plane_axis_combo.addItems(available_axes)
+        if previous_axis in available_axes:
+            self.in_plane_axis_combo.setCurrentText(previous_axis)
+        self.in_plane_axis_combo.blockSignals(was_blocked)
+
+    def on_frame_axis_selection_changed(self, *_args) -> None:
+        self.sync_in_plane_axis_options()
+        self.update_frame_status_labels()
+        if self.plotter is not None:
+            try:
+                self.refresh_scene(reset_camera=False)
+            except ValueError as exc:
+                self.status_label.setText(str(exc))
+                self.live_coordinate_label.setText("Cursor: -")
+
+    def begin_pick_frame_origin(self) -> None:
+        if self.model_mesh is None or self.model_mesh.n_points == 0:
+            QMessageBox.warning(self, "No mesh", "Load a mesh before picking a local coordinate origin.")
+            return
+        self.pending_frame_pick = "origin"
+        self.status_label.setText("Right-click the slice plane in the viewer to draft the local-coordinate origin.")
+
+    def begin_pick_frame_axis_point(self) -> None:
+        if self.model_mesh is None or self.model_mesh.n_points == 0:
+            QMessageBox.warning(self, "No mesh", "Load a mesh before picking a local coordinate axis.")
+            return
+        if self.draft_local_origin is None:
+            QMessageBox.warning(self, "No origin", "Pick an origin before picking the in-plane axis point.")
+            return
+        self.pending_frame_pick = "axis"
+        axis_name = self.in_plane_axis_combo.currentText()
+        self.status_label.setText(
+            f"Right-click the slice plane in the viewer to draft the local +{axis_name} axis direction."
+        )
+
+    def format_frame_point(self, point: Optional[np.ndarray]) -> str:
+        if point is None:
+            return "-"
+        point = np.asarray(point, dtype=float)
+        return f"({format_decimal(point[0])}, {format_decimal(point[1])}, {format_decimal(point[2])})"
+
+    def update_frame_status_labels(self) -> None:
+        self.frame_origin_label.setText(f"Origin: {self.format_frame_point(self.draft_local_origin)}")
+        axis_name = self.in_plane_axis_combo.currentText() if hasattr(self, "in_plane_axis_combo") else ""
+        self.frame_axis_point_label.setText(
+            f"+{axis_name} point: {self.format_frame_point(self.draft_local_axis_point)}"
+        )
+
+    def local_coordinate_origin(self) -> np.ndarray:
+        return self.active_local_origin.copy()
+
+    def local_axis_basis(self) -> np.ndarray:
+        return self.active_local_basis.copy()
+
+    def model_to_local_point(self, point: np.ndarray) -> np.ndarray:
+        offset = np.asarray(point, dtype=float) - self.active_local_origin
+        return np.linalg.solve(self.active_local_basis, offset)
+
+    def local_to_model_point(self, point: np.ndarray) -> np.ndarray:
+        return self.active_local_origin + self.active_local_basis @ np.asarray(point, dtype=float)
+
+    def build_local_basis(
+        self,
+        origin: np.ndarray,
+        axis_point: np.ndarray,
+        plane_normal: np.ndarray,
+    ) -> np.ndarray:
+        normal_axis = self.axis_name_to_index(self.normal_axis_combo.currentText())
+        in_plane_axis = self.axis_name_to_index(self.in_plane_axis_combo.currentText())
+        if normal_axis == in_plane_axis:
+            raise ValueError("Plane normal axis and in-plane axis must be different.")
+
+        normal_unit = normalized(np.asarray(plane_normal, dtype=float))
+        in_plane_vector = np.asarray(axis_point, dtype=float) - np.asarray(origin, dtype=float)
+        in_plane_vector = in_plane_vector - normal_unit * float(np.dot(in_plane_vector, normal_unit))
+        if np.linalg.norm(in_plane_vector) < 1e-9:
+            raise ValueError("The in-plane axis point must be away from the origin and not parallel to the normal.")
+        in_plane_unit = normalized(in_plane_vector)
+
+        axes: List[Optional[np.ndarray]] = [None, None, None]
+        axes[normal_axis] = normal_unit
+        axes[in_plane_axis] = in_plane_unit
+        missing_axis = next(index for index, axis in enumerate(axes) if axis is None)
+        if missing_axis == 0:
+            axes[0] = normalized(np.cross(axes[1], axes[2]))
+        elif missing_axis == 1:
+            axes[1] = normalized(np.cross(axes[2], axes[0]))
+        else:
+            axes[2] = normalized(np.cross(axes[0], axes[1]))
+        basis = np.column_stack([np.asarray(axis, dtype=float) for axis in axes])
+        if abs(float(np.linalg.det(basis))) < 1e-6:
+            raise ValueError("The selected axes do not define a valid coordinate frame.")
+        return basis
+
+    def confirm_local_coordinate_frame(self) -> None:
+        if self.draft_local_origin is None:
+            QMessageBox.warning(self, "No origin", "Pick an origin on the slice plane first.")
+            return
+        if self.draft_local_axis_point is None:
+            QMessageBox.warning(self, "No axis point", "Pick a point on the slice plane for the in-plane axis.")
+            return
+        if self.draft_plane_normal is None:
+            QMessageBox.warning(self, "No plane normal", "Pick the origin or axis point again to capture the slice plane normal.")
+            return
+        try:
+            basis = self.build_local_basis(
+                self.draft_local_origin,
+                self.draft_local_axis_point,
+                self.draft_plane_normal,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid coordinate frame", str(exc))
+            return
+        self.active_local_origin = self.draft_local_origin.copy()
+        self.active_local_basis = basis
+        self.draft_local_origin = None
+        self.draft_local_axis_point = None
+        self.draft_plane_normal = None
+        self.pending_frame_pick = None
+        self.update_plane_value_range()
+        self.update_frame_status_labels()
+        self.refresh_points_table()
+        self.refresh_scene(reset_camera=False)
+        self.status_label.setText("Applied new local coordinate frame.")
+
+    def has_custom_local_coordinate_frame(self) -> bool:
+        return bool(
+            np.linalg.norm(self.active_local_origin) > 1e-12
+            or np.linalg.norm(self.active_local_basis - np.eye(3, dtype=float)) > 1e-12
+        )
+
+    def save_model_with_local_coordinate_frame(self) -> None:
+        if self.model_mesh is None or self.model_mesh.n_points == 0:
+            QMessageBox.warning(self, "No mesh", "Load a mesh before saving a model with a local coordinate frame.")
+            return
+        if not self.has_custom_local_coordinate_frame():
+            QMessageBox.warning(
+                self,
+                "No custom frame",
+                "Confirm and apply a local coordinate frame before saving a transformed model.",
+            )
+            return
+
+        default_stem = "model" if self.mesh_path is None else self.mesh_path.stem
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save model with local coordinate frame",
+            str(Path.cwd() / f"{default_stem}_local_frame.stl"),
+            "STL files (*.stl)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        if path.suffix.lower() != ".stl":
+            path = path.with_suffix(".stl")
+
+        try:
+            transformed_mesh = transform_polydata_to_local_frame(
+                self.model_mesh,
+                self.active_local_origin,
+                self.active_local_basis,
+            )
+            path.write_bytes(polydata_to_stl_bytes(transformed_mesh))
+        except Exception as exc:
+            QMessageBox.critical(self, "Save model failed", str(exc))
+            return
+
+        self.status_label.setText(f"Saved model with local coordinate frame to {path}.")
+
+    def reset_local_coordinate_frame(self) -> None:
+        self.active_local_origin = np.zeros(3, dtype=float)
+        self.active_local_basis = np.eye(3, dtype=float)
+        self.draft_local_origin = None
+        self.draft_local_axis_point = None
+        self.draft_plane_normal = None
+        self.pending_frame_pick = None
+        self.update_plane_value_range()
+        self.update_frame_status_labels()
+        self.refresh_points_table()
+        if self.plotter is not None:
+            self.refresh_scene(reset_camera=False)
+        self.status_label.setText("Reset local coordinate frame to the original model coordinates.")
 
     def current_plane_definition(self) -> Tuple[np.ndarray, np.ndarray, float]:
         if self.model_mesh is None or self.model_mesh.n_points == 0:
@@ -2373,12 +3137,13 @@ class PointPickerPanel(QWidget):
         mode = self.plane_mode_combo.currentText()
         if mode == "Axis aligned":
             axis_index = {"X": 0, "Y": 1, "Z": 2}[self.plane_axis_combo.currentText()]
-            origin = center.copy()
-            origin[axis_index] = self.plane_value_spin.value()
-            normal = np.zeros(3, dtype=float)
-            normal[axis_index] = 1.0
+            active_center = self.model_to_local_point(center)
+            active_origin = active_center.copy()
+            active_origin[axis_index] = self.plane_value_spin.value()
+            origin = self.local_to_model_point(active_origin)
+            normal = normalized(self.active_local_basis[:, axis_index])
         elif mode == "Point + normal":
-            origin = np.array(
+            active_origin = np.array(
                 [
                     self.plane_origin_x_spin.value(),
                     self.plane_origin_y_spin.value(),
@@ -2386,7 +3151,7 @@ class PointPickerPanel(QWidget):
                 ],
                 dtype=float,
             )
-            normal = np.array(
+            active_normal = np.array(
                 [
                     self.plane_normal_x_spin.value(),
                     self.plane_normal_y_spin.value(),
@@ -2394,22 +3159,27 @@ class PointPickerPanel(QWidget):
                 ],
                 dtype=float,
             )
-            if np.linalg.norm(normal) < 1e-9:
+            if np.linalg.norm(active_normal) < 1e-9:
                 raise ValueError("Plane normal must be non-zero.")
+            origin = self.local_to_model_point(active_origin)
+            normal = self.active_local_basis @ active_normal
             normal = normalized(normal)
         elif mode == "Three points":
-            point_1 = np.array(
+            active_point_1 = np.array(
                 [self.plane_p1_x_spin.value(), self.plane_p1_y_spin.value(), self.plane_p1_z_spin.value()],
                 dtype=float,
             )
-            point_2 = np.array(
+            active_point_2 = np.array(
                 [self.plane_p2_x_spin.value(), self.plane_p2_y_spin.value(), self.plane_p2_z_spin.value()],
                 dtype=float,
             )
-            point_3 = np.array(
+            active_point_3 = np.array(
                 [self.plane_p3_x_spin.value(), self.plane_p3_y_spin.value(), self.plane_p3_z_spin.value()],
                 dtype=float,
             )
+            point_1 = self.local_to_model_point(active_point_1)
+            point_2 = self.local_to_model_point(active_point_2)
+            point_3 = self.local_to_model_point(active_point_3)
             normal = np.cross(point_2 - point_1, point_3 - point_1)
             if np.linalg.norm(normal) < 1e-9:
                 raise ValueError("Three-point plane requires non-collinear points.")
@@ -2419,6 +3189,98 @@ class PointPickerPanel(QWidget):
             raise ValueError(f"Unsupported plane mode: {mode}")
         plane_size = max(float(np.linalg.norm(spans)), 1.0) * 1.35
         return origin, normal, plane_size
+
+    def current_grid_definition(
+        self,
+        origin: np.ndarray,
+        normal: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float]:
+        base_u, base_v = orthogonal_plane_basis(normal, np.array([0.0, 0.0, 1.0], dtype=float))
+        rotation = np.radians(self.grid_rotation_spin.value())
+        cos_theta = float(np.cos(rotation))
+        sin_theta = float(np.sin(rotation))
+        axis_u = normalized(cos_theta * base_u + sin_theta * base_v)
+        axis_v = normalized(-sin_theta * base_u + cos_theta * base_v)
+        center = (
+            np.asarray(origin, dtype=float)
+            + axis_u * self.grid_offset_u_spin.value()
+            + axis_v * self.grid_offset_v_spin.value()
+        )
+        return (
+            center,
+            axis_u,
+            axis_v,
+            float(self.grid_u_size_spin.value()),
+            float(self.grid_v_size_spin.value()),
+            float(self.grid_u_spacing_spin.value()),
+            float(self.grid_v_spacing_spin.value()),
+        )
+
+    def make_plane_grid_mesh(
+        self,
+        center: np.ndarray,
+        axis_u: np.ndarray,
+        axis_v: np.ndarray,
+        size_u: float,
+        size_v: float,
+        spacing_u: float,
+        spacing_v: float,
+    ) -> pv.PolyData:
+        half_u = max(float(size_u) / 2.0, 0.0005)
+        half_v = max(float(size_v) / 2.0, 0.0005)
+        spacing_u = max(float(spacing_u), 0.001)
+        spacing_v = max(float(spacing_v), 0.001)
+
+        def grid_values(half_size: float, spacing: float) -> np.ndarray:
+            max_index = int(np.floor(half_size / spacing))
+            if max_index * 2 + 1 > 401:
+                indices = np.unique(np.linspace(-max_index, max_index, 401, dtype=int))
+            else:
+                indices = np.arange(-max_index, max_index + 1, dtype=int)
+            values = indices.astype(float) * spacing
+            values = values[(values >= -half_size - 1e-9) & (values <= half_size + 1e-9)]
+            return np.unique(np.clip(np.append(values, [-half_size, half_size]), -half_size, half_size))
+
+        u_values = grid_values(half_u, spacing_u)
+        v_values = grid_values(half_v, spacing_v)
+        segments = []
+        for u_value in u_values:
+            start = center + axis_u * u_value - axis_v * half_v
+            end = center + axis_u * u_value + axis_v * half_v
+            segments.append((start, end))
+        for v_value in v_values:
+            start = center - axis_u * half_u + axis_v * v_value
+            end = center + axis_u * half_u + axis_v * v_value
+            segments.append((start, end))
+        return make_multi_line_polydata(segments)
+
+    def grid_projected_pick_point(self, point: np.ndarray) -> Optional[np.ndarray]:
+        if not self.grid_enabled_checkbox.isChecked():
+            return np.asarray(point, dtype=float)
+        try:
+            origin, normal, _plane_size = self.current_plane_definition()
+        except ValueError:
+            return None
+        grid_center, axis_u, axis_v, size_u, size_v, spacing_u, spacing_v = self.current_grid_definition(origin, normal)
+        delta = np.asarray(point, dtype=float) - grid_center
+        coordinate_u = float(np.dot(delta, axis_u))
+        coordinate_v = float(np.dot(delta, axis_v))
+        half_u = size_u / 2.0
+        half_v = size_v / 2.0
+        tolerance = max(spacing_u, spacing_v, size_u, size_v) * 1e-9
+        if abs(coordinate_u) > half_u + tolerance or abs(coordinate_v) > half_v + tolerance:
+            QMessageBox.warning(
+                self,
+                "Point outside grid",
+                "The selected point is outside the active grid. Move or resize the grid, or turn off the grid.",
+            )
+            return None
+        if self.grid_snap_checkbox.isChecked():
+            coordinate_u = round(coordinate_u / spacing_u) * spacing_u
+            coordinate_v = round(coordinate_v / spacing_v) * spacing_v
+            coordinate_u = min(max(coordinate_u, -half_u), half_u)
+            coordinate_v = min(max(coordinate_v, -half_v), half_v)
+        return grid_center + axis_u * coordinate_u + axis_v * coordinate_v
 
     def mesh_camera_reference(self) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
         if self.model_mesh is None or self.model_mesh.n_points == 0:
@@ -2443,6 +3305,30 @@ class PointPickerPanel(QWidget):
         if self.view_button_group is not None and group_was_exclusive is not None:
             self.view_button_group.setExclusive(group_was_exclusive)
 
+    def sync_interaction_button_states(self) -> None:
+        for mode, button in self.interaction_buttons.items():
+            was_blocked = button.blockSignals(True)
+            button.setChecked(mode == self.interaction_mode)
+            button.blockSignals(was_blocked)
+
+    def set_interaction_mode(self, mode: str) -> None:
+        if self.plotter is None:
+            return
+        if mode == "pan":
+            self.plotter.enable_2d_style()
+        else:
+            mode = "rotate"
+            self.plotter.enable_trackball_style()
+        self.interaction_mode = mode
+        self.sync_interaction_button_states()
+
+    def zoom_view(self, factor: float) -> None:
+        if self.plotter is None:
+            return
+        self.plotter.camera.Zoom(float(factor))
+        self.plotter.reset_camera_clipping_range()
+        self.plotter.render()
+
     def view_axis(self, axis: str) -> None:
         if self.plotter is None:
             return
@@ -2450,20 +3336,21 @@ class PointPickerPanel(QWidget):
         if reference is None:
             return
         center, spans, diagonal = reference
+        basis = self.local_axis_basis()
         axis_specs = {
             "x": (
-                np.array([1.0, 0.0, 0.0], dtype=float),
-                np.array([0.0, 0.0, 1.0], dtype=float),
+                basis[:, 0],
+                basis[:, 2],
                 (spans[1], spans[2]),
             ),
             "y": (
-                np.array([0.0, 1.0, 0.0], dtype=float),
-                np.array([0.0, 0.0, 1.0], dtype=float),
+                basis[:, 1],
+                basis[:, 2],
                 (spans[0], spans[2]),
             ),
             "z": (
-                np.array([0.0, 0.0, 1.0], dtype=float),
-                np.array([0.0, 1.0, 0.0], dtype=float),
+                basis[:, 2],
+                basis[:, 1],
                 (spans[0], spans[1]),
             ),
         }
@@ -2516,10 +3403,38 @@ class PointPickerPanel(QWidget):
 
     def eventFilter(self, watched, event) -> bool:
         if self.plotter is not None and watched is self.plotter.interactor:
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
+                try:
+                    self._right_pick_press_pos = event.position()
+                except AttributeError:
+                    self._right_pick_press_pos = QPointF(event.x(), event.y())
+                self._right_pick_dragged = False
+                event.accept()
+                return True
             if event.type() == QEvent.MouseMove:
+                if self._right_pick_press_pos is not None:
+                    try:
+                        current_pos = event.position()
+                    except AttributeError:
+                        current_pos = QPointF(event.x(), event.y())
+                    delta = current_pos - self._right_pick_press_pos
+                    if delta.manhattanLength() > QApplication.startDragDistance():
+                        self._right_pick_dragged = True
                 self.update_live_coordinate_label(event)
             elif event.type() == QEvent.Leave:
+                self._right_pick_press_pos = None
+                self._right_pick_dragged = False
                 self.live_coordinate_label.setText("Cursor: -")
+            elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.RightButton:
+                should_pick = self._right_pick_press_pos is not None and not self._right_pick_dragged
+                self._right_pick_press_pos = None
+                self._right_pick_dragged = False
+                if should_pick:
+                    point = self._cursor_plane_point(event)
+                    if point is not None:
+                        self.on_plane_picked(point)
+                event.accept()
+                return True
         return super().eventFilter(watched, event)
 
     def _cursor_plane_point(self, event) -> Optional[np.ndarray]:
@@ -2569,9 +3484,27 @@ class PointPickerPanel(QWidget):
         if point is None:
             self.live_coordinate_label.setText("Cursor: -")
             return
-        self.live_coordinate_label.setText(
-            f"Cursor: X={format_decimal(point[0])}, Y={format_decimal(point[1])}, Z={format_decimal(point[2])}"
+        local_point = self.model_to_local_point(point)
+        coordinate_text = (
+            f"Cursor: X={format_decimal(local_point[0])}, "
+            f"Y={format_decimal(local_point[1])}, Z={format_decimal(local_point[2])}"
         )
+        if self.grid_enabled_checkbox.isChecked():
+            try:
+                origin, normal, _plane_size = self.current_plane_definition()
+                grid_center, axis_u, axis_v, _size_u, _size_v, _spacing_u, _spacing_v = self.current_grid_definition(
+                    origin,
+                    normal,
+                )
+            except ValueError:
+                pass
+            else:
+                delta = point - grid_center
+                coordinate_text += (
+                    f" | Grid U={format_decimal(float(np.dot(delta, axis_u)))}, "
+                    f"V={format_decimal(float(np.dot(delta, axis_v)))}"
+                )
+        self.live_coordinate_label.setText(coordinate_text)
 
     def refresh_scene(self, reset_camera: bool = False) -> None:
         if self.plotter is None or self.model_mesh is None or self.model_mesh.n_points == 0:
@@ -2612,6 +3545,143 @@ class PointPickerPanel(QWidget):
             show_edges=False,
             pickable=True,
         )
+        if self.grid_enabled_checkbox.isChecked():
+            grid_center, grid_u, grid_v, grid_size_u, grid_size_v, grid_spacing_u, grid_spacing_v = self.current_grid_definition(
+                origin,
+                normal,
+            )
+            grid_mesh = self.make_plane_grid_mesh(
+                grid_center,
+                grid_u,
+                grid_v,
+                grid_size_u,
+                grid_size_v,
+                grid_spacing_u,
+                grid_spacing_v,
+            )
+            self.set_or_add_mesh(
+                "grid_mesh",
+                grid_mesh,
+                "picker_grid",
+                color="#111827",
+                line_width=1,
+                pickable=False,
+            )
+        else:
+            self.set_or_add_mesh(
+                "grid_mesh",
+                pv.PolyData(np.empty((0, 3), dtype=float)),
+                "picker_grid",
+                color="#111827",
+                line_width=1,
+                pickable=False,
+            )
+
+        local_origin = self.draft_local_origin if self.draft_local_origin is not None else self.local_coordinate_origin()
+        local_basis = self.local_axis_basis()
+        if (
+            self.draft_local_origin is not None
+            and self.draft_local_axis_point is not None
+            and self.draft_plane_normal is not None
+        ):
+            try:
+                local_basis = self.build_local_basis(
+                    self.draft_local_origin,
+                    self.draft_local_axis_point,
+                    self.draft_plane_normal,
+                )
+            except ValueError:
+                local_basis = self.local_axis_basis()
+        show_coordinate_triad = (
+            self.show_coordinate_triad_button is None
+            or self.show_coordinate_triad_button.isChecked()
+        )
+        has_non_default_frame = show_coordinate_triad
+        if has_non_default_frame:
+            origin_cloud = pv.PolyData(np.array([local_origin], dtype=float))
+            origin_cloud["labels"] = np.array(["Origin"], dtype=object)
+            self.set_or_add_mesh(
+                "local_origin_mesh",
+                origin_cloud,
+                "picker_local_origin",
+                render_points_as_spheres=True,
+                point_size=16,
+                color="#ef4444",
+                pickable=False,
+            )
+            self.plotter.remove_actor("picker_local_origin_label", render=False)
+            self.plotter.add_point_labels(
+                self.local_origin_mesh,
+                "labels",
+                font_size=self.viewer_font_size(gui_like_label_font_size(self)),
+                shape=None,
+                point_color="#ef4444",
+                text_color="black",
+                always_visible=True,
+                name="picker_local_origin_label",
+                render=False,
+            )
+        else:
+            self.set_or_add_mesh(
+                "local_origin_mesh",
+                pv.PolyData(np.empty((0, 3), dtype=float)),
+                "picker_local_origin",
+                render_points_as_spheres=True,
+                point_size=16,
+                color="#ef4444",
+                pickable=False,
+            )
+            self.plotter.remove_actor("picker_local_origin_label", render=False)
+
+        axis_segments = []
+        axis_label_points = []
+        axis_labels = []
+        if has_non_default_frame:
+            axis_length = max(plane_size * 0.18, 1.0)
+            for axis_index, label in enumerate(("+X", "+Y", "+Z")):
+                end_point = local_origin + local_basis[:, axis_index] * axis_length
+                axis_segments.append((local_origin, end_point))
+                axis_label_points.append(end_point)
+                axis_labels.append(label)
+            if self.draft_local_axis_point is not None:
+                axis_name = self.in_plane_axis_combo.currentText()
+                axis_segments.append((local_origin, self.draft_local_axis_point))
+                axis_label_points.append(self.draft_local_axis_point)
+                axis_labels.append(f"+{axis_name} pick")
+        if axis_segments:
+            axes_mesh = make_multi_line_polydata(axis_segments)
+            self.set_or_add_mesh(
+                "local_axes_mesh",
+                axes_mesh,
+                "picker_local_axes",
+                color="#ef4444",
+                line_width=4,
+                pickable=False,
+            )
+            self.plotter.remove_actor("picker_local_axes_labels", render=False)
+            labels_mesh = pv.PolyData(np.array(axis_label_points, dtype=float))
+            labels_mesh["labels"] = np.array(axis_labels, dtype=object)
+            self.plotter.add_point_labels(
+                labels_mesh,
+                "labels",
+                font_size=self.viewer_font_size(gui_like_label_font_size(self)),
+                shape=None,
+                point_color="#ef4444",
+                text_color="black",
+                always_visible=True,
+                name="picker_local_axes_labels",
+                render=False,
+            )
+        else:
+            self.set_or_add_mesh(
+                "local_axes_mesh",
+                pv.PolyData(np.empty((0, 3), dtype=float)),
+                "picker_local_axes",
+                color="#ef4444",
+                line_width=4,
+                pickable=False,
+            )
+            self.plotter.remove_actor("picker_local_axes_labels", render=False)
 
         if self.picked_points:
             picked_coordinates = np.array([point for _label, point in self.picked_points], dtype=float)
@@ -2629,7 +3699,7 @@ class PointPickerPanel(QWidget):
             self.plotter.add_point_labels(
                 self.picked_points_mesh,
                 "labels",
-                font_size=max(gui_like_label_font_size(self) - 1, 14),
+                font_size=self.viewer_font_size(gui_like_label_font_size(self) - 1),
                 shape=None,
                 point_color="#14b8a6",
                 text_color="black",
@@ -2668,9 +3738,29 @@ class PointPickerPanel(QWidget):
         else:
             plane_description = "defined by three points"
         source_name = "mesh" if self.mesh_path is None else self.mesh_path.name
+        active_origin = self.local_coordinate_origin()
+        origin_status = (
+            f" Local origin=({format_decimal(active_origin[0])}, "
+            f"{format_decimal(active_origin[1])}, {format_decimal(active_origin[2])})."
+        )
+        axes_status = ""
+        if self.draft_local_origin is not None or self.draft_local_axis_point is not None:
+            axes_status = " Draft frame pending confirmation."
+        elif self.has_custom_local_coordinate_frame():
+            axes_status = " Custom coordinate system active."
+        grid_status = ""
+        if self.grid_enabled_checkbox.isChecked():
+            grid_status = (
+                f" Grid center U={format_decimal(self.grid_offset_u_spin.value())}, "
+                f"V={format_decimal(self.grid_offset_v_spin.value())}; "
+                f"rotation={format_decimal(self.grid_rotation_spin.value())} deg."
+            )
         self.status_label.setText(
             f"{source_name}: active slice plane {plane_description}. "
-            "Click on the blue plane within the sliced model to add a point."
+            "Right-click on the blue plane within the sliced model to add a point."
+            f"{origin_status}"
+            f"{axes_status}"
+            f"{grid_status}"
         )
 
     def set_or_add_mesh(self, attr_name: str, mesh: pv.PolyData, actor_name: str, **kwargs) -> None:
@@ -2690,7 +3780,7 @@ class PointPickerPanel(QWidget):
     def add_point(self, point: np.ndarray, label: Optional[str] = None) -> None:
         if self.model_mesh is None or self.model_mesh.n_points == 0:
             return
-        point = np.asarray(point, dtype=float)
+        point = self.local_to_model_point(round_decimal_array(self.model_to_local_point(point)))
         try:
             _origin, normal, _plane_size = self.current_plane_definition()
         except ValueError as exc:
@@ -2721,20 +3811,51 @@ class PointPickerPanel(QWidget):
             return
         point = np.asarray(point, dtype=float)
         projected_point = point - normal * float(np.dot(point - origin, normal))
-        self.add_point(projected_point)
+        grid_point = self.grid_projected_pick_point(projected_point)
+        if grid_point is None:
+            return
+        if self.pending_frame_pick == "origin":
+            self.pending_frame_pick = None
+            self.draft_local_origin = grid_point.copy()
+            self.draft_local_axis_point = None
+            self.draft_plane_normal = normalized(normal)
+            self.update_frame_status_labels()
+            self.refresh_scene(reset_camera=False)
+            self.status_label.setText(
+                "Draft local-coordinate origin set to "
+                f"({format_decimal(grid_point[0])}, {format_decimal(grid_point[1])}, {format_decimal(grid_point[2])})."
+            )
+            return
+        if self.pending_frame_pick == "axis":
+            self.pending_frame_pick = None
+            self.draft_local_axis_point = grid_point.copy()
+            self.draft_plane_normal = normalized(normal)
+            self.update_frame_status_labels()
+            self.refresh_scene(reset_camera=False)
+            axis_name = self.in_plane_axis_combo.currentText()
+            self.status_label.setText(
+                f"Draft local +{axis_name} axis point set to "
+                f"({format_decimal(grid_point[0])}, {format_decimal(grid_point[1])}, {format_decimal(grid_point[2])})."
+            )
+            return
+        self.add_point(grid_point)
 
     def add_manual_point(self) -> None:
-        self.add_point(
-            np.array(
-                [self.manual_x_spin.value(), self.manual_y_spin.value(), self.manual_z_spin.value()],
-                dtype=float,
-            )
+        display_point = round_decimal_array(
+            [self.manual_x_spin.value(), self.manual_y_spin.value(), self.manual_z_spin.value()],
         )
+        self.add_point(self.local_to_model_point(display_point))
 
     def refresh_points_table(self) -> None:
         self.points_table.setRowCount(len(self.picked_points))
         for row_index, (label, point) in enumerate(self.picked_points):
-            values = [label, format_decimal(point[0]), format_decimal(point[1]), format_decimal(point[2])]
+            local_point = self.model_to_local_point(point)
+            values = [
+                label,
+                format_decimal(local_point[0]),
+                format_decimal(local_point[1]),
+                format_decimal(local_point[2]),
+            ]
             for column_index, value in enumerate(values):
                 self.points_table.setItem(row_index, column_index, QTableWidgetItem(value))
 
@@ -2780,10 +3901,33 @@ class PointPickerPanel(QWidget):
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
             writer.writerow(
-                ["label", "model_x", "model_y", "model_z", "stage_x", "stage_y", "stage_z", "path_1", "path_2"]
+                [
+                    "label",
+                    "model_x",
+                    "model_y",
+                    "model_z",
+                    "stage_x",
+                    "stage_y",
+                    "stage_z",
+                    "path_1",
+                    "path_2",
+                ]
             )
             for label, point in self.picked_points:
-                writer.writerow([label, point[0], point[1], point[2], "", "", "", "", ""])
+                local_point = round_decimal_array(self.model_to_local_point(point))
+                writer.writerow(
+                    [
+                        label,
+                        format_decimal(local_point[0]),
+                        format_decimal(local_point[1]),
+                        format_decimal(local_point[2]),
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                    ]
+                )
         self.status_label.setText(f"Saved picked model points to {path}.")
 
 
@@ -2797,6 +3941,7 @@ class MainWindow(QMainWindow):
         self.enable_3d = enable_3d
         self.project_path: Optional[Path] = None
         self.mesh_path: Optional[Path] = None
+        self.pick_point_mesh_path: Optional[Path] = None
         self.measurement_source_text = "Measurements can be loaded from CSV or edited directly."
         self.report_body_text = (
             "Fit report will appear here.\n\n"
@@ -2807,6 +3952,7 @@ class MainWindow(QMainWindow):
             "4. Compute the imaging map if needed."
         )
         self.model_mesh: Optional[pv.PolyData] = None
+        self.pick_point_mesh: Optional[pv.PolyData] = None
         self.fit_transform = None
         self.residual_rows = []
         self.manual_rotation_matrix = np.eye(3, dtype=float)
@@ -2814,7 +3960,8 @@ class MainWindow(QMainWindow):
         self.top_splitter = None
         self.bottom_splitter = None
         self.left_splitter = None
-        self.tables_splitter = None
+        self.tables_tabs = None
+        self.auto_move_to_pivot_action = None
         self.controls_scroll = None
         self.main_tabs = None
         self.tab_menu_stack = None
@@ -2830,6 +3977,9 @@ class MainWindow(QMainWindow):
         self.ui_font_size_spin = None
         self.view_buttons = {}
         self.view_button_group = None
+        self.interaction_buttons = {}
+        self.interaction_button_group = None
+        self.interaction_mode = "rotate"
         self.scene_initialized = False
         self.stage_world_mesh = None
         self.beam_mesh = None
@@ -2973,6 +4123,7 @@ class MainWindow(QMainWindow):
             self.plotter = CursorZoomQtInteractor(self)
             self.plotter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self.plotter.interactor.installEventFilter(self)
+            self.set_interaction_mode(self.interaction_mode)
             view_layout.addWidget(self.plotter.interactor)
         else:
             self.plotter = None
@@ -2984,19 +4135,19 @@ class MainWindow(QMainWindow):
             view_layout.addWidget(placeholder)
         self.bottom_splitter.addWidget(view_panel)
 
-        self.tables_splitter = QSplitter(Qt.Horizontal)
-        self.tables_splitter.setChildrenCollapsible(False)
-        self.tables_splitter.setMinimumWidth(0)
-        self.tables_splitter.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.tables_tabs = QTabWidget()
+        self.tables_tabs.setMinimumWidth(0)
+        self.tables_tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         measurement_section = self._build_measurement_section()
         prediction_section = self._build_prediction_section()
         for section in (measurement_section, prediction_section):
             section.setMinimumWidth(0)
             section.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.tables_splitter.addWidget(measurement_section)
-        self.tables_splitter.addWidget(prediction_section)
+        self.tables_tabs.addTab(measurement_section, "Feature Points")
+        self.tables_tabs.addTab(prediction_section, "Predictions")
+        self.tables_tabs.currentChanged.connect(self.on_tables_tab_changed)
 
-        self.bottom_splitter.addWidget(self.tables_splitter)
+        self.bottom_splitter.addWidget(self.tables_tabs)
         self.bottom_splitter.setStretchFactor(0, 3)
         self.bottom_splitter.setStretchFactor(1, 1)
         self.top_splitter.addWidget(right_panel)
@@ -3081,7 +4232,8 @@ class MainWindow(QMainWindow):
         color: str,
         text_color: str,
     ) -> None:
-        if not segments:
+        display_segments = list(segments)
+        if not display_segments:
             if getattr(self, attr_name) is not None:
                 self.plotter.remove_actor(actor_name, render=False)
                 setattr(self, attr_name, None)
@@ -3091,23 +4243,24 @@ class MainWindow(QMainWindow):
 
         self.set_or_add_mesh(
             attr_name,
-            make_multi_line_polydata(segments),
+            make_multi_line_polydata(display_segments),
             actor_name,
             color=color,
             line_width=6,
+            render_lines_as_tubes=True,
         )
         if label_name is None:
             return
         if not label:
             self.plotter.remove_actor(label_name, render=False)
             return
-        longest_segment = max(segments, key=lambda segment: float(np.linalg.norm(segment[1] - segment[0])))
+        longest_segment = max(display_segments, key=lambda segment: float(np.linalg.norm(segment[1] - segment[0])))
         label_position = (np.asarray(longest_segment[0], dtype=float) + np.asarray(longest_segment[1], dtype=float)) / 2.0
         self.plotter.remove_actor(label_name, render=False)
         self.plotter.add_point_labels(
             pv.PolyData(np.array([label_position], dtype=float)),
             [f"{label}: {total_path_length:.1f} mm"],
-            font_size=self.viewer_font_size(max(gui_like_label_font_size(self) - 1, 13)),
+            font_size=self.viewer_font_size(gui_like_label_font_size(self) - 1),
             shape=None,
             text_color=text_color,
             always_visible=True,
@@ -3131,13 +4284,13 @@ class MainWindow(QMainWindow):
             self._remove_diffraction_path_visuals()
             return
 
-        signed_distance_evaluator = build_mesh_signed_distance_evaluator(self.model_world_mesh)
         incoming_path_length, incoming_segments = compute_segment_path_length(
             self.model_world_mesh,
             slit_origin,
             pivot,
-            signed_distance_evaluator=signed_distance_evaluator,
         )
+        if not incoming_segments:
+            incoming_segments = line_mesh_intersection_segments(self.model_world_mesh, slit_origin, pivot)
         self._set_diffraction_path_visual(
             "diffraction_incident_path_mesh",
             "diffraction_incident_path",
@@ -3154,8 +4307,13 @@ class MainWindow(QMainWindow):
                 self.model_world_mesh,
                 pivot,
                 np.asarray(geometry["center"], dtype=float),
-                signed_distance_evaluator=signed_distance_evaluator,
             )
+            if not outgoing_segments:
+                outgoing_segments = line_mesh_intersection_segments(
+                    self.model_world_mesh,
+                    pivot,
+                    np.asarray(geometry["center"], dtype=float),
+                )
             display_path_length = incoming_path_length + outgoing_path_length
             if index < len(state_list) and state_list[index] is not None:
                 display_path_length = float(state_list[index]["average_length"])
@@ -3180,8 +4338,8 @@ class MainWindow(QMainWindow):
         if self.left_splitter is not None:
             self.left_splitter.setChildrenCollapsible(False)
             self.left_splitter.setSizes([760, 80])
-        if self.tables_splitter is not None:
-            self.tables_splitter.setSizes([565, 565])
+        if self.tables_tabs is not None:
+            self.tables_tabs.setCurrentIndex(0)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -3367,6 +4525,16 @@ class MainWindow(QMainWindow):
             preset_actions.append((action, preset))
         menu.addSeparator()
 
+        self.auto_move_to_pivot_action = QAction("Auto Move on Select", self)
+        self.auto_move_to_pivot_action.setCheckable(True)
+        self.auto_move_to_pivot_action.setChecked(True)
+        self.auto_move_to_pivot_action.setStatusTip("Auto Move on Select")
+        self.auto_move_to_pivot_action.triggered.connect(
+            lambda checked=False: self.set_placement_view_toggle("auto_move_to_pivot_action", checked)
+        )
+        menu.addAction(self.auto_move_to_pivot_action)
+        menu.addSeparator()
+
         toggle_specs = [
             ("Parallel Projection", "parallel_projection_checkbox"),
             ("Show Stage", "show_stage_checkbox"),
@@ -3379,6 +4547,7 @@ class MainWindow(QMainWindow):
             ("Show Sample Triad", "show_sample_triad_checkbox"),
             ("Show Theodolite Sight Line", "show_theodolite_sight_line_checkbox"),
             ("Show Diffraction Vectors", "show_diffraction_vectors_checkbox"),
+            ("Show Path Length Overlays", "show_path_lengths_checkbox"),
         ]
         toggle_actions = []
         for label, button_attr in toggle_specs:
@@ -3390,12 +4559,18 @@ class MainWindow(QMainWindow):
             )
             menu.addAction(action)
             toggle_actions.append((action, button_attr))
+        toggle_actions.append((self.auto_move_to_pivot_action, "auto_move_to_pivot_action"))
+
+        menu.addSeparator()
+        self._add_tab_menu_action(menu, "Compute Imaging Map", self.compute_detector_map)
+        self._add_tab_menu_action(menu, "Compute Diffraction Path", self.compute_diffraction_map)
+        self._add_tab_menu_action(menu, "Export Detector Map", self.export_detector_map_dialog)
 
         menu.aboutToShow.connect(lambda: self.sync_placement_view_menu_actions(preset_actions, toggle_actions))
 
     def _populate_pick_point_file_menu(self, menu) -> None:
-        self._add_tab_menu_action(menu, "Load mesh/SAT", self.load_mesh_dialog)
-        self._add_tab_menu_action(menu, "Clear Mesh", self.clear_mesh)
+        self._add_tab_menu_action(menu, "Load mesh/SAT", self.load_pick_point_mesh_dialog)
+        self._add_tab_menu_action(menu, "Clear Mesh", self.clear_pick_point_mesh)
         menu.addSeparator()
         self._add_tab_menu_action(menu, "Save Picked Points", self.save_picked_points_dialog)
         menu.addSeparator()
@@ -3418,6 +4593,8 @@ class MainWindow(QMainWindow):
 
     def _populate_residual_stress_view_menu(self, menu) -> None:
         self._add_tab_menu_action(menu, "Calculate", self.calculate_residual_stress)
+        self._add_tab_menu_action(menu, "Plot Selected Columns", self.plot_selected_stress_columns)
+        self._add_tab_menu_action(menu, "2D Map Selected Column", self.open_stress_2d_mapping_dialog)
         self._add_tab_menu_action(menu, "Clear Outputs", self.clear_stress_outputs)
         menu.addSeparator()
         self._add_tab_menu_action(menu, "Add Row", self.add_stress_row)
@@ -3652,14 +4829,14 @@ class MainWindow(QMainWindow):
         load_mesh_button = make_toolbar_action_button(
             "act_mesh_load",
             "Load mesh/SAT",
-            self.load_mesh_dialog,
+            self.load_pick_point_mesh_dialog,
             button_size=30,
             icon_size=18,
         )
         clear_mesh_button = make_toolbar_action_button(
             "act_mesh_clear",
             "Clear mesh",
-            self.clear_mesh,
+            self.clear_pick_point_mesh,
             button_size=30,
             icon_size=18,
         )
@@ -3669,7 +4846,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(toolbar)
 
         self.point_picker_panel = PointPickerPanel(self, enable_3d=self.enable_3d)
-        self.point_picker_panel.set_mesh(self.model_mesh, self.mesh_path)
+        self.point_picker_panel.set_mesh(self.pick_point_mesh, self.pick_point_mesh_path)
         layout.addWidget(self.point_picker_panel)
         return tab
 
@@ -3755,8 +4932,10 @@ class MainWindow(QMainWindow):
         appearance_layout.addRow("UI font size (pt)", self.ui_font_size_spin)
 
         help_label = QLabel(
-            "Changes apply to the Qt interface immediately. The 3D viewer label size remains controlled separately."
+            "Changes apply to the Qt interface and 3D viewer labels immediately. "
+            "Use Shift+< or Shift+> for a viewer label offset."
         )
+        help_label.setTextFormat(Qt.PlainText)
         help_label.setWordWrap(True)
         appearance_layout.addRow(help_label)
 
@@ -3768,7 +4947,7 @@ class MainWindow(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("Settings")
         dialog.setModal(False)
-        dialog.resize(420, 220)
+        resize_dialog_to_available_screen(dialog, 420, 220)
 
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -3799,6 +4978,10 @@ class MainWindow(QMainWindow):
         calculate_button.clicked.connect(self.calculate_residual_stress)
         equations_button = QPushButton("Equations")
         equations_button.clicked.connect(self.show_stress_equations_dialog)
+        plot_button = QPushButton("Plot")
+        plot_button.clicked.connect(self.plot_selected_stress_columns)
+        map_button = QPushButton("2D Map")
+        map_button.clicked.connect(self.open_stress_2d_mapping_dialog)
         save_csv_button = QPushButton("Save CSV")
         save_csv_button.clicked.connect(self.save_stress_csv_dialog)
 
@@ -3807,6 +4990,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(clear_outputs_button)
         layout.addWidget(calculate_button)
         layout.addWidget(equations_button)
+        layout.addWidget(plot_button)
+        layout.addWidget(map_button)
         layout.addWidget(save_csv_button)
         layout.addStretch(1)
         return toolbar
@@ -3934,10 +5119,11 @@ class MainWindow(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("Instrument Setup")
         dialog.setModal(False)
-        dialog.resize(360, 560)
+        resize_dialog_to_available_screen(dialog, 360, 560)
 
         layout = QVBoxLayout(dialog)
-        form = QFormLayout()
+        form_widget = QWidget(dialog)
+        form = QFormLayout(form_widget)
         form.addRow("Pivot X", self.pivot_x)
         form.addRow("Pivot Y", self.pivot_y)
         form.addRow("Pivot Z", self.pivot_z)
@@ -3962,7 +5148,11 @@ class MainWindow(QMainWindow):
         form.addRow("Stage offset X", self.stage_offset_x)
         form.addRow("Stage offset Y", self.stage_offset_y)
         form.addRow("Stage offset Z", self.stage_offset_z)
-        layout.addLayout(form)
+        scroll = QScrollArea(dialog)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(form_widget)
+        layout.addWidget(scroll, stretch=1)
 
         close_button = QPushButton("Close")
         close_button.clicked.connect(dialog.close)
@@ -4017,7 +5207,7 @@ class MainWindow(QMainWindow):
             | Qt.WindowMinMaxButtonsHint
             | Qt.WindowMaximizeButtonHint
         )
-        dialog.resize(1040, 560)
+        resize_dialog_to_available_screen(dialog, 1040, 560)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(10, 10, 10, 10)
 
@@ -4481,7 +5671,7 @@ class MainWindow(QMainWindow):
             | Qt.WindowMinMaxButtonsHint
             | Qt.WindowMaximizeButtonHint
         )
-        dialog.resize(900, 420)
+        resize_dialog_to_available_screen(dialog, 900, 420)
         layout = QVBoxLayout(dialog)
 
         top_row = QHBoxLayout()
@@ -4615,6 +5805,7 @@ class MainWindow(QMainWindow):
         self.pose_y = make_spin_box(0.0, -100000.0, 100000.0)
         self.pose_z = make_spin_box(0.0, -100000.0, 100000.0)
         self.pose_omega = make_spin_box(0.0, -3600.0, 3600.0, step=1.0)
+        self.pose_omega.setToolTip("Live stage omega in degrees. Positive rotates clockwise; negative rotates anticlockwise.")
 
         for widget in (self.pose_x, self.pose_y, self.pose_z, self.pose_omega):
             widget.valueChanged.connect(self.on_view_parameter_changed)
@@ -4750,6 +5941,21 @@ class MainWindow(QMainWindow):
         )
         self.view_button_group = QButtonGroup(toolbar)
         self.view_button_group.setExclusive(True)
+        self.interaction_button_group = QButtonGroup(toolbar)
+        self.interaction_button_group.setExclusive(True)
+
+        for icon_kind, tooltip, mode in (
+            ("nav_rotate", "Rotate view", "rotate"),
+            ("nav_pan", "Pan view", "pan"),
+        ):
+            button = make_toolbar_preset_button(
+                icon_kind,
+                tooltip,
+                lambda _checked=False, target_mode=mode: self.set_interaction_mode(target_mode),
+            )
+            self.interaction_button_group.addButton(button)
+            self.interaction_buttons[mode] = button
+            layout.addWidget(button)
 
         buttons = [
             ("cam_iso", "Isometric view", "iso"),
@@ -4788,28 +5994,12 @@ class MainWindow(QMainWindow):
         for attribute_name, icon_kind, tooltip, checked, slot in toggle_specs:
             button = make_toolbar_toggle_button(icon_kind, tooltip, checked, slot)
             setattr(self, attribute_name, button)
+            if attribute_name == "show_path_lengths_checkbox":
+                continue
             layout.addWidget(button)
-
-        compute_detector_map_button = make_toolbar_action_button(
-            "act_detector_map",
-            "Compute imaging map",
-            self.compute_detector_map,
-        )
-        compute_diffraction_map_button = make_toolbar_action_button(
-            "act_diffraction_map",
-            "Compute diffraction path",
-            self.compute_diffraction_map,
-        )
-        export_detector_map_button = make_toolbar_action_button(
-            "act_map_export",
-            "Export detector map",
-            self.export_detector_map_dialog,
-        )
-        layout.addWidget(compute_detector_map_button)
-        layout.addWidget(compute_diffraction_map_button)
-        layout.addWidget(export_detector_map_button)
         layout.addStretch(1)
         self.sync_view_button_states()
+        self.sync_interaction_button_states()
         return self._wrap_toolbar_for_narrow_panel(toolbar)
 
     def _build_measurement_toolbar(self) -> QWidget:
@@ -4852,9 +6042,6 @@ class MainWindow(QMainWindow):
             "Clear placement",
             self.clear_placement,
         )
-        self.auto_move_to_pivot_checkbox = QCheckBox("Auto move on select")
-        self.auto_move_to_pivot_checkbox.setChecked(True)
-
         layout.addWidget(add_row_button)
         layout.addWidget(remove_row_button)
         layout.addWidget(load_csv_button)
@@ -4862,7 +6049,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(move_to_pivot_button)
         layout.addWidget(fit_button)
         layout.addWidget(clear_placement_button)
-        layout.addWidget(self.auto_move_to_pivot_checkbox)
         layout.addStretch(1)
         return self._wrap_toolbar_for_narrow_panel(toolbar)
 
@@ -5046,14 +6232,27 @@ class MainWindow(QMainWindow):
         self.updateGeometry()
         self.update_scene(reset_camera=False)
 
+    def auto_move_to_pivot_enabled(self) -> bool:
+        return bool(self.auto_move_to_pivot_action is not None and self.auto_move_to_pivot_action.isChecked())
+
+    def on_tables_tab_changed(self, index: int) -> None:
+        if index == 0 and hasattr(self, "prediction_table"):
+            was_blocked = self.prediction_table.blockSignals(True)
+            self.prediction_table.clearSelection()
+            self.prediction_table.blockSignals(was_blocked)
+        elif index == 1 and hasattr(self, "measurement_table"):
+            was_blocked = self.measurement_table.blockSignals(True)
+            self.measurement_table.clearSelection()
+            self.measurement_table.blockSignals(was_blocked)
+        self.update_scene(reset_camera=False)
+
     def on_measurement_selection_changed(self) -> None:
         if hasattr(self, "prediction_table"):
             was_blocked = self.prediction_table.blockSignals(True)
             self.prediction_table.clearSelection()
             self.prediction_table.blockSignals(was_blocked)
         if (
-            hasattr(self, "auto_move_to_pivot_checkbox")
-            and self.auto_move_to_pivot_checkbox.isChecked()
+            self.auto_move_to_pivot_enabled()
             and (self.fit_transform is not None or self.manual_placement_enabled_checkbox.isChecked())
         ):
             self.move_selected_point_to_pivot(show_error=False)
@@ -5064,7 +6263,7 @@ class MainWindow(QMainWindow):
             was_blocked = self.measurement_table.blockSignals(True)
             self.measurement_table.clearSelection()
             self.measurement_table.blockSignals(was_blocked)
-        if hasattr(self, "auto_move_to_pivot_checkbox") and self.auto_move_to_pivot_checkbox.isChecked():
+        if self.auto_move_to_pivot_enabled():
             self.move_selected_prediction_point_to_pivot(show_error=False)
         self.update_scene(reset_camera=False)
 
@@ -5359,6 +6558,31 @@ class MainWindow(QMainWindow):
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
             self.prediction_table.setItem(row, column, item)
 
+    def populate_table_rows(
+        self,
+        table: QTableWidget,
+        rows: Sequence[Sequence[object]],
+        read_only_columns: Optional[set[int]] = None,
+    ) -> None:
+        read_only_columns = read_only_columns or set()
+        previous_updates = table.updatesEnabled()
+        previous_signals = table.blockSignals(True)
+        table.setUpdatesEnabled(False)
+        try:
+            table.clearSelection()
+            table.setRowCount(0)
+            table.setRowCount(len(rows))
+            for row_index, values in enumerate(rows):
+                for column_index, value in enumerate(values):
+                    item = QTableWidgetItem(str(value))
+                    if column_index in read_only_columns:
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    table.setItem(row_index, column_index, item)
+        finally:
+            table.blockSignals(previous_signals)
+            table.setUpdatesEnabled(previous_updates)
+            table.viewport().update()
+
     def on_measurement_item_changed(self, item: QTableWidgetItem) -> None:
         if item.column() == 0:
             return
@@ -5479,6 +6703,338 @@ class MainWindow(QMainWindow):
         if text == "":
             return None
         return float(text)
+
+    def stress_column_label(self, column: int) -> str:
+        header = self.stress_table.horizontalHeader()
+        single_headers = getattr(header, "single_headers", {})
+        if column in single_headers:
+            return str(single_headers[column])
+        for start_column, group_label, sub_headers in getattr(header, "grouped_headers", []):
+            offset = column - int(start_column)
+            if 0 <= offset < len(sub_headers):
+                return f"{group_label} {sub_headers[offset]}"
+        if 0 <= column < len(STRESS_TABLE_HEADERS):
+            return STRESS_TABLE_HEADERS[column]
+        return f"Column {column + 1}"
+
+    def selected_stress_plot_columns(self) -> List[int]:
+        columns = sorted({index.column() for index in self.stress_table.selectedIndexes()})
+        if not columns and self.stress_table.currentColumn() >= 0:
+            columns = [self.stress_table.currentColumn()]
+        if len(columns) not in (1, 2):
+            raise ValueError("Select exactly one numeric column, or two numeric columns for X/Y plotting.")
+        return columns
+
+    def selected_stress_plot_rows(self) -> List[int]:
+        rows = sorted({index.row() for index in self.stress_table.selectedIndexes()})
+        if not rows:
+            rows = list(range(self.stress_table.rowCount()))
+        return rows
+
+    def stress_plot_data_for_columns(
+        self,
+        columns: Sequence[int],
+        rows: Optional[Sequence[int]] = None,
+    ) -> Tuple[str, str, List[float], List[float], int]:
+        if len(columns) not in (1, 2):
+            raise ValueError("Plotting requires one or two selected columns.")
+        plot_rows = list(range(self.stress_table.rowCount())) if rows is None else list(rows)
+        x_values: List[float] = []
+        y_values: List[float] = []
+        skipped_rows = 0
+
+        if len(columns) == 1:
+            y_column = int(columns[0])
+            for row in plot_rows:
+                try:
+                    y_value = self._stress_optional_float(row, y_column)
+                except ValueError:
+                    y_value = None
+                if y_value is None:
+                    skipped_rows += 1
+                    continue
+                x_values.append(float(row + 1))
+                y_values.append(float(y_value))
+            return "Row", self.stress_column_label(y_column), x_values, y_values, skipped_rows
+
+        x_column = int(columns[0])
+        y_column = int(columns[1])
+        for row in plot_rows:
+            try:
+                x_value = self._stress_optional_float(row, x_column)
+                y_value = self._stress_optional_float(row, y_column)
+            except ValueError:
+                x_value = None
+                y_value = None
+            if x_value is None or y_value is None:
+                skipped_rows += 1
+                continue
+            x_values.append(float(x_value))
+            y_values.append(float(y_value))
+        return self.stress_column_label(x_column), self.stress_column_label(y_column), x_values, y_values, skipped_rows
+
+    def plot_selected_stress_columns(self) -> None:
+        if FigureCanvas is None or Figure is None:
+            self.show_error("Plot unavailable", "matplotlib is required to plot residual-stress table values.")
+            return
+        try:
+            columns = self.selected_stress_plot_columns()
+            rows = self.selected_stress_plot_rows()
+            x_label, y_label, x_values, y_values, skipped_rows = self.stress_plot_data_for_columns(columns, rows)
+            if not x_values:
+                raise ValueError("No numeric data points were found in the selected column(s).")
+        except Exception as exc:
+            self.show_error("Plot failed", str(exc))
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Residual Stress Plot")
+        resize_dialog_to_available_screen(dialog, 780, 540)
+        layout = QVBoxLayout(dialog)
+
+        figure = Figure(figsize=(7.2, 4.6))
+        canvas = FigureCanvas(figure)
+        axes = figure.add_subplot(111)
+        axes.plot(x_values, y_values, marker="o", linewidth=1.5)
+        axes.set_xlabel(x_label)
+        axes.set_ylabel(y_label)
+        axes.set_title(y_label if len(columns) == 1 else f"{y_label} vs {x_label}")
+        axes.grid(True, alpha=0.28)
+        figure.tight_layout()
+        layout.addWidget(canvas)
+
+        if skipped_rows:
+            note = QLabel(f"Skipped {skipped_rows} row(s) with blank or non-numeric values.")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Close, parent=dialog)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        canvas.draw()
+        dialog.exec_()
+
+    def selected_stress_map_value_column(self) -> int:
+        columns = sorted({index.column() for index in self.stress_table.selectedIndexes()})
+        if not columns and self.stress_table.currentColumn() >= 0:
+            columns = [self.stress_table.currentColumn()]
+        if len(columns) != 1:
+            raise ValueError("Select exactly one result/value column for 2D mapping.")
+        return int(columns[0])
+
+    def stress_map_seed_rows(self, value_column: int) -> List[Tuple[int, float]]:
+        values: List[Tuple[int, float]] = []
+        for row in range(self.stress_table.rowCount()):
+            try:
+                value = self._stress_optional_float(row, value_column)
+            except ValueError:
+                value = None
+            if value is not None:
+                values.append((row, float(value)))
+        return values
+
+    def parse_stress_map_table(self, table: QTableWidget) -> Tuple[List[float], List[float], List[float], int]:
+        x_values: List[float] = []
+        y_values: List[float] = []
+        z_values: List[float] = []
+        skipped_rows = 0
+        for row in range(table.rowCount()):
+            texts = []
+            for column in range(3):
+                item = table.item(row, column)
+                texts.append("" if item is None else item.text().strip())
+            if texts[0] == "" or texts[1] == "" or texts[2] == "":
+                skipped_rows += 1
+                continue
+            try:
+                x_values.append(float(texts[0]))
+                y_values.append(float(texts[1]))
+                z_values.append(float(texts[2]))
+            except ValueError:
+                skipped_rows += 1
+        return x_values, y_values, z_values, skipped_rows
+
+    def aggregate_stress_map_points(
+        self,
+        x_values: Sequence[float],
+        y_values: Sequence[float],
+        z_values: Sequence[float],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        grouped: dict[Tuple[float, float], List[float]] = {}
+        for x_value, y_value, z_value in zip(x_values, y_values, z_values):
+            key = (float(x_value), float(y_value))
+            grouped.setdefault(key, []).append(float(z_value))
+        x_unique = []
+        y_unique = []
+        z_unique = []
+        for (x_value, y_value), values in grouped.items():
+            x_unique.append(x_value)
+            y_unique.append(y_value)
+            z_unique.append(float(np.mean(values)))
+        return (
+            np.asarray(x_unique, dtype=float),
+            np.asarray(y_unique, dtype=float),
+            np.asarray(z_unique, dtype=float),
+        )
+
+    def open_stress_2d_mapping_dialog(self) -> None:
+        try:
+            value_column = self.selected_stress_map_value_column()
+            value_label = self.stress_column_label(value_column)
+            seed_rows = self.stress_map_seed_rows(value_column)
+            if not seed_rows:
+                raise ValueError("The selected column has no numeric values to map.")
+        except Exception as exc:
+            self.show_error("2D map failed", str(exc))
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Residual Stress 2D Map")
+        resize_dialog_to_available_screen(dialog, 620, 520)
+        layout = QVBoxLayout(dialog)
+
+        instruction = QLabel(
+            f"Enter X and Y map coordinates. The selected values are prefilled from {value_label}."
+        )
+        instruction.setWordWrap(True)
+        layout.addWidget(instruction)
+
+        map_table = SpreadsheetTableWidget(len(seed_rows), 3, dialog)
+        map_table.setHorizontalHeaderLabels(["X", "Y", value_label])
+        map_table.setAlternatingRowColors(True)
+        map_table.setWordWrap(False)
+        map_table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        map_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        map_table.verticalHeader().setDefaultSectionSize(26)
+        map_table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        header = map_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Stretch)
+
+        def renumber_map_rows() -> None:
+            map_table.setVerticalHeaderLabels([str(row + 1) for row in range(map_table.rowCount())])
+
+        for row_index, (_source_row, value) in enumerate(seed_rows):
+            map_table.setItem(row_index, 0, QTableWidgetItem(""))
+            map_table.setItem(row_index, 1, QTableWidgetItem(""))
+            value_item = QTableWidgetItem(format_trimmed_decimal(value, decimals=6))
+            map_table.setItem(row_index, 2, value_item)
+        renumber_map_rows()
+        if seed_rows:
+            map_table.setCurrentCell(0, 0)
+        layout.addWidget(map_table, stretch=1)
+
+        table_actions = QHBoxLayout()
+        add_row_button = QPushButton("Add row", dialog)
+        delete_row_button = QPushButton("Delete row", dialog)
+        copy_button = QPushButton("Copy", dialog)
+        paste_button = QPushButton("Paste", dialog)
+        clear_button = QPushButton("Clear", dialog)
+
+        def add_map_row() -> None:
+            current_row = map_table.currentRow()
+            insert_at = map_table.rowCount() if current_row < 0 else current_row + 1
+            map_table.insertRow(insert_at)
+            for column in range(map_table.columnCount()):
+                map_table.setItem(insert_at, column, QTableWidgetItem(""))
+            renumber_map_rows()
+            map_table.setCurrentCell(insert_at, 0)
+
+        def delete_map_rows() -> None:
+            selected_rows = sorted({index.row() for index in map_table.selectedIndexes()}, reverse=True)
+            if not selected_rows and map_table.currentRow() >= 0:
+                selected_rows = [map_table.currentRow()]
+            for row in selected_rows:
+                map_table.removeRow(row)
+            if map_table.rowCount() == 0:
+                map_table.insertRow(0)
+                for column in range(map_table.columnCount()):
+                    map_table.setItem(0, column, QTableWidgetItem(""))
+            renumber_map_rows()
+            map_table.setCurrentCell(min(selected_rows[-1] if selected_rows else 0, map_table.rowCount() - 1), 0)
+
+        add_row_button.clicked.connect(add_map_row)
+        delete_row_button.clicked.connect(delete_map_rows)
+        copy_button.clicked.connect(map_table.copy_selection_to_clipboard)
+        paste_button.clicked.connect(map_table.paste_from_clipboard)
+        clear_button.clicked.connect(map_table.clear_selected_cells)
+        for button in (add_row_button, delete_row_button, copy_button, paste_button, clear_button):
+            table_actions.addWidget(button)
+        table_actions.addStretch(1)
+        layout.addLayout(table_actions)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Close, parent=dialog)
+        create_button = button_box.addButton("Create", QDialogButtonBox.ActionRole)
+
+        def create_map() -> None:
+            try:
+                x_values, y_values, z_values, skipped_rows = self.parse_stress_map_table(map_table)
+                if len(x_values) < 3:
+                    raise ValueError("Enter at least three complete X/Y/value rows.")
+                x_array, y_array, z_array = self.aggregate_stress_map_points(x_values, y_values, z_values)
+                if len(x_array) < 3:
+                    raise ValueError("At least three unique X/Y points are required for interpolation.")
+                self.show_stress_2d_map_plot(x_array, y_array, z_array, value_label, skipped_rows)
+            except Exception as exc:
+                self.show_error("Create 2D map failed", str(exc))
+
+        create_button.clicked.connect(create_map)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        dialog.exec_()
+
+    def show_stress_2d_map_plot(
+        self,
+        x_values: np.ndarray,
+        y_values: np.ndarray,
+        z_values: np.ndarray,
+        value_label: str,
+        skipped_rows: int,
+    ) -> None:
+        if FigureCanvas is None or Figure is None:
+            self.show_error("2D map unavailable", "matplotlib is required to plot residual-stress 2D maps.")
+            return
+        try:
+            import matplotlib.tri as mtri
+
+            triangulation = mtri.Triangulation(x_values, y_values)
+            interpolator = mtri.LinearTriInterpolator(triangulation, z_values)
+            grid_x = np.linspace(float(np.min(x_values)), float(np.max(x_values)), 120)
+            grid_y = np.linspace(float(np.min(y_values)), float(np.max(y_values)), 120)
+            xx, yy = np.meshgrid(grid_x, grid_y)
+            zz = interpolator(xx, yy)
+        except Exception as exc:
+            self.show_error("2D interpolation failed", str(exc))
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Residual Stress 2D Map")
+        resize_dialog_to_available_screen(dialog, 820, 620)
+        layout = QVBoxLayout(dialog)
+
+        figure = Figure(figsize=(7.6, 5.4))
+        canvas = FigureCanvas(figure)
+        axes = figure.add_subplot(111)
+        contour = axes.contourf(xx, yy, zz, levels=24, cmap="viridis")
+        axes.scatter(x_values, y_values, c=z_values, cmap="viridis", edgecolors="black", linewidths=0.5)
+        axes.set_xlabel("X")
+        axes.set_ylabel("Y")
+        axes.set_title(f"2D map: {value_label}")
+        axes.set_aspect("equal", adjustable="box")
+        colorbar = figure.colorbar(contour, ax=axes)
+        colorbar.set_label(value_label)
+        figure.tight_layout()
+        layout.addWidget(canvas)
+
+        if skipped_rows:
+            note = QLabel(f"Skipped {skipped_rows} row(s) with blank or non-numeric X/Y values.")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Close, parent=dialog)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        canvas.draw()
+        dialog.exec_()
 
     def _set_stress_output_value(self, row: int, column: int, value: Optional[float], decimals: int) -> None:
         item = self.stress_table.item(row, column)
@@ -5614,7 +7170,7 @@ class MainWindow(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("Residual Stress Equations")
         dialog.setModal(False)
-        dialog.resize(1040, 780)
+        resize_dialog_to_available_screen(dialog, 1040, 780)
         dialog.setStyleSheet(
             """
             QDialog {
@@ -5840,7 +7396,7 @@ class MainWindow(QMainWindow):
 
     def file_status_header_text(self) -> str:
         project_text = "No project saved or loaded" if self.project_path is None else f"Project: {self.project_path}"
-        mesh_text = "No mesh loaded" if self.mesh_path is None else str(self.mesh_path)
+        mesh_text = "No placement mesh loaded" if self.mesh_path is None else f"Placement mesh: {self.mesh_path}"
         return "\n".join((project_text, mesh_text, self.measurement_source_text))
 
     def refresh_report_box(self) -> None:
@@ -5859,7 +7415,7 @@ class MainWindow(QMainWindow):
 
     def sync_point_picker_panel_mesh(self) -> None:
         if self.point_picker_panel is not None:
-            self.point_picker_panel.set_mesh(self.model_mesh, self.mesh_path)
+            self.point_picker_panel.set_mesh(self.pick_point_mesh, self.pick_point_mesh_path)
 
     def default_project_path(self) -> Path:
         if self.project_path is not None:
@@ -5964,7 +7520,7 @@ class MainWindow(QMainWindow):
                 ),
                 "viewer_font_size_offset": int(self.viewer_font_size_offset),
                 "active_tab": self.main_tabs.currentIndex() if self.main_tabs is not None else 0,
-                "auto_move_to_pivot": self.auto_move_to_pivot_checkbox.isChecked(),
+                "auto_move_to_pivot": self.auto_move_to_pivot_enabled(),
                 "show_stage": self.show_stage_checkbox.isChecked(),
                 "show_beam": self.show_beam_checkbox.isChecked(),
                 "show_gauge_volume": self.show_gauge_volume_checkbox.isChecked(),
@@ -6146,7 +7702,7 @@ class MainWindow(QMainWindow):
 
         checkbox_values = (
             (self.manual_placement_enabled_checkbox, manual_placement.get("enabled")),
-            (self.auto_move_to_pivot_checkbox, view.get("auto_move_to_pivot")),
+            (self.auto_move_to_pivot_action, view.get("auto_move_to_pivot")),
             (self.parallel_projection_checkbox, view.get("parallel_projection_enabled")),
             (self.show_stage_checkbox, view.get("show_stage")),
             (self.show_beam_checkbox, view.get("show_beam")),
@@ -6246,7 +7802,6 @@ class MainWindow(QMainWindow):
         self.update_placement_status()
         self.update_placement_summary_fields()
         self.invalidate_detector_map(update_scene=False)
-        self.sync_point_picker_panel_mesh()
         self.update_scene(reset_camera=True)
         if self.main_tabs is not None:
             active_tab = int(view.get("active_tab", 0))
@@ -6254,19 +7809,34 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Loaded project {path.name}", 5000)
 
     def load_csv(self, path: Path) -> None:
-        self.measurement_source_text = str(path)
-        self.measurement_table.setRowCount(0)
+        table_rows = []
         with path.open("r", newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
             if reader.fieldnames is None:
                 raise ValueError(f"{path.name} does not contain a CSV header.")
+            normalized_fieldnames = {name.strip().lower(): name for name in reader.fieldnames}
+            required = ("label", "model_x", "model_y", "model_z")
+            missing = [name for name in required if name not in normalized_fieldnames]
+            if missing:
+                raise ValueError(f"{path.name} is missing required columns: {', '.join(missing)}")
+            label_key = normalized_fieldnames["label"]
+            model_keys = [normalized_fieldnames[name] for name in ("model_x", "model_y", "model_z")]
+            stage_keys = [normalized_fieldnames.get(name) for name in ("stage_x", "stage_y", "stage_z")]
             for row in reader:
-                measurement = Measurement(
-                    label=row["label"].strip(),
-                    model_point=(float(row["model_x"]), float(row["model_y"]), float(row["model_z"])),
-                    stage_readout=(float(row["stage_x"]), float(row["stage_y"]), float(row["stage_z"])),
+                stage_readout = tuple(
+                    optional_decimal(row.get(key, "")) if key is not None else ""
+                    for key in stage_keys
                 )
-                self.add_measurement_row(measurement)
+                table_rows.append(
+                    (
+                        row[label_key].strip(),
+                        *(format_decimal(round_decimal(row[key])) for key in model_keys),
+                        *(format_decimal(value) if value != "" else "" for value in stage_readout),
+                    )
+                )
+
+        self.measurement_source_text = str(path)
+        self.populate_table_rows(self.measurement_table, table_rows)
         self.fit_transform = None
         self.residual_rows = []
         self.update_placement_status()
@@ -6299,26 +7869,28 @@ class MainWindow(QMainWindow):
         if not path_str:
             return
         try:
-            measurements = self.measurements_from_table()
             with Path(path_str).open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(
                     ["label", "model_x", "model_y", "model_z", "stage_x", "stage_y", "stage_z", "path_1", "path_2"]
                 )
-                for measurement in measurements:
-                    writer.writerow(
-                        [
-                            measurement.label,
-                            *measurement.model_point,
-                            *measurement.stage_readout,
-                        ]
-                    )
+                for row in range(self.measurement_table.rowCount()):
+                    values = []
+                    for column in range(self.measurement_table.columnCount()):
+                        item = self.measurement_table.item(row, column)
+                        text = "" if item is None else item.text().strip()
+                        if column != 0:
+                            text = format_table_value(text)
+                        values.append(text)
+                    if not any(values):
+                        continue
+                    writer.writerow([*values, "", ""])
             self.statusBar().showMessage(f"Saved measurements to {path_str}", 5000)
         except Exception as exc:
             self.show_error("Failed to save CSV", str(exc))
 
     def load_prediction_csv(self, path: Path) -> None:
-        self.prediction_table.setRowCount(0)
+        table_rows = []
         with path.open("r", newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
             if reader.fieldnames is None:
@@ -6337,14 +7909,22 @@ class MainWindow(QMainWindow):
                     value = row.get(key, "")
                     if value is None or value.strip() == "":
                         raise ValueError(f"Row {row_index + 2} is missing a model coordinate.")
-                    model_values.append(float(value))
-                self.add_prediction_row(
-                    label=label,
-                    model_point=model_values,
-                    stage_readout=("", "", ""),
-                    path_values=("", ""),
-                    uamp_values=("", ""),
+                    model_values.append(round_decimal(value))
+                table_rows.append(
+                    (
+                        label,
+                        *(format_decimal(value) for value in model_values),
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                    )
                 )
+
+        self.populate_table_rows(self.prediction_table, table_rows, self.prediction_table.read_only_columns)
         self.statusBar().showMessage(f"Loaded prediction points from {path.name}", 5000)
         self.update_scene(reset_camera=False)
 
@@ -6393,7 +7973,10 @@ class MainWindow(QMainWindow):
                     values = []
                     for column in range(self.prediction_table.columnCount()):
                         item = self.prediction_table.item(row, column)
-                        values.append("" if item is None else item.text().strip())
+                        text = "" if item is None else item.text().strip()
+                        if column != 0:
+                            text = format_table_value(text)
+                        values.append(text)
                     if not any(values):
                         continue
                     writer.writerow(values)
@@ -6416,11 +7999,37 @@ class MainWindow(QMainWindow):
         if self.main_tabs is None:
             return
         if self.point_picker_panel is not None:
-            self.point_picker_panel.set_mesh(self.model_mesh, self.mesh_path)
+            self.point_picker_panel.set_mesh(self.pick_point_mesh, self.pick_point_mesh_path)
         for index in range(self.main_tabs.count()):
             if self.main_tabs.tabText(index) == "Pick Point":
                 self.main_tabs.setCurrentIndex(index)
                 break
+
+    def load_pick_point_mesh_dialog(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load point-picking mesh",
+            str(Path.cwd()),
+            MESH_FILE_FILTER,
+        )
+        if not path_str:
+            return
+        self.load_pick_point_mesh(Path(path_str))
+
+    def load_pick_point_mesh(self, path: Path) -> None:
+        try:
+            self.pick_point_mesh = load_mesh_as_polydata(path)
+            self.pick_point_mesh_path = path
+            self.sync_point_picker_panel_mesh()
+            self.statusBar().showMessage(f"Loaded point-picking mesh {path.name}", 5000)
+        except Exception as exc:
+            self.show_error("Failed to load point-picking mesh", str(exc))
+
+    def clear_pick_point_mesh(self) -> None:
+        self.pick_point_mesh_path = None
+        self.pick_point_mesh = None
+        self.sync_point_picker_panel_mesh()
+        self.statusBar().showMessage("Cleared point-picking mesh", 5000)
 
     def load_mesh(self, path: Path) -> None:
         try:
@@ -6429,7 +8038,6 @@ class MainWindow(QMainWindow):
             self.refresh_report_box()
             self.invalidate_detector_map(update_scene=False)
             self.update_placement_status()
-            self.sync_point_picker_panel_mesh()
             self.statusBar().showMessage(f"Loaded mesh {path.name}", 5000)
             self.update_scene(reset_camera=True)
         except Exception as exc:
@@ -6441,7 +8049,6 @@ class MainWindow(QMainWindow):
         self.refresh_report_box()
         self.invalidate_detector_map(update_scene=False)
         self.update_placement_status()
-        self.sync_point_picker_panel_mesh()
         self.update_scene(reset_camera=False)
 
     def fit_placement(self) -> None:
@@ -6923,7 +8530,7 @@ class MainWindow(QMainWindow):
             stage_readout=(float(values[4]), float(values[5]), float(values[6])),
         )
 
-    def selected_prediction_row(self) -> Optional[Tuple[str, np.ndarray]]:
+    def selected_prediction_row(self, strict: bool = False) -> Optional[Tuple[str, np.ndarray]]:
         row = self.selected_prediction_index()
         if row is None:
             return None
@@ -6935,8 +8542,15 @@ class MainWindow(QMainWindow):
             item = self.prediction_table.item(row, column)
             text = "" if item is None else item.text().strip()
             if text == "":
+                if not strict:
+                    return None
                 raise ValueError("The selected prediction row is missing model coordinates.")
-            model_values.append(float(text))
+            try:
+                model_values.append(float(text))
+            except ValueError as exc:
+                if not strict:
+                    return None
+                raise ValueError("The selected prediction row contains an invalid model coordinate.") from exc
         return label, np.array(model_values, dtype=float)
 
     def move_model_point_to_pivot(self, model_point: np.ndarray, label: str) -> None:
@@ -6971,7 +8585,7 @@ class MainWindow(QMainWindow):
 
     def move_selected_prediction_point_to_pivot(self, show_error: bool = True) -> None:
         try:
-            prediction_row = self.selected_prediction_row()
+            prediction_row = self.selected_prediction_row(strict=True)
             if prediction_row is None:
                 raise ValueError("Select a prediction row first.")
             label, model_point = prediction_row
@@ -7155,8 +8769,6 @@ class MainWindow(QMainWindow):
             dtype=float,
         )
         detector_points = np.zeros((len(horizontal_angles_deg), len(vertical_angles_deg), 3), dtype=float)
-        all_segments: List[Tuple[np.ndarray, np.ndarray]] = []
-
         for h_index, horizontal_scale in enumerate(horizontal_scales):
             for v_index, vertical_scale in enumerate(vertical_scales):
                 ray_direction = normalized(center_direction + horizontal_scale * right + vertical_scale * up)
@@ -7180,7 +8792,6 @@ class MainWindow(QMainWindow):
                     collect_segments=False,
                 )
                 path_map[h_index, v_index] += path_length
-                all_segments.extend(segments)
 
         detector_map_mesh = pv.StructuredGrid(
             detector_points[..., 0],
@@ -7203,7 +8814,6 @@ class MainWindow(QMainWindow):
             "average_length": average_length,
             "incoming_path_length": incoming_path_length,
             "interval_deg": float(DIFFRACTION_ANGLE_INTERVAL_DEG),
-            "segments": all_segments,
             "stage_pose": stage_pose_info,
         }
 
@@ -7339,7 +8949,11 @@ class MainWindow(QMainWindow):
         if new_offset == self.viewer_font_size_offset:
             return
         self.viewer_font_size_offset = new_offset
-        self.statusBar().showMessage(f"Viewer font size {self.viewer_font_size(16)}", 3000)
+        current_size = self.viewer_font_size(gui_like_label_font_size(self))
+        self.statusBar().showMessage(
+            f"Viewer label font offset {self.viewer_font_size_offset:+d}; current size {current_size}",
+            3000,
+        )
         self.update_scene(reset_camera=False)
 
     def eventFilter(self, watched, event) -> bool:
@@ -7535,6 +9149,23 @@ class MainWindow(QMainWindow):
             was_blocked = button.blockSignals(True)
             button.setChecked(preset == self.camera_preset)
             button.blockSignals(was_blocked)
+
+    def sync_interaction_button_states(self) -> None:
+        for mode, button in self.interaction_buttons.items():
+            was_blocked = button.blockSignals(True)
+            button.setChecked(mode == self.interaction_mode)
+            button.blockSignals(was_blocked)
+
+    def set_interaction_mode(self, mode: str) -> None:
+        if self.plotter is None:
+            return
+        if mode == "pan":
+            self.plotter.enable_2d_style()
+        else:
+            mode = "rotate"
+            self.plotter.enable_trackball_style()
+        self.interaction_mode = mode
+        self.sync_interaction_button_states()
 
     def update_scene(self, reset_camera: bool = False) -> None:
         if not self.enable_3d or self.plotter is None:
@@ -7931,7 +9562,7 @@ class MainWindow(QMainWindow):
             self.plotter.add_point_labels(
                 pv.PolyData(np.array([direct_detector_center], dtype=float)),
                 ["Imaging detector"],
-                font_size=self.viewer_font_size(max(gui_like_label_font_size(self) - 1, 14)),
+                font_size=self.viewer_font_size(gui_like_label_font_size(self) - 1),
                 shape=None,
                 text_color="#9a0000",
                 always_visible=True,
@@ -7983,7 +9614,7 @@ class MainWindow(QMainWindow):
             self.plotter.add_point_labels(
                 pv.PolyData(np.array([diffraction_bank_1_geometry["center"]], dtype=float)),
                 ["Diffraction detector - bank 1"],
-                font_size=self.viewer_font_size(max(gui_like_label_font_size(self) - 1, 14)),
+                font_size=self.viewer_font_size(gui_like_label_font_size(self) - 1),
                 shape=None,
                 text_color="#9a5400",
                 always_visible=True,
@@ -8005,7 +9636,7 @@ class MainWindow(QMainWindow):
             self.plotter.add_point_labels(
                 pv.PolyData(np.array([diffraction_bank_2_geometry["center"]], dtype=float)),
                 ["Diffraction detector - bank 2"],
-                font_size=self.viewer_font_size(max(gui_like_label_font_size(self) - 1, 14)),
+                font_size=self.viewer_font_size(gui_like_label_font_size(self) - 1),
                 shape=None,
                 text_color="#12407a",
                 always_visible=True,
@@ -8361,7 +9992,7 @@ class MainWindow(QMainWindow):
                 omega_deg,
                 pivot,
             )[0]
-            model_rotation_world = np.array(rotation_z_deg(omega_deg), dtype=float) @ np.asarray(
+            model_rotation_world = np.array(rotation_z_deg(-omega_deg), dtype=float) @ np.asarray(
                 rotation_model_to_stage,
                 dtype=float,
             )
@@ -8405,7 +10036,7 @@ class MainWindow(QMainWindow):
                     self.model_axes_actor.GetZAxisCaptionActor2D(),
                 ):
                     text_property = caption_actor.GetCaptionTextProperty()
-                    text_property.SetFontSize(self.viewer_font_size(12))
+                    text_property.SetFontSize(self.viewer_font_size(gui_like_label_font_size(self)))
                 self.model_axes_actor.SetTotalLength(triad_length, triad_length, triad_length)
                 transform = vtkTransform()
                 transform.PostMultiply()
@@ -8434,19 +10065,21 @@ class MainWindow(QMainWindow):
         )
         beam_inside_segments: List[Tuple[np.ndarray, np.ndarray]] = []
         if self.model_world_mesh is not None and self.model_world_mesh.n_points > 0:
-            _beam_path_length, beam_inside_segments = compute_line_beam_path(
+            signed_distance_evaluator = build_mesh_signed_distance_evaluator(self.model_world_mesh)
+            _beam_path_length, beam_inside_segments = compute_segment_path_length(
                 self.model_world_mesh,
                 slit_origin,
-                beam_direction,
-                beam_trace_distance,
+                slit_origin + beam_direction * beam_trace_distance,
+                signed_distance_evaluator=signed_distance_evaluator,
             )
-        if show_imaging_detector and show_path_lengths:
+        if show_path_lengths:
             self.set_or_add_mesh(
                 "beam_inside_mesh",
                 make_multi_line_polydata(beam_inside_segments),
                 "beam_inside",
                 color="#dc2626",
                 line_width=6,
+                render_lines_as_tubes=True,
             )
         elif self.beam_inside_mesh is not None:
             self.plotter.remove_actor("beam_inside", render=False)
@@ -8454,8 +10087,7 @@ class MainWindow(QMainWindow):
 
         live_diffraction_bank_states = None
         if (
-            show_diffraction_detectors
-            and show_path_lengths
+            show_path_lengths
             and self.model_world_mesh is not None
             and self.model_world_mesh.n_points > 0
         ):
@@ -8467,7 +10099,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 live_diffraction_bank_states = None
         self._update_diffraction_path_visuals(
-            show_diffraction_detectors and show_path_lengths,
+            show_path_lengths,
             pivot,
             slit_origin,
             (

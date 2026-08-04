@@ -195,6 +195,7 @@ class PeakComponentResult:
     eta: float
     centre_uncertainty: Optional[float] = None
     fwhm_uncertainty: Optional[float] = None
+    reflection: Optional[Reflection] = None
 
 
 @dataclass(frozen=True)
@@ -214,6 +215,7 @@ class PeakFitResult:
     fit_x: Optional[np.ndarray] = None
     fit_y: Optional[np.ndarray] = None
     observed_y: Optional[np.ndarray] = None
+    fit_uncertainty: Optional[np.ndarray] = None
 
 
 @dataclass(frozen=True)
@@ -238,6 +240,9 @@ class PawleyFitResult:
     fit_x: Optional[np.ndarray] = None
     fit_y: Optional[np.ndarray] = None
     observed_y: Optional[np.ndarray] = None
+    fit_uncertainty: Optional[np.ndarray] = None
+    lattice_parameters: Mapping[str, float] = field(default_factory=dict)
+    lattice_parameter_uncertainties: Mapping[str, Optional[float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -247,7 +252,11 @@ class FittingSettings:
     pattern_profile_key: str = "gsas_tof"
     polynomial_order: int = 2
     use_uncertainties: bool = True
-    max_evaluations: int = 50000
+    max_evaluations: int = 1000
+    batch_timeout_seconds: int = 10
+    gsas_min_delta_chi_square: float = 0.0001
+    batch_stagnation_iterations: int = 25
+    batch_stagnation_relative_improvement: float = 0.0001
     pseudo_voigt_eta_initial: float = 0.5
     pseudo_voigt_eta_min: float = 0.0
     pseudo_voigt_eta_max: float = 1.0
@@ -260,7 +269,7 @@ class FittingSettings:
     pawley_eta_max: float = 1.0
     pawley_fwhm_min_fraction: float = 0.0001
     pawley_fwhm_max_fraction: float = 0.5
-    pawley_width_model: str = PAWLEY_WIDTH_CONSTANT
+    pawley_width_model: str = PAWLEY_WIDTH_D_RESOLUTION
 
 
 @dataclass(frozen=True)

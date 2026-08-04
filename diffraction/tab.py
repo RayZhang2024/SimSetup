@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import csv
+import json
+import os
+import pickle
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QAction,
@@ -20,11 +29,16 @@ from PyQt5.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMenuBar,
     QMessageBox,
     QPushButton,
+    QProgressBar,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -36,6 +50,15 @@ from PyQt5.QtWidgets import (
 )
 
 from .calibration import OPENGENIE_CALIBRATION_TOF_MAX, OPENGENIE_CALIBRATION_TOF_MIN, refine_ceo2_calibration
+from .convergence import fitting_settings_min_dm_over_m
+from .batch_fitting import (
+    SpectrumFitRecord,
+    SpectrumFitRequest,
+    expected_phase_reflections,
+    fit_spectrum,
+    position_to_d_spacing,
+    width_to_d_spacing,
+)
 from .fitting import fit_peak_profile
 from .gsas_exp import parse_gsas_exp
 from .importers import load_focused_spectrum
@@ -56,6 +79,7 @@ from .models import (
     tof_to_d,
 )
 from .normalization import apply_vanadium_normalization
+from .profile_metadata import calibration_profile_metadata, initial_profile_parameters_from_metadata
 from .pawley import fit_pawley
 from .profiles import PEAK_PROFILE_SPECS, PROFILE_EXP_VOIGT, PROFILE_GSAS_TOF, is_gsas_tof_profile
 
@@ -72,20 +96,158 @@ except Exception:  # pragma: no cover - exercised only when optional dependency 
 
 
 RESULT_HEADERS = [
-    "Peak function",
-    "Scope / method",
     "Source",
-    "Run",
-    "Bank",
-    "Axis",
-    "Range min",
-    "Range max",
     "Lattice a",
     "Lattice a unc",
     "Chi2",
     "Rwp %",
+    "Status",
+    "Error",
+    "Lattice b",
+    "Lattice b unc",
+    "Lattice c",
+    "Lattice c unc",
 ]
 PEAK_RESULT_FIELD_HEADERS = ("d", "d unc", "FWHM d", "FWHM d unc", "Height", "Area", "Eta")
+
+
+class BatchFitWorker(QObject):
+    started_spectrum = pyqtSignal(int, int, str)
+    result_ready = pyqtSignal(object)
+    partial_ready = pyqtSignal(int, str, object)
+    failed = pyqtSignal(int, str)
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(bool)
+
+    def __init__(
+        self,
+        requests: list[SpectrumFitRequest],
+        cancel_event: threading.Event,
+        use_processes: bool = True,
+    ) -> None:
+        super().__init__()
+        self.requests = requests
+        self.cancel_event = cancel_event
+        self.use_processes = bool(use_processes)
+
+    @staticmethod
+    def _stop_process(process) -> None:
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=0.5)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+        finally:
+            stdout = getattr(process, "stdout", None)
+            if stdout is not None:
+                try:
+                    stdout.close()
+                except OSError:
+                    pass
+
+    def _run_isolated_fit(self, request: SpectrumFitRequest, deadline: float) -> tuple[str, object]:
+        process = None
+        with tempfile.TemporaryDirectory(prefix="simsetup-diffraction-fit-") as directory:
+            request_path = Path(directory) / "request.pkl"
+            result_path = Path(directory) / "result.pkl"
+            checkpoint_path = Path(directory) / "checkpoint.pkl"
+            with request_path.open("wb") as handle:
+                pickle.dump(request, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            environment = dict(os.environ)
+            for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+                environment[name] = "1"
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            try:
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "diffraction.fit_worker",
+                        str(request_path),
+                        str(result_path),
+                        str(checkpoint_path),
+                    ],
+                    cwd=str(Path(__file__).resolve().parents[1]),
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    creationflags=creation_flags,
+                )
+                while process.poll() is None:
+                    if self.cancel_event.wait(0.02):
+                        self._stop_process(process)
+                        return "cancelled", "Batch fitting cancelled."
+                    if time.monotonic() >= deadline:
+                        self._stop_process(process)
+                        message = f"Fit timed out after {request.settings.batch_timeout_seconds} seconds."
+                        if checkpoint_path.exists():
+                            with checkpoint_path.open("rb") as handle:
+                                return "partial", (message, pickle.load(handle))
+                        return "error", message
+                output, _unused = process.communicate(timeout=0.5)
+                if result_path.exists():
+                    with result_path.open("rb") as handle:
+                        status, payload = pickle.load(handle)
+                    if status == "error" and checkpoint_path.exists():
+                        with checkpoint_path.open("rb") as handle:
+                            return "partial", (str(payload), pickle.load(handle))
+                    return str(status), payload
+                output = str(output or "").strip()
+                detail = f": {output[-500:]}" if output else ""
+                return "error", f"Fit process exited with code {process.returncode}{detail}"
+            except Exception as exc:
+                self._stop_process(process)
+                return "error", f"Could not run isolated fit: {exc}"
+
+    def run(self) -> None:
+        total = len(self.requests)
+        completed = 0
+        for request in self.requests:
+            if self.cancel_event.is_set():
+                break
+            self.started_spectrum.emit(completed + 1, total, request.spectrum.source_path.name)
+            timeout_seconds = max(5, int(request.settings.batch_timeout_seconds))
+            deadline = time.monotonic() + timeout_seconds
+
+            def abort_check() -> Optional[str]:
+                if self.cancel_event.is_set():
+                    return "Batch fitting cancelled."
+                if time.monotonic() >= deadline:
+                    return f"Fit timed out after {timeout_seconds} seconds."
+                return None
+
+            try:
+                if self.use_processes:
+                    status, payload = self._run_isolated_fit(request, deadline)
+                    if status == "cancelled":
+                        break
+                    if status == "error":
+                        self.failed.emit(request.spectrum_index, str(payload))
+                    elif status == "partial":
+                        message, curve_payload = payload
+                        self.partial_ready.emit(request.spectrum_index, str(message), curve_payload)
+                    else:
+                        self.result_ready.emit(payload)
+                else:
+                    self.result_ready.emit(
+                        fit_spectrum(request, abort_check=abort_check, use_gsas_convergence=True)
+                    )
+            except Exception as exc:
+                if not self.cancel_event.is_set():
+                    self.failed.emit(request.spectrum_index, str(exc))
+            completed += 1
+            self.progress.emit(completed, total)
+        self.finished.emit(self.cancel_event.is_set())
 
 
 def _populate_fit_scope_combo(combo: QComboBox) -> None:
@@ -103,6 +265,18 @@ def _populate_pawley_width_model_combo(combo: QComboBox) -> None:
     combo.addItem("d-dependent resolution", PAWLEY_WIDTH_D_RESOLUTION)
 
 
+def _resize_dialog_to_available_screen(dialog: QDialog, preferred_width: int, preferred_height: int) -> None:
+    screen = QApplication.primaryScreen()
+    if screen is None:
+        dialog.resize(preferred_width, preferred_height)
+        return
+    available = screen.availableGeometry()
+    dialog.resize(
+        min(int(preferred_width), max(1, available.width() - 80)),
+        min(int(preferred_height), max(1, available.height() - 80)),
+    )
+
+
 class CalibrationDialog(QDialog):
     def __init__(self, diffraction_tab: "DiffractionTab") -> None:
         super().__init__(diffraction_tab)
@@ -110,7 +284,10 @@ class CalibrationDialog(QDialog):
         self.setWindowTitle("Calibration")
         self.setModal(True)
 
-        layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(8, 8, 8, 8)
+        content = QWidget(self)
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
@@ -180,6 +357,12 @@ class CalibrationDialog(QDialog):
         form.setColumnStretch(1, 1)
         layout.addLayout(form)
 
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll, stretch=1)
+
         buttons = QHBoxLayout()
         self.run_button = QPushButton("Run calibration + normalization")
         self.run_button.clicked.connect(self.run_calibration)
@@ -188,9 +371,10 @@ class CalibrationDialog(QDialog):
         buttons.addWidget(self.run_button)
         buttons.addStretch(1)
         buttons.addWidget(self.close_button)
-        layout.addLayout(buttons)
+        outer_layout.addLayout(buttons)
 
         self.refresh()
+        _resize_dialog_to_available_screen(self, 680, 620)
 
     def load_open_beam(self) -> None:
         self.diffraction_tab.load_vanadium_spectrum_dialog()
@@ -239,7 +423,10 @@ class FittingSettingsDialog(QDialog):
         self.setModal(True)
 
         settings = diffraction_tab.fitting_settings
-        layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(8, 8, 8, 8)
+        content = QWidget(self)
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
@@ -247,12 +434,14 @@ class FittingSettingsDialog(QDialog):
         self.fit_scope_combo = QComboBox()
         _populate_fit_scope_combo(self.fit_scope_combo)
         self._set_combo_data(self.fit_scope_combo, settings.fit_scope)
-        self.peak_profile_combo = QComboBox()
-        _populate_profile_combo(self.peak_profile_combo)
-        self._set_combo_data(self.peak_profile_combo, settings.peak_profile_key)
-        self.pattern_profile_combo = QComboBox()
-        _populate_profile_combo(self.pattern_profile_combo)
-        self._set_combo_data(self.pattern_profile_combo, settings.pattern_profile_key)
+        self.profile_combo = QComboBox()
+        _populate_profile_combo(self.profile_combo)
+        initial_profile_key = (
+            settings.pattern_profile_key
+            if settings.fit_scope == FIT_SCOPE_PATTERN
+            else settings.peak_profile_key
+        )
+        self._set_combo_data(self.profile_combo, initial_profile_key)
         self.background_order_spin = QSpinBox()
         self.background_order_spin.setRange(0, 5)
         self.background_order_spin.setValue(settings.polynomial_order)
@@ -262,12 +451,27 @@ class FittingSettingsDialog(QDialog):
         self.max_evaluations_spin.setRange(100, 1_000_000)
         self.max_evaluations_spin.setSingleStep(1000)
         self.max_evaluations_spin.setValue(settings.max_evaluations)
+        self.batch_timeout_spin = QSpinBox()
+        self.batch_timeout_spin.setRange(5, 3600)
+        self.batch_timeout_spin.setSuffix(" s")
+        self.batch_timeout_spin.setValue(settings.batch_timeout_seconds)
+        self.batch_stagnation_iterations_spin = QSpinBox()
+        self.batch_stagnation_iterations_spin.setRange(0, 500)
+        self.batch_stagnation_iterations_spin.setSpecialValueText("Unused")
+        self.batch_stagnation_iterations_spin.setValue(settings.batch_stagnation_iterations)
+        self.batch_stagnation_improvement_spin = self._make_double_spin(
+            0.0, 0.1, 0.0001, fitting_settings_min_dm_over_m(settings), 6
+        )
         model_form.addRow("Fit scope", self.fit_scope_combo)
-        model_form.addRow("Single peak function", self.peak_profile_combo)
-        model_form.addRow("Whole pattern function", self.pattern_profile_combo)
+        model_form.addRow("Peak profile function", self.profile_combo)
         model_form.addRow("Background order", self.background_order_spin)
         model_form.addRow("Use uncertainties", self.use_uncertainties_check)
-        model_form.addRow("Max evaluations", self.max_evaluations_spin)
+        model_form.addRow("Max evaluations / cycles", self.max_evaluations_spin)
+        model_form.addRow("Fit timeout / spectrum", self.batch_timeout_spin)
+        self.batch_stagnation_improvement_spin.setToolTip(
+            "GSAS-II-style min dM/M. The optimizer stops successfully when relative chi-square improvement falls below this value."
+        )
+        model_form.addRow("GSAS-II min dM/M", self.batch_stagnation_improvement_spin)
         layout.addLayout(model_form)
 
         range_form = QGridLayout()
@@ -331,7 +535,13 @@ class FittingSettingsDialog(QDialog):
         apply_button = self.button_box.button(QDialogButtonBox.Apply)
         if apply_button is not None:
             apply_button.clicked.connect(self.apply_settings)
-        layout.addWidget(self.button_box)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll, stretch=1)
+        outer_layout.addWidget(self.button_box)
+        _resize_dialog_to_available_screen(self, 680, 760)
 
     def _make_double_spin(self, minimum: float, maximum: float, step: float, value: float, decimals: int) -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
@@ -365,13 +575,18 @@ class FittingSettingsDialog(QDialog):
         self.range_max_edit.clear()
 
     def _settings_from_controls(self) -> FittingSettings:
+        profile_key = str(self.profile_combo.currentData() or PROFILE_EXP_VOIGT)
         return FittingSettings(
             fit_scope=str(self.fit_scope_combo.currentData() or FIT_SCOPE_PEAK),
-            peak_profile_key=str(self.peak_profile_combo.currentData() or PROFILE_EXP_VOIGT),
-            pattern_profile_key=str(self.pattern_profile_combo.currentData() or PROFILE_GSAS_TOF),
+            peak_profile_key=profile_key,
+            pattern_profile_key=profile_key,
             polynomial_order=int(self.background_order_spin.value()),
             use_uncertainties=self.use_uncertainties_check.isChecked(),
             max_evaluations=int(self.max_evaluations_spin.value()),
+            batch_timeout_seconds=int(self.batch_timeout_spin.value()),
+            gsas_min_delta_chi_square=float(self.batch_stagnation_improvement_spin.value()),
+            batch_stagnation_iterations=int(self.batch_stagnation_iterations_spin.value()),
+            batch_stagnation_relative_improvement=float(self.batch_stagnation_improvement_spin.value()),
             pseudo_voigt_eta_initial=float(self.pv_eta_initial_spin.value()),
             pseudo_voigt_eta_min=float(self.pv_eta_min_spin.value()),
             pseudo_voigt_eta_max=float(self.pv_eta_max_spin.value()),
@@ -384,7 +599,7 @@ class FittingSettingsDialog(QDialog):
             pawley_eta_max=float(self.pawley_eta_max_spin.value()),
             pawley_fwhm_min_fraction=float(self.pawley_fwhm_min_fraction_spin.value()),
             pawley_fwhm_max_fraction=float(self.pawley_fwhm_max_fraction_spin.value()),
-            pawley_width_model=str(self.pawley_width_model_combo.currentData() or PAWLEY_WIDTH_CONSTANT),
+            pawley_width_model=str(self.pawley_width_model_combo.currentData() or PAWLEY_WIDTH_D_RESOLUTION),
         )
 
     def apply_settings(self) -> None:
@@ -415,6 +630,17 @@ class DiffractionTab(QWidget):
         self.calibration_result: Optional[CalibrationResult] = None
         self.fitting_settings = FittingSettings()
         self.latest_fit_curve: Optional[dict[str, object]] = None
+        self.fit_records_by_row: dict[int, SpectrumFitRecord] = {}
+        self.fit_records_by_spectrum: dict[tuple[int, str, str], SpectrumFitRecord] = {}
+        self.fit_curve_payloads_by_row: dict[int, dict[str, object]] = {}
+        self.fit_curve_payloads_by_spectrum: dict[tuple[int, str, str], dict[str, object]] = {}
+        self._result_selection_update = False
+        self._batch_thread: Optional[QThread] = None
+        self._batch_worker: Optional[BatchFitWorker] = None
+        self._batch_process_isolation = True
+        self._batch_cancel_event: Optional[threading.Event] = None
+        self._batch_range: Optional[tuple[float, float]] = None
+        self._batch_completed_count = 0
         self._span_selector = None
         self._build_ui()
         self._load_default_phase()
@@ -432,6 +658,7 @@ class DiffractionTab(QWidget):
             return
 
         controls = QFrame(self)
+        self.controls_panel = controls
         controls.setFrameShape(QFrame.StyledPanel)
         controls.setMinimumWidth(300)
         controls.setMaximumWidth(380)
@@ -442,6 +669,8 @@ class DiffractionTab(QWidget):
 
         self.load_button = QPushButton("Load spectrum")
         self.load_button.clicked.connect(self.load_spectrum_dialog)
+        self.remove_spectra_button = QPushButton("Remove spectrum(s)")
+        self.remove_spectra_button.clicked.connect(self.remove_spectra_dialog)
         self.calibration_button = QPushButton("Calibration")
         self.calibration_button.clicked.connect(self.open_calibration_dialog)
         self.calibration_status_edit = QLineEdit()
@@ -479,8 +708,22 @@ class DiffractionTab(QWidget):
         self.y_view_max_edit.returnPressed.connect(self.update_plot)
         self.fit_button = QPushButton("Fit selected range")
         self.fit_button.clicked.connect(self.fit_selected_range)
+        self.batch_scope_combo = QComboBox()
+        self.batch_scope_combo.addItem("Current spectrum", "current")
+        self.batch_scope_combo.addItem("All loaded spectra", "all")
+        self.batch_fit_button = QPushButton("Fit batch")
+        self.batch_fit_button.clicked.connect(self.fit_batch)
+        self.cancel_batch_button = QPushButton("Cancel batch")
+        self.cancel_batch_button.clicked.connect(self.cancel_batch_fit)
+        self.cancel_batch_button.setEnabled(False)
+        self.batch_progress = QProgressBar()
+        self.batch_progress.setRange(0, 1)
+        self.batch_progress.setValue(0)
+        self.batch_progress.setTextVisible(True)
         self.export_button = QPushButton("Export results")
         self.export_button.clicked.connect(self.export_results_dialog)
+        self.clear_results_button = QPushButton("Clear fitting results")
+        self.clear_results_button.clicked.connect(self.clear_fitting_results)
         self._configure_view_limit_edits()
         self.menu_bar = self._build_menu_bar()
 
@@ -488,7 +731,13 @@ class DiffractionTab(QWidget):
         controls_layout.addWidget(self.calibration_status_edit, 0, 1)
         controls_layout.addWidget(self.phase_button, 1, 0)
         controls_layout.addWidget(self.phase_status_edit, 1, 1)
-        controls_layout.addWidget(self.load_button, 2, 0, 1, 2)
+        load_buttons = QWidget()
+        load_buttons_layout = QHBoxLayout(load_buttons)
+        load_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        load_buttons_layout.setSpacing(6)
+        load_buttons_layout.addWidget(self.load_button)
+        load_buttons_layout.addWidget(self.remove_spectra_button)
+        controls_layout.addWidget(load_buttons, 2, 0, 1, 2)
         controls_layout.addWidget(QLabel("Spectrum"), 3, 0)
         controls_layout.addWidget(self.spectrum_combo, 3, 1)
         controls_layout.addWidget(QLabel("Axis"), 4, 0)
@@ -504,15 +753,30 @@ class DiffractionTab(QWidget):
         controls_layout.addWidget(QLabel("Range max"), 9, 0)
         controls_layout.addWidget(self.range_max_edit, 9, 1)
         controls_layout.addWidget(self.fit_button, 10, 0, 1, 2)
-        controls_layout.addWidget(self.export_button, 11, 0, 1, 2)
+        controls_layout.addWidget(QLabel("Batch selection"), 11, 0)
+        controls_layout.addWidget(self.batch_scope_combo, 11, 1)
+        controls_layout.addWidget(self.batch_fit_button, 12, 0)
+        controls_layout.addWidget(self.cancel_batch_button, 12, 1)
+        controls_layout.addWidget(self.batch_progress, 13, 0, 1, 2)
+        controls_layout.addWidget(self.export_button, 14, 0, 1, 2)
+        controls_layout.addWidget(self.clear_results_button, 15, 0, 1, 2)
+        details_label = QLabel("Result details")
+        self.result_details_edit = QTextEdit()
+        self.result_details_edit.setReadOnly(True)
+        self.result_details_edit.setMinimumHeight(120)
+        self.result_details_edit.setPlaceholderText("Select a result row to view fit details.")
+        controls_layout.addWidget(details_label, 16, 0, 1, 2)
+        controls_layout.addWidget(self.result_details_edit, 17, 0, 1, 2)
         controls_layout.setColumnStretch(1, 1)
-        controls_layout.setRowStretch(12, 1)
+        controls_layout.setRowStretch(17, 1)
 
-        splitter = QSplitter(Qt.Vertical)
-        splitter.setChildrenCollapsible(False)
-        top_splitter = QSplitter(Qt.Horizontal)
-        top_splitter.setChildrenCollapsible(False)
-        top_splitter.addWidget(controls)
+        main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter = main_splitter
+        main_splitter.setChildrenCollapsible(False)
+        main_splitter.addWidget(controls)
+        right_splitter = QSplitter(Qt.Vertical)
+        self.results_splitter = right_splitter
+        right_splitter.setChildrenCollapsible(False)
 
         self.figure = Figure(figsize=(8, 5))
         self.canvas = FigureCanvas(self.figure)
@@ -528,36 +792,24 @@ class DiffractionTab(QWidget):
         if self.toolbar is not None:
             plot_layout.addWidget(self.toolbar)
         plot_layout.addWidget(self.canvas)
-        top_splitter.addWidget(plot_panel)
-        top_splitter.setStretchFactor(0, 0)
-        top_splitter.setStretchFactor(1, 1)
-        splitter.addWidget(top_splitter)
+        right_splitter.addWidget(plot_panel)
 
         self._peak_result_column_count = 0
+        self._peak_result_labels: list[str] = []
         self.results_table = QTableWidget(0, len(RESULT_HEADERS))
         self.results_table.setHorizontalHeaderLabels(RESULT_HEADERS)
         self.results_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.results_table.setAlternatingRowColors(True)
         self.results_table.setWordWrap(False)
         self.results_table.itemSelectionChanged.connect(self._update_selected_result_details)
-        splitter.addWidget(self.results_table)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
-        layout.addWidget(splitter, stretch=1)
-
-        details_frame = QFrame(self)
-        details_layout = QVBoxLayout(details_frame)
-        details_layout.setContentsMargins(0, 0, 0, 0)
-        details_layout.setSpacing(3)
-        details_label = QLabel("Result details")
-        self.result_details_edit = QTextEdit()
-        self.result_details_edit.setReadOnly(True)
-        self.result_details_edit.setMinimumHeight(72)
-        self.result_details_edit.setMaximumHeight(140)
-        self.result_details_edit.setPlaceholderText("Select a result row to view fit details.")
-        details_layout.addWidget(details_label)
-        details_layout.addWidget(self.result_details_edit)
-        layout.addWidget(details_frame)
+        self._update_lattice_column_visibility()
+        right_splitter.addWidget(self.results_table)
+        right_splitter.setStretchFactor(0, 3)
+        right_splitter.setStretchFactor(1, 1)
+        main_splitter.addWidget(right_splitter)
+        main_splitter.setStretchFactor(0, 0)
+        main_splitter.setStretchFactor(1, 1)
+        layout.addWidget(main_splitter, stretch=1)
 
         status_frame = QFrame(self)
         status_layout = QHBoxLayout(status_frame)
@@ -589,9 +841,11 @@ class DiffractionTab(QWidget):
 
         file_menu = menu_bar.addMenu("File")
         self._add_menu_action(file_menu, "Load Spectrum", self.load_spectrum_dialog)
+        self._add_menu_action(file_menu, "Remove Spectrum(s)", self.remove_spectra_dialog)
         self._add_menu_action(file_menu, "Load Phase", self.load_phase_dialog)
         file_menu.addSeparator()
         self._add_menu_action(file_menu, "Export Results", self.export_results_dialog)
+        self._add_menu_action(file_menu, "Export Selected Fit Curve", self.export_selected_curve_dialog)
 
         calibration_menu = menu_bar.addMenu("Calibration")
         self._add_menu_action(calibration_menu, "Open Calibration Dialog", self.open_calibration_dialog)
@@ -612,6 +866,9 @@ class DiffractionTab(QWidget):
         fit_menu = menu_bar.addMenu("Fit")
         self._add_menu_action(fit_menu, "Fitting Settings...", self.open_fitting_settings_dialog)
         self._add_menu_action(fit_menu, "Fit Selected Range", self.fit_selected_range)
+        self._add_menu_action(fit_menu, "Fit Batch", self.fit_batch)
+        fit_menu.addSeparator()
+        self._add_menu_action(fit_menu, "Clear Fitting Results", self.clear_fitting_results)
 
         about_menu = menu_bar.addMenu("About")
         self._add_menu_action(about_menu, "About Diffraction", self.show_about_dialog)
@@ -782,6 +1039,7 @@ class DiffractionTab(QWidget):
             return spectrum
         if spectrum.bank_number is not None and result.bank_number is not None and spectrum.bank_number != result.bank_number:
             return spectrum
+        profile_metadata = calibration_profile_metadata(result)
         return spectrum_with_calibration(
             spectrum,
             result.calibration,
@@ -793,7 +1051,7 @@ class DiffractionTab(QWidget):
                 "single_peak_calibration_difc": result.single_peak_calibration.difc,
                 "single_peak_calibration_tzero": result.single_peak_calibration.tzero,
                 "single_peak_calibration_rms_tof": result.single_peak_rms_residual_tof,
-                "pattern_calibration_profile": result.pattern_fit.profile_name if result.pattern_fit is not None else "",
+                **profile_metadata,
             },
         )
 
@@ -843,6 +1101,103 @@ class DiffractionTab(QWidget):
                 self._set_status(f"Loaded {last_loaded_name}.")
             self.update_plot()
 
+    def remove_spectra_dialog(self) -> None:
+        if self._batch_thread is not None:
+            self._set_status("Cancel the active batch before removing spectra.")
+            return
+        if not self.spectra:
+            self._set_status("No loaded spectra to remove.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Remove loaded spectra")
+        layout = QVBoxLayout(dialog)
+        label = QLabel("Select one or more loaded spectra to remove.")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QAbstractItemView.MultiSelection)
+        current_index = self.spectrum_combo.currentIndex()
+        for index, spectrum in enumerate(self.spectra):
+            text = self.spectrum_combo.itemText(index) or spectrum.source_path.name
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, index)
+            list_widget.addItem(item)
+            if index == current_index:
+                item.setSelected(True)
+        layout.addWidget(list_widget)
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.button(QDialogButtonBox.Ok).setText("Remove selected")
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        _resize_dialog_to_available_screen(dialog, 420, 360)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        indices = [
+            int(item.data(Qt.UserRole))
+            for item in list_widget.selectedItems()
+            if item.data(Qt.UserRole) is not None
+        ]
+        if not indices:
+            self._set_status("No spectra selected for removal.")
+            return
+        self.remove_spectrum_indices(indices)
+
+    def remove_spectrum_indices(self, indices: list[int] | tuple[int, ...] | set[int]) -> None:
+        if self._batch_thread is not None:
+            self._set_status("Cancel the active batch before removing spectra.")
+            return
+        remove_set = {
+            int(index)
+            for index in indices
+            if 0 <= int(index) < len(self.spectra)
+        }
+        if not remove_set:
+            self._set_status("No valid spectra selected for removal.")
+            return
+        old_current = self.spectrum_combo.currentIndex()
+        removed_names = [
+            self.spectra[index].source_path.name
+            for index in sorted(remove_set)
+        ]
+        remaining_spectra: list[FocusedSpectrum] = []
+        remaining_corrected: list[Optional[FocusedSpectrum]] = []
+        remaining_normalization: list[Optional[NormalizationResult]] = []
+        remaining_labels: list[str] = []
+        for index, spectrum in enumerate(self.spectra):
+            if index in remove_set:
+                continue
+            remaining_spectra.append(spectrum)
+            remaining_corrected.append(self.corrected_spectra[index] if index < len(self.corrected_spectra) else None)
+            remaining_normalization.append(self.normalization_results[index] if index < len(self.normalization_results) else None)
+            remaining_labels.append(self.spectrum_combo.itemText(index) or spectrum.source_path.name)
+
+        self.spectra = remaining_spectra
+        self.corrected_spectra = remaining_corrected
+        self.normalization_results = remaining_normalization
+        combo_state = self.spectrum_combo.blockSignals(True)
+        try:
+            self.spectrum_combo.clear()
+            for label in remaining_labels:
+                self.spectrum_combo.addItem(label)
+            if remaining_labels:
+                removed_before_or_at_current = sum(1 for index in remove_set if index <= old_current)
+                new_index = max(0, min(old_current - removed_before_or_at_current, len(remaining_labels) - 1))
+                self.spectrum_combo.setCurrentIndex(new_index)
+        finally:
+            self.spectrum_combo.blockSignals(combo_state)
+
+        if self.results_table.rowCount() or self.fit_records_by_row or self.fit_curve_payloads_by_row:
+            self.clear_fitting_results()
+        else:
+            self.latest_fit_curve = None
+            self.update_plot()
+        count = len(remove_set)
+        if count == 1:
+            self._set_status(f"Removed spectrum {removed_names[0]}.")
+        else:
+            self._set_status(f"Removed {count} spectra.")
+
     def load_phase_dialog(self) -> None:
         path_str, _ = QFileDialog.getOpenFileName(
             self,
@@ -853,7 +1208,17 @@ class DiffractionTab(QWidget):
         if not path_str:
             return
         try:
-            self.phase = parse_gsas_exp(Path(path_str))[0]
+            phases = parse_gsas_exp(Path(path_str))
+            if len(phases) == 1:
+                self.phase = phases[0]
+            else:
+                labels = [f"{phase.index}: {phase.name} [{phase.space_group}]" for phase in phases]
+                selected, accepted = QInputDialog.getItem(
+                    self, "Select phase", "Phase from EXP file", labels, 0, False
+                )
+                if not accepted:
+                    return
+                self.phase = phases[labels.index(selected)]
             self._set_status(f"Loaded phase {self.phase.name} from {Path(path_str).name}.")
         except Exception as exc:
             self._set_status(f"Failed to load phase: {exc}")
@@ -1236,7 +1601,13 @@ class DiffractionTab(QWidget):
             observed_y = fit_curve["observed_y"]
             if isinstance(fit_x, np.ndarray) and isinstance(fit_y, np.ndarray) and isinstance(observed_y, np.ndarray):
                 self.axes.plot(fit_x, fit_y, color="#dc2626", linewidth=1.4, label=str(fit_curve["label"]))
-                residual = observed_y - fit_y
+                weighted_residual = fit_curve.get("weighted_residual")
+                if isinstance(weighted_residual, np.ndarray):
+                    residual = weighted_residual
+                    self.residual_axes.set_ylabel("Weighted residual")
+                else:
+                    residual = observed_y - fit_y
+                    self.residual_axes.set_ylabel("Residual")
                 self.residual_axes.plot(
                     fit_x,
                     residual,
@@ -1266,14 +1637,24 @@ class DiffractionTab(QWidget):
 
     def _current_fit_curve(self) -> Optional[dict[str, object]]:
         curve = self.latest_fit_curve
+        spectrum_index = self.spectrum_combo.currentIndex()
+        axis = self._selected_axis()
+        data_mode = str(self.data_combo.currentData() or "raw")
+        if (
+            curve is not None
+            and curve.get("spectrum_index") == spectrum_index
+            and curve.get("axis") == axis
+            and curve.get("data_mode") == data_mode
+        ):
+            return curve
+        key = (spectrum_index, axis, data_mode)
+        curve = self.fit_curve_payloads_by_spectrum.get(key)
         if curve is None:
-            return None
-        if curve.get("spectrum_index") != self.spectrum_combo.currentIndex():
-            return None
-        if curve.get("axis") != self._selected_axis():
-            return None
-        if curve.get("data_mode") != self.data_combo.currentData():
-            return None
+            record = self.fit_records_by_spectrum.get(key)
+            if record is None:
+                return None
+            curve = self._fit_curve_payload(record)
+        self.latest_fit_curve = curve
         return curve
 
     def _store_latest_fit_curve(
@@ -1466,7 +1847,7 @@ class DiffractionTab(QWidget):
             return ""
         return f"{float(value):.{precision}g}"
 
-    def fit_selected_range(self) -> None:
+    def _legacy_fit_selected_range(self) -> None:
         spectrum = self.current_spectrum()
         if spectrum is None:
             self._set_status("Load a spectrum before fitting.")
@@ -1482,6 +1863,15 @@ class DiffractionTab(QWidget):
             profile_key = self._profile_key_for_scope(settings)
             fit_axis = self._fit_axis_for_mode(axis, profile_key)
             fit_x_values = x_values if fit_axis == axis else self._convert_axis_values(x_values, axis, fit_axis, spectrum)
+            initial_profile_parameters = initial_profile_parameters_from_metadata(spectrum.metadata, profile_key)
+            timeout_seconds = max(1, int(settings.batch_timeout_seconds))
+            deadline = time.monotonic() + timeout_seconds
+
+            def abort_check() -> Optional[str]:
+                if time.monotonic() > deadline:
+                    return f"Fit timed out after {timeout_seconds} seconds."
+                return None
+
             if fit_scope == FIT_SCOPE_PATTERN:
                 if self.phase is None:
                     raise ValueError("Load a GSAS EXP phase before whole-pattern fitting.")
@@ -1502,6 +1892,9 @@ class DiffractionTab(QWidget):
                     max_nfev=settings.max_evaluations,
                     profile_key=profile_key,
                     width_model=settings.pawley_width_model,
+                    abort_check=abort_check,
+                    convergence_relative_improvement=fitting_settings_min_dm_over_m(settings),
+                    initial_profile_parameters=initial_profile_parameters,
                 )
                 reflection_details = "; ".join(
                     f"{item.reflection.label}@{self._axis_position_to_d_spacing(item.position, fit_axis, spectrum):.6g}:I={item.intensity:.6g}"
@@ -1512,14 +1905,7 @@ class DiffractionTab(QWidget):
                     profile_details = ";profile_parameters=" + profile_details
                 self._append_structured_result_row(
                     [
-                        result.profile_name,
-                        "Whole pattern: Pawley",
                         spectrum.source_path.name,
-                        spectrum.run_number or "",
-                        str(spectrum.bank_number or ""),
-                        axis,
-                        f"{selected_range[0]:.6g}",
-                        f"{selected_range[1]:.6g}",
                         f"{result.lattice_a:.8g}",
                         self._format_optional_value(result.lattice_a_uncertainty),
                         f"{result.quality.reduced_chi_square:.6g}",
@@ -1528,8 +1914,13 @@ class DiffractionTab(QWidget):
                     [],
                     "reported_value=lattice_a;reported_axis=d-spacing;fit_axis="
                         + fit_axis
+                        + ";data_mode="
+                        + str(self.data_combo.currentData() or "raw")
                         + ";peak_function="
                         + result.profile_name
+                        + ";scope_method=Whole pattern: Pawley"
+                        + f";run={spectrum.run_number or ''};bank={spectrum.bank_number or ''};axis={axis}"
+                        + f";range_min={selected_range[0]:.6g};range_max={selected_range[1]:.6g}"
                         + ";width_model="
                         + settings.pawley_width_model
                         + profile_details
@@ -1542,6 +1933,13 @@ class DiffractionTab(QWidget):
                 self._store_latest_fit_curve(curve_x, result.fit_y, result.observed_y, axis, f"Pawley {result.profile_name} fit")
                 self._set_status(f"Whole-pattern Pawley fit complete with {result.profile_name}: a={result.lattice_a:.6g}, Rwp={result.quality.rwp_percent:.4g}%.")
             else:
+                expected_reflections = expected_phase_reflections(
+                    self.phase,
+                    fit_axis,
+                    spectrum.calibration,
+                    (float(np.min(fit_x_values[mask])), float(np.max(fit_x_values[mask]))),
+                    reflection_margin_percent=settings.pawley_reflection_margin_percent,
+                )
                 result = fit_peak_profile(
                     profile_key,
                     fit_x_values[mask],
@@ -1553,6 +1951,15 @@ class DiffractionTab(QWidget):
                     fwhm_min_fraction=settings.pseudo_voigt_fwhm_min_fraction,
                     fwhm_max_multiplier=settings.pseudo_voigt_fwhm_max_multiplier,
                     maxfev=settings.max_evaluations,
+                    abort_check=abort_check,
+                    initial_profile_parameters=initial_profile_parameters,
+                    convergence_relative_improvement=fitting_settings_min_dm_over_m(settings),
+                    expected_peak_positions=None if expected_reflections is None else [
+                        position for position, _reflection in expected_reflections
+                    ],
+                    expected_peak_reflections=None if expected_reflections is None else [
+                        reflection for _position, reflection in expected_reflections
+                    ],
                 )
                 extra_details = ",".join(f"{key}={value:.6g}" for key, value in result.profile_parameters.items())
                 if extra_details:
@@ -1562,6 +1969,7 @@ class DiffractionTab(QWidget):
                 if curve_x is not None and fit_axis != axis:
                     curve_x = self._convert_axis_values(curve_x, fit_axis, axis, spectrum)
                 peak_groups = []
+                peak_labels = []
                 for component in components:
                     centre_d = self._axis_position_to_d_spacing(component.centre, fit_axis, spectrum)
                     fwhm_d = self._axis_width_to_d_spacing(component.fwhm, component.centre, fit_axis, spectrum)
@@ -1588,16 +1996,15 @@ class DiffractionTab(QWidget):
                             f"{component.eta:.4g}",
                         ]
                     )
+                    reflection = getattr(component, "reflection", None)
+                    peak_labels.append(self._reflection_table_label(reflection) if reflection is not None else "")
+                peak_details = ";".join(
+                    f"{label or f'peak_{index + 1}'}@{values[0]}"
+                    for index, (label, values) in enumerate(zip(peak_labels, peak_groups))
+                )
                 self._append_structured_result_row(
                     [
-                        result.model_name,
-                        "Individual peak fitting",
                         spectrum.source_path.name,
-                        spectrum.run_number or "",
-                        str(spectrum.bank_number or ""),
-                        axis,
-                        f"{selected_range[0]:.6g}",
-                        f"{selected_range[1]:.6g}",
                         "",
                         "",
                         f"{result.quality.reduced_chi_square:.6g}",
@@ -1606,10 +2013,20 @@ class DiffractionTab(QWidget):
                     peak_groups,
                     "reported_value=peak_d;reported_axis=d-spacing;fit_axis="
                     + fit_axis
+                    + ";data_mode="
+                    + str(self.data_combo.currentData() or "raw")
+                    + ";peak_function="
+                    + result.model_name
+                    + ";scope_method=Individual peak fitting"
+                    + f";run={spectrum.run_number or ''};bank={spectrum.bank_number or ''};axis={axis}"
+                    + f";range_min={selected_range[0]:.6g};range_max={selected_range[1]:.6g}"
                     + f";peak_count={len(components)}"
                     + ";background="
                     + ",".join(f"{value:.6g}" for value in result.background_coefficients)
-                    + extra_details,
+                    + extra_details
+                    + ";peaks="
+                    + peak_details,
+                    peak_labels=peak_labels,
                 )
                 self._store_latest_fit_curve(curve_x, result.fit_y, result.observed_y, axis, f"{result.model_name} fit")
                 self._set_status(
@@ -1619,48 +2036,477 @@ class DiffractionTab(QWidget):
         except Exception as exc:
             self._set_status(f"Fit failed: {exc}")
 
+    def _spectrum_for_fit(self, index: int, data_mode: str) -> FocusedSpectrum:
+        if index < 0 or index >= len(self.spectra):
+            raise ValueError("Spectrum index is out of range.")
+        if data_mode == "corrected":
+            corrected = self.corrected_spectra[index] if index < len(self.corrected_spectra) else None
+            if corrected is None:
+                raise ValueError("Corrected data are not available for this spectrum.")
+            return corrected
+        return self._with_refined_calibration_if_matching(self.spectra[index])
+
+    def _fit_request(self, index: int, selected_range: tuple[float, float]) -> SpectrumFitRequest:
+        data_mode = str(self.data_combo.currentData() or "raw")
+        return SpectrumFitRequest(
+            spectrum_index=index,
+            spectrum=self._spectrum_for_fit(index, data_mode),
+            settings=replace(self.fitting_settings),
+            phase=self.phase,
+            display_axis=self._selected_axis(),
+            data_mode=data_mode,
+            selected_range=selected_range,
+        )
+
+    def _selected_fit_range(self) -> tuple[float, float]:
+        spectrum = self.current_spectrum()
+        if spectrum is None:
+            raise ValueError("Load a spectrum before fitting.")
+        x_values, _label = self._axis_data(spectrum)
+        _mask, selected_range = self._fit_range_mask(x_values, spectrum)
+        return selected_range
+
+    def fit_selected_range(self) -> None:
+        if self._batch_thread is not None:
+            self._set_status("Wait for the active batch fit to finish or cancel it.")
+            return
+        try:
+            self._sync_fitting_settings_from_controls()
+            index = self.spectrum_combo.currentIndex()
+            settings = self.fitting_settings
+            timeout_seconds = max(1, int(settings.batch_timeout_seconds))
+            deadline = time.monotonic() + timeout_seconds
+
+            def abort_check() -> Optional[str]:
+                if time.monotonic() > deadline:
+                    return f"Fit timed out after {timeout_seconds} seconds."
+                return None
+
+            record = fit_spectrum(
+                self._fit_request(index, self._selected_fit_range()),
+                abort_check=abort_check,
+                use_gsas_convergence=True,
+            )
+            self._append_fit_record(record)
+            self._show_fit_record(record)
+            self._set_status(self._fit_completion_text(record))
+        except Exception as exc:
+            self._set_status(f"Fit failed: {exc}")
+
+    def fit_batch(self) -> None:
+        if self._batch_thread is not None:
+            self._set_status("A batch fit is already running.")
+            return
+        if not self.spectra:
+            self._set_status("Load spectra before batch fitting.")
+            return
+        try:
+            self._sync_fitting_settings_from_controls()
+            selected_range = self._selected_fit_range()
+        except Exception as exc:
+            self._set_status(f"Batch fit cannot start: {exc}")
+            return
+
+        current_index = self.spectrum_combo.currentIndex()
+        indices = [current_index] if self.batch_scope_combo.currentData() == "current" else list(range(len(self.spectra)))
+        requests: list[SpectrumFitRequest] = []
+        for index in indices:
+            try:
+                requests.append(self._fit_request(index, selected_range))
+            except Exception as exc:
+                self._append_failed_fit(index, str(exc), selected_range)
+        if not requests:
+            self._set_status("No spectra passed batch preflight checks.")
+            return
+
+        self._batch_range = selected_range
+        self._batch_cancel_event = threading.Event()
+        thread = QThread(self)
+        worker = BatchFitWorker(
+            requests,
+            self._batch_cancel_event,
+            use_processes=self._batch_process_isolation,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.started_spectrum.connect(self._batch_spectrum_started)
+        worker.result_ready.connect(self._append_fit_record)
+        worker.partial_ready.connect(
+            lambda index, message, curve: self._append_failed_fit(
+                index, message, selected_range, curve_payload=curve
+            )
+        )
+        worker.failed.connect(lambda index, message: self._append_failed_fit(index, message, selected_range))
+        worker.progress.connect(self._update_batch_progress)
+        worker.finished.connect(self._batch_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._batch_thread_finished)
+        self._batch_thread = thread
+        self._batch_worker = worker
+        self.batch_progress.setRange(0, len(requests))
+        self.batch_progress.setValue(0)
+        self._batch_completed_count = 0
+        self.fit_button.setEnabled(False)
+        self.batch_fit_button.setEnabled(False)
+        self.clear_results_button.setEnabled(False)
+        self.cancel_batch_button.setEnabled(True)
+        self._set_status(f"Batch fitting 0/{len(requests)} spectra...")
+        thread.start()
+
+    def cancel_batch_fit(self) -> None:
+        if self._batch_cancel_event is not None:
+            self._batch_cancel_event.set()
+            self.cancel_batch_button.setEnabled(False)
+            self._reset_batch_progress()
+            self._set_status("Stopping the active fit process...")
+
+    def _reset_batch_progress(self) -> None:
+        self.batch_progress.setRange(0, 1)
+        self.batch_progress.setValue(0)
+
+    def _update_batch_progress(self, completed: int, total: int) -> None:
+        self._batch_completed_count = completed
+        if self._batch_cancel_event is not None and self._batch_cancel_event.is_set():
+            return
+        self.batch_progress.setRange(0, total)
+        self.batch_progress.setValue(completed)
+        self._set_status(f"Batch fitting {completed}/{total} spectra...")
+
+    def _batch_spectrum_started(self, position: int, total: int, source_name: str) -> None:
+        self._set_status(f"Batch fitting spectrum {position}/{total}: {source_name}")
+
+    def _batch_finished(self, cancelled: bool) -> None:
+        self.fit_button.setEnabled(True)
+        self.batch_fit_button.setEnabled(True)
+        self.clear_results_button.setEnabled(True)
+        self.cancel_batch_button.setEnabled(False)
+        if cancelled:
+            completed = self._batch_completed_count
+            self._reset_batch_progress()
+            self._set_status(f"Batch fitting cancelled after {completed} result(s).")
+        else:
+            self._set_status(f"Batch fitting complete: processed {self.batch_progress.maximum()} spectrum/spectra.")
+
+    def _batch_thread_finished(self) -> None:
+        self._batch_thread = None
+        self._batch_worker = None
+        self._batch_cancel_event = None
+        self._batch_range = None
+        self._batch_completed_count = 0
+
+    def _fit_completion_text(self, record: SpectrumFitRecord) -> str:
+        result = record.result
+        if record.settings.fit_scope == FIT_SCOPE_PATTERN:
+            lattice = ", ".join(
+                f"{name}={value:.6g}" for name, value in result.lattice_parameters.items()
+                if name in {"a", "b", "c"}
+            ) or f"a={result.lattice_a:.6g}"
+            return f"Whole-pattern fit complete: {lattice}, Rwp={result.quality.rwp_percent:.4g}%."
+        return f"Individual peak fit complete: {len(result.components or ())} peak(s), Rwp={result.quality.rwp_percent:.4g}%."
+
+    def _lattice_b_c_table_values(self, result: object) -> list[str]:
+        lattice = getattr(result, "lattice_parameters", {}) or {}
+        try:
+            a_value = float(lattice.get("a"))
+            b_value = float(lattice.get("b"))
+            c_value = float(lattice.get("c"))
+        except (TypeError, ValueError):
+            a_value = b_value = c_value = float("nan")
+        if (
+            np.isfinite(a_value)
+            and np.isfinite(b_value)
+            and np.isfinite(c_value)
+            and np.isclose(a_value, b_value, rtol=1e-8, atol=1e-10)
+            and np.isclose(a_value, c_value, rtol=1e-8, atol=1e-10)
+        ):
+            return ["", "", "", ""]
+        uncertainties = getattr(result, "lattice_parameter_uncertainties", {}) or {}
+        return [
+            self._format_optional_value(lattice.get("b"), 8),
+            self._format_optional_value(uncertainties.get("b")),
+            self._format_optional_value(lattice.get("c"), 8),
+            self._format_optional_value(uncertainties.get("c")),
+        ]
+
+    def _append_fit_record(self, record: SpectrumFitRecord) -> None:
+        result = record.result
+        spectrum = record.spectrum
+        low, high = record.selected_range
+        if record.settings.fit_scope == FIT_SCOPE_PATTERN:
+            reflection_details = ";".join(
+                f"{item.reflection.label}@{position_to_d_spacing(item.position, record.fit_axis, spectrum):.6g}:I={item.intensity:.6g}"
+                for item in result.reflections
+            )
+            profile_details = ",".join(f"{key}={value:.6g}" for key, value in result.profile_parameters.items())
+            details = (
+                f"reported_value=lattice_a;reported_axis=d-spacing;fit_axis={record.fit_axis};"
+                f"data_mode={record.data_mode};weighting={'model_based' if result.fit_uncertainty is not None else 'unweighted'};"
+                f"peak_function={result.profile_name};scope_method=Whole pattern: Pawley;"
+                f"run={spectrum.run_number or ''};bank={spectrum.bank_number or ''};axis={record.display_axis};"
+                f"range_min={low:.6g};range_max={high:.6g};"
+                f"width_model={record.settings.pawley_width_model};profile_parameters={profile_details};"
+                + ";".join(f"lattice_{key}={value:.8g}" for key, value in result.lattice_parameters.items()) + ";"
+                f"reflections={reflection_details}"
+            )
+            base_values = [
+                spectrum.source_path.name,
+                f"{result.lattice_a:.8g}",
+                self._format_optional_value(result.lattice_a_uncertainty),
+                f"{result.quality.reduced_chi_square:.6g}", f"{result.quality.rwp_percent:.4g}",
+                "Success", "",
+                *self._lattice_b_c_table_values(result),
+            ]
+            peak_groups: list[list[str]] = []
+        else:
+            peak_groups = []
+            peak_labels = []
+            for component in result.components or ():
+                centre_d = position_to_d_spacing(component.centre, record.fit_axis, spectrum)
+                fwhm_d = width_to_d_spacing(component.fwhm, component.centre, record.fit_axis, spectrum)
+                centre_unc_d = None if component.centre_uncertainty is None else width_to_d_spacing(
+                    component.centre_uncertainty, component.centre, record.fit_axis, spectrum
+                )
+                fwhm_unc_d = None if component.fwhm_uncertainty is None else width_to_d_spacing(
+                    component.fwhm_uncertainty, component.centre, record.fit_axis, spectrum
+                )
+                peak_groups.append([
+                    f"{centre_d:.8g}", self._format_optional_value(centre_unc_d), f"{fwhm_d:.6g}",
+                    self._format_optional_value(fwhm_unc_d), f"{component.height:.6g}",
+                    f"{component.area:.6g}", f"{component.eta:.4g}",
+                ])
+                reflection = getattr(component, "reflection", None)
+                peak_labels.append(self._reflection_table_label(reflection) if reflection is not None else "")
+            profile_details = ",".join(f"{key}={value:.6g}" for key, value in result.profile_parameters.items())
+            background = ",".join(f"{value:.6g}" for value in result.background_coefficients)
+            peak_details = ";".join(
+                f"{label or f'peak_{index + 1}'}@{values[0]}"
+                for index, (label, values) in enumerate(zip(peak_labels, peak_groups))
+            )
+            details = (
+                f"reported_value=peak_d;reported_axis=d-spacing;fit_axis={record.fit_axis};"
+                f"data_mode={record.data_mode};weighting={'model_based' if result.fit_uncertainty is not None else 'unweighted'};"
+                f"peak_function={result.model_name};scope_method=Individual peak fitting;"
+                f"run={spectrum.run_number or ''};bank={spectrum.bank_number or ''};axis={record.display_axis};"
+                f"range_min={low:.6g};range_max={high:.6g};"
+                f"peak_count={len(peak_groups)};background={background};"
+                f"profile_parameters={profile_details};peaks={peak_details}"
+            )
+            base_values = [
+                spectrum.source_path.name,
+                "", "",
+                f"{result.quality.reduced_chi_square:.6g}", f"{result.quality.rwp_percent:.4g}",
+                "Success", "",
+                "", "", "", "",
+            ]
+        row = self._append_structured_result_row(
+            base_values,
+            peak_groups,
+            details,
+            peak_labels=peak_labels if record.settings.fit_scope == FIT_SCOPE_PEAK else None,
+        )
+        self.fit_records_by_row[row] = record
+        self.fit_records_by_spectrum[(record.spectrum_index, record.display_axis, record.data_mode)] = record
+        curve_payload = self._fit_curve_payload(record)
+        self.fit_curve_payloads_by_row[row] = curve_payload
+        self.fit_curve_payloads_by_spectrum[(record.spectrum_index, record.display_axis, record.data_mode)] = curve_payload
+        self.results_table.selectRow(row)
+
+    def _append_failed_fit(
+        self,
+        index: int,
+        message: str,
+        selected_range: tuple[float, float],
+        curve_payload: Optional[dict[str, object]] = None,
+    ) -> None:
+        spectrum = self.spectra[index] if 0 <= index < len(self.spectra) else None
+        source = "" if spectrum is None else spectrum.source_path.name
+        run = "" if spectrum is None else spectrum.run_number or ""
+        bank = "" if spectrum is None else str(spectrum.bank_number or "")
+        row = self._append_structured_result_row(
+            [source, "", "", "", "", "Failed", message],
+            [],
+            f"status=failed;error={message};run={run};bank={bank};axis={self._selected_axis()};"
+            f"range_min={selected_range[0]:.6g};range_max={selected_range[1]:.6g}",
+        )
+        if curve_payload is not None:
+            payload = dict(curve_payload)
+            self.fit_curve_payloads_by_row[row] = payload
+            key = (
+                int(payload.get("spectrum_index", index)),
+                str(payload.get("axis", self._selected_axis())),
+                str(payload.get("data_mode", self.data_combo.currentData() or "raw")),
+            )
+            self.fit_curve_payloads_by_spectrum[key] = payload
+        self.results_table.selectRow(row)
+
+    def _show_fit_record(self, record: SpectrumFitRecord) -> None:
+        self._result_selection_update = True
+        try:
+            self.spectrum_combo.setCurrentIndex(record.spectrum_index)
+            self._set_combo_data(self.axis_combo, record.display_axis)
+            self._set_combo_data(self.data_combo, record.data_mode)
+            self.latest_fit_curve = self._fit_curve_payload(record)
+        finally:
+            self._result_selection_update = False
+        self.update_plot()
+
+    def _show_fit_curve_payload(self, payload: dict[str, object]) -> None:
+        self._result_selection_update = True
+        try:
+            self.spectrum_combo.setCurrentIndex(int(payload.get("spectrum_index", -1)))
+            self._set_combo_data(self.axis_combo, str(payload.get("axis", AXIS_TOF)))
+            self._set_combo_data(self.data_combo, str(payload.get("data_mode", "raw")))
+            self.latest_fit_curve = payload
+        finally:
+            self._result_selection_update = False
+        self.update_plot()
+
+    def _fit_curve_payload(self, record: SpectrumFitRecord) -> dict[str, object]:
+        return {
+            "spectrum_index": record.spectrum_index,
+            "axis": record.display_axis,
+            "data_mode": record.data_mode,
+            "x": record.curve_x,
+            "fit_y": record.fit_y,
+            "observed_y": record.observed_y,
+            "weighted_residual": record.weighted_residual,
+            "label": "Pawley fit"
+            if record.settings.fit_scope == FIT_SCOPE_PATTERN
+            else f"{record.result.model_name} fit",
+        }
+
+    def clear_fitting_results(self) -> None:
+        if self._batch_thread is not None:
+            self._set_status("Cancel the active batch before clearing fitting results.")
+            return
+        self.latest_fit_curve = None
+        self.fit_records_by_row.clear()
+        self.fit_records_by_spectrum.clear()
+        self.fit_curve_payloads_by_row.clear()
+        self.fit_curve_payloads_by_spectrum.clear()
+        self.results_table.clearSelection()
+        self.results_table.setRowCount(0)
+        self.results_table.setColumnCount(len(RESULT_HEADERS))
+        self.results_table.setHorizontalHeaderLabels(RESULT_HEADERS)
+        self._peak_result_column_count = 0
+        self._peak_result_labels = []
+        self._update_lattice_column_visibility()
+        self.result_details_edit.clear()
+        self.update_plot()
+        self._set_status("Cleared all diffraction fitting results.")
+
     def _append_result_row(self, values: list[str]) -> int:
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
         for column, value in enumerate(values):
             self.results_table.setItem(row, column, QTableWidgetItem(value))
+        self._update_lattice_column_visibility()
         self.results_table.resizeColumnsToContents()
         return row
 
-    def _ensure_peak_result_columns(self, peak_count: int) -> None:
+    def _table_column_index(self, header: str) -> int:
+        for column in range(self.results_table.columnCount()):
+            item = self.results_table.horizontalHeaderItem(column)
+            if item is not None and item.text() == header:
+                return column
+        return -1
+
+    def _column_has_values(self, column: int) -> bool:
+        if column < 0:
+            return False
+        for row in range(self.results_table.rowCount()):
+            item = self.results_table.item(row, column)
+            if item is not None and item.text().strip():
+                return True
+        return False
+
+    def _update_lattice_column_visibility(self) -> None:
+        if not hasattr(self, "results_table"):
+            return
+        for header in ("Lattice a", "Lattice a unc", "Lattice b", "Lattice b unc", "Lattice c", "Lattice c unc"):
+            column = self._table_column_index(header)
+            if column >= 0:
+                self.results_table.setColumnHidden(column, not self._column_has_values(column))
+
+    @staticmethod
+    def _peak_group_label(index: int, label: Optional[str] = None) -> str:
+        clean_label = str(label or "").strip()
+        if clean_label:
+            return clean_label
+        return f"Peak {index + 1}"
+
+    @staticmethod
+    def _reflection_table_label(reflection: object) -> str:
+        try:
+            hkl = sorted(
+                (
+                    abs(int(getattr(reflection, "h"))),
+                    abs(int(getattr(reflection, "k"))),
+                    abs(int(getattr(reflection, "l"))),
+                ),
+                reverse=True,
+            )
+            return f"({hkl[0]} {hkl[1]} {hkl[2]})"
+        except (TypeError, ValueError):
+            label = str(getattr(reflection, "label", "")).strip()
+            return f"({label})" if label else ""
+
+    def _ensure_peak_result_columns(self, peak_count: int, peak_labels: Optional[list[str]] = None) -> None:
         peak_count = max(0, int(peak_count))
         if not hasattr(self, "results_table"):
             return
-        while self._peak_result_column_count < peak_count:
-            peak_number = self._peak_result_column_count + 1
+        requested_labels = list(peak_labels or [])
+        if requested_labels:
+            for label in requested_labels:
+                if str(label or "").strip() and label not in self._peak_result_labels:
+                    self._peak_result_labels.append(label)
+        while len(self._peak_result_labels) < peak_count:
+            self._peak_result_labels.append("")
+        while self._peak_result_column_count < len(self._peak_result_labels):
+            peak_index = self._peak_result_column_count
+            peak_label = self._peak_group_label(peak_index, self._peak_result_labels[peak_index])
             insert_at = self.results_table.columnCount()
             for offset, field in enumerate(PEAK_RESULT_FIELD_HEADERS):
                 column = insert_at + offset
                 self.results_table.insertColumn(column)
-                self.results_table.setHorizontalHeaderItem(column, QTableWidgetItem(f"Peak {peak_number} {field}"))
+                self.results_table.setHorizontalHeaderItem(column, QTableWidgetItem(f"{peak_label} {field}"))
+                for row in range(self.results_table.rowCount()):
+                    self.results_table.setItem(row, column, QTableWidgetItem(""))
             self._peak_result_column_count += 1
+
+    def _peak_label_column_index(self, peak_index: int, label: str) -> int:
+        clean_label = str(label or "").strip()
+        if clean_label and clean_label in self._peak_result_labels:
+            return self._peak_result_labels.index(clean_label)
+        return int(peak_index)
 
     def _append_structured_result_row(
         self,
         base_values: list[str],
         peak_groups: list[list[str]],
         details: str,
-    ) -> None:
+        peak_labels: Optional[list[str]] = None,
+    ) -> int:
         expected_base_values = len(RESULT_HEADERS)
         values = list(base_values[:expected_base_values])
         values.extend([""] * max(0, expected_base_values - len(values)))
-        self._ensure_peak_result_columns(len(peak_groups))
-        for peak_values in peak_groups:
+        self._ensure_peak_result_columns(len(peak_groups), peak_labels)
+        peak_values_by_column: dict[int, list[str]] = {}
+        for peak_index, peak_values in enumerate(peak_groups):
+            label = "" if peak_labels is None or peak_index >= len(peak_labels) else peak_labels[peak_index]
+            column_index = self._peak_label_column_index(peak_index, label)
             group = list(peak_values[: len(PEAK_RESULT_FIELD_HEADERS)])
-            values.extend(group + [""] * (len(PEAK_RESULT_FIELD_HEADERS) - len(group)))
-        missing_peak_groups = max(0, self._peak_result_column_count - len(peak_groups))
-        values.extend([""] * missing_peak_groups * len(PEAK_RESULT_FIELD_HEADERS))
+            peak_values_by_column[column_index] = group + [""] * (len(PEAK_RESULT_FIELD_HEADERS) - len(group))
+        for peak_index in range(self._peak_result_column_count):
+            values.extend(peak_values_by_column.get(peak_index, [""] * len(PEAK_RESULT_FIELD_HEADERS)))
         row = self._append_result_row(values)
         self.results_table.setVerticalHeaderItem(row, QTableWidgetItem(str(row + 1)))
         header_item = self.results_table.verticalHeaderItem(row)
         if header_item is not None:
             header_item.setData(Qt.UserRole, details)
-        self.results_table.selectRow(row)
+        return row
 
     def _update_selected_result_details(self) -> None:
         if not hasattr(self, "result_details_edit"):
@@ -1672,6 +2518,14 @@ class DiffractionTab(QWidget):
         header_item = self.results_table.verticalHeaderItem(selected_rows[-1])
         details = "" if header_item is None else str(header_item.data(Qt.UserRole) or "")
         self.result_details_edit.setPlainText(self._format_result_details(details))
+        if not self._result_selection_update:
+            record = self.fit_records_by_row.get(selected_rows[-1])
+            if record is not None:
+                self._show_fit_record(record)
+            else:
+                curve_payload = self.fit_curve_payloads_by_row.get(selected_rows[-1])
+                if curve_payload is not None:
+                    self._show_fit_curve_payload(curve_payload)
 
     def _format_result_details(self, details: str) -> str:
         if not details:
@@ -1691,11 +2545,15 @@ class DiffractionTab(QWidget):
             self,
             "Export diffraction results",
             str(Path.cwd() / "diffraction_results.csv"),
-            "CSV files (*.csv);;All files (*.*)",
+            "CSV files (*.csv);;JSON files (*.json);;All files (*.*)",
         )
         if not path_str:
             return
         try:
+            if Path(path_str).suffix.lower() == ".json":
+                self._export_results_json(Path(path_str))
+                self._set_status(f"Exported diffraction results to {path_str}.")
+                return
             with Path(path_str).open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
                 headers = [
@@ -1719,3 +2577,81 @@ class DiffractionTab(QWidget):
             self._set_status(f"Exported diffraction results to {path_str}.")
         except Exception as exc:
             self._set_status(f"Export failed: {exc}")
+
+    def _export_results_json(self, path: Path) -> None:
+        records = []
+        for row in range(self.results_table.rowCount()):
+            record = self.fit_records_by_row.get(row)
+            status_item = self.results_table.item(row, RESULT_HEADERS.index("Status"))
+            error_item = self.results_table.item(row, RESULT_HEADERS.index("Error"))
+            if record is None:
+                records.append({
+                    "status": "" if status_item is None else status_item.text(),
+                    "error": "" if error_item is None else error_item.text(),
+                    "source": self.results_table.item(row, RESULT_HEADERS.index("Source")).text(),
+                })
+                continue
+            result = record.result
+            payload = {
+                "status": "success",
+                "spectrum_index": record.spectrum_index,
+                "source": str(record.spectrum.source_path),
+                "run": record.spectrum.run_number,
+                "bank": record.spectrum.bank_number,
+                "display_axis": record.display_axis,
+                "fit_axis": record.fit_axis,
+                "data_mode": record.data_mode,
+                "range": list(record.selected_range),
+                "settings": asdict(record.settings),
+                "quality": asdict(result.quality),
+                "curve": {
+                    "x": None if record.curve_x is None else record.curve_x.tolist(),
+                    "observed": None if record.observed_y is None else record.observed_y.tolist(),
+                    "calculated": None if record.fit_y is None else record.fit_y.tolist(),
+                    "residual": None if record.residual is None else record.residual.tolist(),
+                    "weighted_residual": None if record.weighted_residual is None else record.weighted_residual.tolist(),
+                },
+            }
+            if record.settings.fit_scope == FIT_SCOPE_PATTERN:
+                payload["lattice_a"] = result.lattice_a
+                payload["lattice_a_uncertainty"] = result.lattice_a_uncertainty
+                payload["lattice_parameters"] = dict(result.lattice_parameters)
+                payload["lattice_parameter_uncertainties"] = dict(result.lattice_parameter_uncertainties)
+                payload["profile_name"] = result.profile_name
+                payload["reflections"] = [
+                    {"hkl": item.reflection.label, "position": item.position, "intensity": item.intensity}
+                    for item in result.reflections
+                ]
+            else:
+                payload["model_name"] = result.model_name
+                payload["background_coefficients"] = list(result.background_coefficients)
+                payload["peaks"] = [asdict(component) for component in result.components or ()]
+            records.append(payload)
+        path.write_text(json.dumps({"format": "SimSetup diffraction batch results", "records": records}, indent=2), encoding="utf-8")
+
+    def export_selected_curve_dialog(self) -> None:
+        selected_rows = sorted({index.row() for index in self.results_table.selectedIndexes()})
+        record = None if not selected_rows else self.fit_records_by_row.get(selected_rows[-1])
+        if record is None or record.curve_x is None or record.observed_y is None or record.fit_y is None:
+            self._set_status("Select a successful fit result before exporting its curve.")
+            return
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export selected diffraction fit curve",
+            str(Path.cwd() / f"{record.spectrum.source_path.stem}_fit_curve.csv"),
+            "CSV files (*.csv);;All files (*.*)",
+        )
+        if not path_str:
+            return
+        try:
+            residual = record.residual
+            weighted_residual = record.weighted_residual
+            with Path(path_str).open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow([record.display_axis, "observed", "calculated", "residual", "weighted_residual"])
+                for index, (x, observed, calculated, difference) in enumerate(zip(record.curve_x, record.observed_y, record.fit_y, residual)):
+                    weighted = "" if weighted_residual is None else f"{weighted_residual[index]:.12g}"
+                    writer.writerow([f"{x:.12g}", f"{observed:.12g}", f"{calculated:.12g}", f"{difference:.12g}", weighted])
+            self._set_status(f"Exported fit curve to {path_str}.")
+        except Exception as exc:
+            self._set_status(f"Curve export failed: {exc}")

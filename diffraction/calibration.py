@@ -19,7 +19,13 @@ from .models import (
     d_to_tof,
     tof_to_d,
 )
-from .profiles import PROFILE_EXP_VOIGT, PROFILE_GSAS_TOF, evaluate_peak_profile, peak_profile_spec
+from .profiles import (
+    PROFILE_EXP_VOIGT,
+    PROFILE_GSAS_TOF,
+    back_to_back_tail_bounds,
+    evaluate_peak_profile,
+    peak_profile_spec,
+)
 
 CalibrationProgressCallback = Callable[[str, Mapping[str, object]], None]
 OPENGENIE_CALIBRATION_TOF_MIN = 15978.6
@@ -245,8 +251,14 @@ def _fit_ceo2_pattern_calibration(
     fitted_widths = [float(peak.fwhm) for peak in single_peak_results if peak.accepted and peak.fwhm is not None and peak.fwhm > 0.0]
     fwhm_guess = float(np.median(fitted_widths)) if fitted_widths else max(float(np.max(x_values) - np.min(x_values)) / 400.0, 10.0)
     fwhm_guess = min(max(fwhm_guess, 5.0), 1000.0)
-    alpha_guess = max(fwhm_guess * 0.35, 1.0)
-    beta_guess = max(fwhm_guess * 0.7, 1.0)
+    alpha_beta_guess, alpha_beta_min, alpha_beta_max = back_to_back_tail_bounds(
+        float(np.max(x_values) - np.min(x_values)),
+        fwhm_guess,
+        1.0,
+        2000.0,
+    )
+    alpha_guess = min(max(fwhm_guess * 0.35, alpha_beta_min), alpha_beta_max)
+    beta_guess = min(max(fwhm_guess * 0.7, alpha_beta_guess), alpha_beta_max)
 
     shape_names = ["fwhm", "eta", "alpha", "beta"]
     p0 = [
@@ -269,8 +281,8 @@ def _fit_ceo2_pattern_calibration(
         float(seed.tzero) - tzero_span,
         1.0,
         0.0,
-        0.5,
-        0.5,
+        alpha_beta_min,
+        alpha_beta_min,
         *([0.0] * len(reflections)),
         *([-np.inf] * (order + 1)),
     ]
@@ -280,8 +292,8 @@ def _fit_ceo2_pattern_calibration(
         float(seed.tzero) + tzero_span,
         2000.0,
         1.0,
-        2000.0,
-        2000.0,
+        alpha_beta_max,
+        alpha_beta_max,
         *([max(float(np.max(peak_signal)) * 200.0, 1.0)] * len(reflections)),
         *([np.inf] * (order + 1)),
     ]
@@ -501,6 +513,7 @@ def refine_ceo2_calibration(
                 ceo2_spectrum.e[fit_mask] if ceo2_spectrum.e is not None else None,
                 polynomial_order=polynomial_order,
                 max_peaks=1,
+                model_based_weighting=False,
             )
         except Exception as exc:
             peak_results.append(

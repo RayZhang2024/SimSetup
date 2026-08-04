@@ -1,11 +1,20 @@
 from __future__ import annotations
 
-from typing import Optional, Sequence
+import inspect
+from typing import Callable, Mapping, Optional, Sequence
 
 import numpy as np
 
-from .fitting import _clean_fit_inputs, _fit_quality, _normalised_axis, _polyval
-from .gsas_exp import generate_fcc_reflections, validate_ni_cubic_phase
+from .fitting import (
+    _clean_fit_inputs,
+    _fit_quality,
+    _model_based_uncertainty,
+    _normalised_axis,
+    _polyval,
+    _raise_if_aborted,
+)
+from .convergence import gsas_relative_chi_square_ftol
+from .gsas_exp import generate_phase_reflections, unit_cell_d_spacing
 from .models import (
     AXIS_D_SPACING,
     AXIS_TOF,
@@ -22,7 +31,10 @@ from .profiles import (
     PROFILE_GAUSSIAN,
     PROFILE_LORENTZIAN,
     PROFILE_PSEUDO_VOIGT,
+    back_to_back_tail_bounds,
     evaluate_peak_profile,
+    gsas2_tof_effective_fwhm,
+    gsas2_tof_profile_initial_bounds,
     is_gsas_tof_profile,
     peak_profile_spec,
 )
@@ -32,11 +44,11 @@ def _reflection_axis_position(
     h: int,
     k: int,
     l: int,
-    lattice_a: float,
+    cell: tuple[float, float, float, float, float, float],
     axis: str,
     calibration: Optional[InstrumentCalibration],
 ) -> float:
-    d_spacing = float(lattice_a) / float(np.sqrt(h * h + k * k + l * l))
+    d_spacing = unit_cell_d_spacing(h, k, l, *cell)
     if axis == AXIS_D_SPACING:
         return d_spacing
     if calibration is None:
@@ -44,8 +56,36 @@ def _reflection_axis_position(
     return float(d_to_tof(d_spacing, calibration))
 
 
-def _reflection_d_spacing(h: int, k: int, l: int, lattice_a: float) -> float:
-    return float(lattice_a) / float(np.sqrt(h * h + k * k + l * l))
+def _reflection_d_spacing(h: int, k: int, l: int, cell: tuple[float, float, float, float, float, float]) -> float:
+    return unit_cell_d_spacing(h, k, l, *cell)
+
+
+def _lattice_parameterisation(phase: PhaseModel):
+    right_angles = all(abs(value - 90.0) < 1e-5 for value in (phase.alpha, phase.beta, phase.gamma))
+    hexagonal = (
+        abs(phase.a - phase.b) < 1e-5
+        and abs(phase.alpha - 90.0) < 1e-5
+        and abs(phase.beta - 90.0) < 1e-5
+        and abs(phase.gamma - 120.0) < 1e-5
+    )
+    if right_angles and abs(phase.a - phase.b) < 1e-5 and abs(phase.a - phase.c) < 1e-5:
+        names, initial = ("a",), (phase.a,)
+        build = lambda values: (values[0], values[0], values[0], phase.alpha, phase.beta, phase.gamma)
+    elif hexagonal or (right_angles and abs(phase.a - phase.b) < 1e-5):
+        names, initial = ("a", "c"), (phase.a, phase.c)
+        build = lambda values: (values[0], values[0], values[1], phase.alpha, phase.beta, phase.gamma)
+    elif (
+        abs(phase.a - phase.b) < 1e-5
+        and abs(phase.a - phase.c) < 1e-5
+        and abs(phase.alpha - phase.beta) < 1e-5
+        and abs(phase.alpha - phase.gamma) < 1e-5
+    ):
+        names, initial = ("a",), (phase.a,)
+        build = lambda values: (values[0], values[0], values[0], phase.alpha, phase.beta, phase.gamma)
+    else:
+        names, initial = ("a", "b", "c"), (phase.a, phase.b, phase.c)
+        build = lambda values: (values[0], values[1], values[2], phase.alpha, phase.beta, phase.gamma)
+    return names, initial, build
 
 
 def _d_width_to_axis_width(
@@ -105,6 +145,143 @@ def _least_squares_parameter_uncertainties(result: object, parameter_count: int)
     return np.sqrt(np.maximum(diagonal, 0.0))
 
 
+def _run_least_squares(
+    least_squares,
+    residual,
+    p0: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    max_nfev: int,
+    callback,
+    convergence_relative_improvement: float = 0.0,
+):
+    kwargs = {
+        "bounds": (lower, upper),
+        "max_nfev": max(100, int(max_nfev)),
+    }
+    ftol = gsas_relative_chi_square_ftol(convergence_relative_improvement)
+    if ftol is not None:
+        kwargs["ftol"] = ftol
+    if callback is not None and "callback" in inspect.signature(least_squares).parameters:
+        kwargs["callback"] = callback
+    return least_squares(residual, p0, **kwargs)
+
+
+def _estimate_lattice_initial_from_peaks(
+    least_squares,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    background_guess: float,
+    reflections,
+    lattice_names: tuple[str, ...],
+    lattice_initial: tuple[float, ...],
+    build_cell,
+    axis: str,
+    calibration: Optional[InstrumentCalibration],
+    lattice_fraction: float,
+    fwhm_guess: float,
+) -> tuple[float, ...]:
+    lattice_count = len(lattice_names)
+    if lattice_count <= 0 or len(reflections) < lattice_count:
+        return lattice_initial
+    peak_signal = np.maximum(np.asarray(y_values, dtype=float) - float(background_guess), 0.0)
+    strongest_signal = float(np.max(peak_signal)) if peak_signal.size else 0.0
+    if not np.isfinite(strongest_signal) or strongest_signal <= 0.0:
+        return lattice_initial
+    if x_values.size > 1:
+        axis_step = float(np.median(np.abs(np.diff(np.sort(x_values)))))
+    else:
+        axis_step = 0.0
+    lower = tuple(value * (1.0 - lattice_fraction) for value in lattice_initial)
+    upper = tuple(value * (1.0 + lattice_fraction) for value in lattice_initial)
+    lower_cell = build_cell(lower)
+    upper_cell = build_cell(upper)
+    initial_cell = build_cell(lattice_initial)
+    observations: list[tuple[tuple[int, int, int], float, float]] = []
+    for reflection in reflections:
+        hkl = (reflection.h, reflection.k, reflection.l)
+        try:
+            expected = _reflection_axis_position(*hkl, initial_cell, axis, calibration)
+            low_position = _reflection_axis_position(*hkl, lower_cell, axis, calibration)
+            high_position = _reflection_axis_position(*hkl, upper_cell, axis, calibration)
+        except Exception:
+            continue
+        search_half_width = max(
+            4.0 * abs(float(fwhm_guess)),
+            0.75 * abs(float(high_position) - float(low_position)),
+            3.0 * abs(axis_step),
+            1e-12,
+        )
+        mask = np.isfinite(x_values) & (x_values >= expected - search_half_width) & (x_values <= expected + search_half_width)
+        if int(np.count_nonzero(mask)) < 3:
+            continue
+        local_x = x_values[mask]
+        local_signal = peak_signal[mask]
+        local_max = float(np.max(local_signal))
+        if not np.isfinite(local_max) or local_max < 0.05 * strongest_signal:
+            continue
+        peak_index = int(np.argmax(local_signal))
+        observed_position = float(local_x[peak_index])
+        observations.append((hkl, observed_position, search_half_width))
+    if len(observations) < lattice_count:
+        return lattice_initial
+
+    def position_residual(values: np.ndarray) -> np.ndarray:
+        cell = build_cell(tuple(float(value) for value in values[:lattice_count]))
+        residuals = []
+        for hkl, observed_position, scale in observations:
+            calculated = _reflection_axis_position(*hkl, cell, axis, calibration)
+            residuals.append((float(observed_position) - calculated) / max(abs(scale), 1e-12))
+        return np.asarray(residuals, dtype=float)
+
+    try:
+        result = _run_least_squares(
+            least_squares,
+            position_residual,
+            np.asarray(lattice_initial, dtype=float),
+            np.asarray(lower, dtype=float),
+            np.asarray(upper, dtype=float),
+            200,
+            None,
+            0.0,
+        )
+    except Exception:
+        return lattice_initial
+    if not np.all(np.isfinite(result.x[:lattice_count])):
+        return lattice_initial
+    initial_cost = float(np.sum(position_residual(np.asarray(lattice_initial, dtype=float)) ** 2))
+    fitted_cost = float(np.sum(position_residual(np.asarray(result.x, dtype=float)) ** 2))
+    if np.isfinite(fitted_cost) and fitted_cost <= initial_cost:
+        return tuple(float(value) for value in result.x[:lattice_count])
+    return lattice_initial
+
+
+def _calibrated_shape_bounds(
+    name: str,
+    value: float,
+    lower: float,
+    upper: float,
+) -> tuple[float, float]:
+    """Return conservative profile-shape bounds around a calibrated value.
+
+    Back-to-back TOF tail terms are instrument/profile parameters. If a CeO2
+    calibration fit has supplied them, the sample fit should refine them only
+    locally. Letting alpha/beta span the full selected TOF range can make the
+    optimizer spend time on unphysical tail/background trade-offs and can cause
+    a batch timeout before convergence.
+    """
+    if name not in {"alpha", "beta", "alp", "bet"}:
+        return lower, upper
+    seeded = abs(float(value))
+    if not np.isfinite(seeded) or seeded <= 0.0:
+        return lower, upper
+    calibrated_lower = max(float(lower), seeded * 0.25)
+    calibrated_upper = min(float(upper), seeded * 4.0)
+    if calibrated_upper <= calibrated_lower:
+        return lower, upper
+    return calibrated_lower, calibrated_upper
+
+
 def fit_pawley(
     x: Sequence[float],
     y: Sequence[float],
@@ -122,14 +299,20 @@ def fit_pawley(
     max_nfev: int = 50000,
     profile_key: str = PROFILE_PSEUDO_VOIGT,
     width_model: str = PAWLEY_WIDTH_CONSTANT,
+    abort_check: Optional[Callable[[], Optional[str]]] = None,
+    stagnation_iterations: int = 0,
+    stagnation_relative_improvement: float = 0.0,
+    convergence_relative_improvement: Optional[float] = None,
+    checkpoint_callback: Optional[Callable[[np.ndarray, np.ndarray, np.ndarray, str], None]] = None,
+    initial_profile_parameters: Optional[Mapping[str, float]] = None,
 ) -> PawleyFitResult:
     from scipy.optimize import least_squares
 
     profile = peak_profile_spec(profile_key)
+    _raise_if_aborted(abort_check)
     width_model = str(width_model or PAWLEY_WIDTH_CONSTANT)
     if width_model not in {PAWLEY_WIDTH_CONSTANT, PAWLEY_WIDTH_D_RESOLUTION}:
         raise ValueError(f"Unsupported Pawley width model: {width_model}")
-    validate_ni_cubic_phase(phase)
     x_values, y_values, e_values = _clean_fit_inputs(x, y, e)
     axis_min = float(np.min(x_values))
     axis_max = float(np.max(x_values))
@@ -144,20 +327,45 @@ def fit_pawley(
         raise ValueError(f"Unsupported Pawley axis: {axis}")
 
     margin = max(float(reflection_margin_percent), 0.0) / 100.0 * max(abs(d_bounds[1] - d_bounds[0]), 1e-6)
-    reflections = generate_fcc_reflections(phase, d_bounds[0] - margin, d_bounds[1] + margin)
+    reflections = generate_phase_reflections(
+        phase, d_bounds[0] - margin, d_bounds[1] + margin, abort_check=abort_check
+    )
     if not reflections:
-        raise ValueError("No Ni FCC reflections are expected in the selected range.")
+        raise ValueError(f"No {phase.name} reflections are expected in the selected range.")
+    if len(reflections) > 120:
+        raise ValueError(
+            f"The selected range contains {len(reflections)} candidate reflections; the Pawley limit is 120. "
+            "Use a narrower fitting range."
+        )
     if is_gsas_tof_profile(profile.key) and axis != AXIS_TOF:
         raise ValueError("GSAS TOF profile functions require fitting on the TOF axis.")
 
     x_norm, _axis_centre, _axis_half_span = _normalised_axis(x_values)
     background_guess = float(np.percentile(y_values, 20.0))
     span = max(axis_max - axis_min, 1e-9)
+    lattice_names, lattice_initial, build_cell = _lattice_parameterisation(phase)
+    lattice_count = len(lattice_names)
+    lattice_fraction = max(float(lattice_tolerance_percent), 1e-9) / 100.0
     fwhm_guess = max(span / max(20.0, 8.0 * len(reflections)), span / 1000.0)
+    lattice_initial = _estimate_lattice_initial_from_peaks(
+        least_squares,
+        x_values,
+        y_values,
+        background_guess,
+        reflections,
+        lattice_names,
+        lattice_initial,
+        build_cell,
+        axis,
+        calibration,
+        lattice_fraction,
+        fwhm_guess,
+    )
+    initial_cell = build_cell(lattice_initial)
     peak_signal = np.maximum(y_values - background_guess, 0.0)
     intensity_guesses = []
     for reflection in reflections:
-        position = _reflection_axis_position(reflection.h, reflection.k, reflection.l, phase.a, axis, calibration)
+        position = _reflection_axis_position(reflection.h, reflection.k, reflection.l, initial_cell, axis, calibration)
         if axis_min <= position <= axis_max:
             intensity_guesses.append(float(np.interp(position, x_values, peak_signal)))
         else:
@@ -168,13 +376,10 @@ def fit_pawley(
     order = max(0, min(int(polynomial_order), 5))
     eta_min, eta_max = sorted((float(eta_bounds[0]), float(eta_bounds[1])))
     eta_initial = min(max(float(eta_initial), eta_min), eta_max)
-    lattice_fraction = max(float(lattice_tolerance_percent), 1e-9) / 100.0
     fwhm_min = max(span * max(float(fwhm_min_fraction), 1e-9), 1e-12)
     fwhm_max = max(span * max(float(fwhm_max_fraction), 1e-6), fwhm_min * 1.001)
     fwhm_guess = min(max(float(fwhm_guess), fwhm_min), fwhm_max)
-    tail_guess = max(fwhm_guess, span * 0.01, fwhm_min)
-    tail_min = max(fwhm_min, span * 1e-5)
-    tail_max = max(span * 2.0, tail_min * 1.001)
+    tail_guess, tail_min, tail_max = back_to_back_tail_bounds(span, fwhm_guess, fwhm_min, fwhm_max)
 
     d_centre = 0.5 * (float(d_bounds[0]) + float(d_bounds[1]))
     d_half_span = max(0.5 * abs(float(d_bounds[1]) - float(d_bounds[0])), 1e-9)
@@ -187,12 +392,21 @@ def fit_pawley(
         macro_term_by_hkl[(reflection.h, reflection.k, reflection.l)] = macro_term
     macro_term_centre = float(np.mean(macro_terms)) if macro_terms else 0.0
     macro_term_half_span = max(0.5 * (max(macro_terms) - min(macro_terms)) if macro_terms else 0.0, 1e-12)
-    shape_names = ["fwhm"] if width_model == PAWLEY_WIDTH_CONSTANT else ["fwhm0_d", "fwhm_d_slope"]
-    if width_model == PAWLEY_WIDTH_CONSTANT:
+    if profile.uses_gsas2_tof_widths:
+        shape_initial, shape_lower_values, shape_upper_values = gsas2_tof_profile_initial_bounds(
+            span, fwhm_guess, fwhm_min, fwhm_max
+        )
+        shape_names = ["sig", "gam", "alp", "bet"]
+        shape_p0 = [shape_initial[name] for name in shape_names]
+        shape_lower = [shape_lower_values[name] for name in shape_names]
+        shape_upper = [shape_upper_values[name] for name in shape_names]
+    elif width_model == PAWLEY_WIDTH_CONSTANT:
+        shape_names = ["fwhm"]
         shape_p0 = [fwhm_guess]
         shape_lower = [fwhm_min]
         shape_upper = [fwhm_max]
     else:
+        shape_names = ["fwhm0_d", "fwhm_d_slope"]
         if axis == AXIS_D_SPACING:
             fwhm0_guess_d = fwhm_guess
             fwhm_min_d = fwhm_min
@@ -235,12 +449,33 @@ def fit_pawley(
         shape_lower.append(-0.005)
         shape_upper.append(0.005)
 
-    p0 = [phase.a] + shape_p0 + intensity_guesses + [background_guess] + [0.0] * order
-    lower = [phase.a * (1.0 - lattice_fraction)] + shape_lower + [0.0] * len(reflections) + [-np.inf] * (order + 1)
-    upper = [phase.a * (1.0 + lattice_fraction)] + shape_upper + [np.inf] * len(reflections) + [np.inf] * (order + 1)
+    if initial_profile_parameters:
+        for index, name in enumerate(shape_names):
+            if name not in initial_profile_parameters:
+                continue
+            try:
+                seeded_value = float(initial_profile_parameters[name])
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(seeded_value):
+                continue
+            calibrated_lower, calibrated_upper = _calibrated_shape_bounds(
+                name, seeded_value, shape_lower[index], shape_upper[index]
+            )
+            shape_lower[index] = calibrated_lower
+            shape_upper[index] = calibrated_upper
+            shape_p0[index] = min(max(seeded_value, shape_lower[index]), shape_upper[index])
 
-    def reflection_fwhm(shape_values: dict[str, float], lattice_a: float, reflection_hkl: tuple[int, int, int]) -> float:
-        d_spacing = _reflection_d_spacing(*reflection_hkl, lattice_a)
+    p0 = list(lattice_initial) + shape_p0 + intensity_guesses + [background_guess] + [0.0] * order
+    lower = [value * (1.0 - lattice_fraction) for value in lattice_initial] + shape_lower + [0.0] * len(reflections) + [-np.inf] * (order + 1)
+    upper = [value * (1.0 + lattice_fraction) for value in lattice_initial] + shape_upper + [np.inf] * len(reflections) + [np.inf] * (order + 1)
+
+    def reflection_fwhm(shape_values: dict[str, float], cell, reflection_hkl: tuple[int, int, int]) -> float:
+        if profile.uses_gsas2_tof_widths:
+            return gsas2_tof_effective_fwhm(
+                shape_values["sig"], shape_values["gam"], shape_values["alp"], shape_values["bet"]
+            )
+        d_spacing = _reflection_d_spacing(*reflection_hkl, cell)
         if width_model == PAWLEY_WIDTH_CONSTANT:
             base_width = float(shape_values["fwhm"])
         else:
@@ -255,11 +490,11 @@ def fit_pawley(
             return float(np.sqrt(base_width * base_width + extra_width * extra_width))
         return base_width
 
-    def reflection_position(shape_values: dict[str, float], lattice_a: float, reflection_hkl: tuple[int, int, int]) -> float:
+    def reflection_position(shape_values: dict[str, float], cell, reflection_hkl: tuple[int, int, int]) -> float:
         h, k, l = reflection_hkl
-        position = _reflection_axis_position(h, k, l, lattice_a, axis, calibration)
+        position = _reflection_axis_position(h, k, l, cell, axis, calibration)
         if refine_position_shift:
-            d_spacing = _reflection_d_spacing(h, k, l, lattice_a)
+            d_spacing = _reflection_d_spacing(h, k, l, cell)
             macro_term = macro_term_by_hkl.get((h, k, l), macro_term_centre)
             macro_normalised = (macro_term - macro_term_centre) / macro_term_half_span
             shift_d = float(shape_values.get("macrostrain", 0.0)) * d_spacing * macro_normalised
@@ -267,17 +502,17 @@ def fit_pawley(
         return float(position)
 
     def model(params: np.ndarray) -> np.ndarray:
-        lattice_a = float(params[0])
-        shape_values = {name: float(value) for name, value in zip(shape_names, params[1 : 1 + len(shape_names)])}
-        intensities_start = 1 + len(shape_names)
+        cell = build_cell(tuple(float(value) for value in params[:lattice_count]))
+        shape_values = {name: float(value) for name, value in zip(shape_names, params[lattice_count : lattice_count + len(shape_names)])}
+        intensities_start = lattice_count + len(shape_names)
         bg_start = intensities_start + len(reflections)
         intensities = params[intensities_start:bg_start]
         bg = params[bg_start:]
         output = _polyval(bg, x_norm)
         for reflection, intensity in zip(reflections, intensities):
             hkl = (reflection.h, reflection.k, reflection.l)
-            position = reflection_position(shape_values, lattice_a, hkl)
-            fwhm_value = reflection_fwhm(shape_values, lattice_a, hkl)
+            position = reflection_position(shape_values, cell, hkl)
+            fwhm_value = reflection_fwhm(shape_values, cell, hkl)
             profile_y = evaluate_peak_profile(
                 profile.key,
                 x_values,
@@ -290,43 +525,115 @@ def fit_pawley(
                 tail=shape_values.get("tail", tail_guess),
                 alpha=shape_values.get("alpha", tail_guess),
                 beta=shape_values.get("beta", tail_guess),
+                sig=shape_values.get("sig"),
+                gam=shape_values.get("gam"),
+                alp=shape_values.get("alp"),
+                bet=shape_values.get("bet"),
             )
             output = output + float(intensity) * profile_y
         return output
 
+    fit_uncertainty = None
+
     def residual(params: np.ndarray) -> np.ndarray:
-        values = y_values - model(params)
-        if e_values is not None:
-            values = values / e_values
+        _raise_if_aborted(abort_check)
+        calculated = model(params)
+        values = y_values - calculated
+        if fit_uncertainty is not None:
+            values = values / fit_uncertainty
         return values
 
-    result = least_squares(
+    if convergence_relative_improvement is None:
+        convergence_relative_improvement = float(stagnation_relative_improvement)
+
+    def optimizer_callback(stage: str):
+        checkpoint_iteration = 0
+        if checkpoint_callback is None:
+            return None
+
+        def callback(intermediate_result) -> None:
+            nonlocal checkpoint_iteration
+            checkpoint_iteration += 1
+            if checkpoint_callback is not None and checkpoint_iteration % 5 == 0:
+                checkpoint_callback(
+                    np.array(x_values, dtype=float, copy=True),
+                    np.array(model(intermediate_result.x), dtype=float, copy=True),
+                    np.array(y_values, dtype=float, copy=True),
+                    stage,
+                )
+
+        return callback
+
+    if checkpoint_callback is not None:
+        checkpoint_callback(
+            np.array(x_values, dtype=float, copy=True),
+            np.array(model(np.asarray(p0, dtype=float)), dtype=float, copy=True),
+            np.array(y_values, dtype=float, copy=True),
+            "initial",
+        )
+
+    result = _run_least_squares(
+        least_squares,
         residual,
         np.asarray(p0, dtype=float),
-        bounds=(np.asarray(lower, dtype=float), np.asarray(upper, dtype=float)),
-        max_nfev=max(100, int(max_nfev)),
+        np.asarray(lower, dtype=float),
+        np.asarray(upper, dtype=float),
+        max_nfev,
+        optimizer_callback("initial refinement"),
+        float(convergence_relative_improvement),
     )
     if not result.success:
         raise ValueError(f"Pawley fit failed: {result.message}")
+    if e_values is not None:
+        fit_uncertainty = _model_based_uncertainty(y_values, model(result.x), e_values)
+        result = _run_least_squares(
+            least_squares,
+            residual,
+            np.asarray(result.x, dtype=float),
+            np.asarray(lower, dtype=float),
+            np.asarray(upper, dtype=float),
+            min(max(100, int(max_nfev)), 2000),
+            optimizer_callback("reweighted refinement"),
+            float(convergence_relative_improvement),
+        )
+        if not result.success:
+            raise ValueError(f"Pawley reweighted fit failed: {result.message}")
 
     params = result.x
     y_fit = model(params)
-    lattice_a = float(params[0])
+    fit_uncertainty = _model_based_uncertainty(y_values, y_fit, e_values)
+    fitted_lattice_values = tuple(float(value) for value in params[:lattice_count])
+    fitted_cell = build_cell(fitted_lattice_values)
+    lattice_a = float(fitted_cell[0])
     uncertainties = _least_squares_parameter_uncertainties(result, len(params))
-    lattice_a_uncertainty = float(uncertainties[0]) if uncertainties is not None else None
-    shape_values = {name: float(value) for name, value in zip(shape_names, params[1 : 1 + len(shape_names)])}
-    if width_model == PAWLEY_WIDTH_CONSTANT:
+    fitted_lattice_uncertainties = {
+        name: (float(uncertainties[index]) if uncertainties is not None else None)
+        for index, name in enumerate(lattice_names)
+    }
+    if lattice_names == ("a",):
+        fitted_lattice_uncertainties.update({"b": fitted_lattice_uncertainties["a"], "c": fitted_lattice_uncertainties["a"]})
+    elif lattice_names == ("a", "c"):
+        fitted_lattice_uncertainties["b"] = fitted_lattice_uncertainties["a"]
+    for angle_name in ("alpha", "beta", "gamma"):
+        fitted_lattice_uncertainties[angle_name] = None
+    lattice_a_uncertainty = fitted_lattice_uncertainties.get("a")
+    shape_values = {name: float(value) for name, value in zip(shape_names, params[lattice_count : lattice_count + len(shape_names)])}
+    if profile.uses_gsas2_tof_widths:
+        fwhm = gsas2_tof_effective_fwhm(
+            shape_values["sig"], shape_values["gam"], shape_values["alp"], shape_values["bet"]
+        )
+    elif width_model == PAWLEY_WIDTH_CONSTANT:
         fwhm = shape_values["fwhm"]
     else:
         fwhm = _d_width_to_axis_width(d_centre, shape_values["fwhm0_d"], axis, calibration)
     eta = shape_values.get("eta", 0.0 if profile.key == PROFILE_GAUSSIAN else 1.0 if profile.key == PROFILE_LORENTZIAN else eta_initial)
-    intensities_start = 1 + len(shape_names)
+    intensities_start = lattice_count + len(shape_names)
     bg_start = intensities_start + len(reflections)
     intensities = params[intensities_start:bg_start]
     bg = params[bg_start:]
     reflection_results = []
     for reflection, intensity in zip(reflections, intensities):
-        position = reflection_position(shape_values, lattice_a, (reflection.h, reflection.k, reflection.l))
+        position = reflection_position(shape_values, fitted_cell, (reflection.h, reflection.k, reflection.l))
         reflection_results.append(
             PawleyReflectionResult(
                 reflection=reflection,
@@ -334,7 +641,7 @@ def fit_pawley(
                 intensity=float(intensity),
             )
         )
-    quality = _fit_quality(y_values, y_fit, e_values, len(params))
+    quality = _fit_quality(y_values, y_fit, fit_uncertainty, len(params))
     profile_parameters = {key: float(value) for key, value in shape_values.items() if key != "fwhm"}
     profile_parameters["reflection_count"] = float(len(reflections))
     profile_parameters["width_model"] = 0.0 if width_model == PAWLEY_WIDTH_CONSTANT else 1.0
@@ -357,4 +664,7 @@ def fit_pawley(
         fit_x=np.array(x_values, dtype=float, copy=True),
         fit_y=np.array(y_fit, dtype=float, copy=True),
         observed_y=np.array(y_values, dtype=float, copy=True),
+        lattice_parameters={name: value for name, value in zip(("a", "b", "c", "alpha", "beta", "gamma"), fitted_cell)},
+        lattice_parameter_uncertainties=fitted_lattice_uncertainties,
+        fit_uncertainty=None if fit_uncertainty is None else np.array(fit_uncertainty, dtype=float, copy=True),
     )
