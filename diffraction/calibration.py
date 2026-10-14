@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
@@ -17,6 +18,7 @@ from .models import (
     PawleyReflectionResult,
     PhaseModel,
     d_to_tof,
+    spectrum_with_calibration,
     tof_to_d,
 )
 from .profiles import (
@@ -611,4 +613,82 @@ def refine_ceo2_calibration(
         pattern_profile_parameters=pattern_fit.profile_parameters,
         pattern_lattice_a=pattern_fit.lattice_a,
         pattern_lattice_a_uncertainty=pattern_fit.lattice_a_uncertainty,
+    )
+
+
+def refine_raw_ceo2_bank_calibration(
+    ceo2_spectrum: FocusedSpectrum,
+    ceo2_phase: PhaseModel,
+    *,
+    polynomial_order: int = 1,
+    minimum_peaks: int = 4,
+    progress_callback: Optional[CalibrationProgressCallback] = None,
+    tof_min: float = OPENGENIE_CALIBRATION_TOF_MIN,
+    tof_max: float = OPENGENIE_CALIBRATION_TOF_MAX,
+) -> CalibrationResult:
+    """Fit a raw-focused bank and accept the issue-defined linear TOF/d model.
+
+    The existing whole-pattern quadratic fit remains available in ``pattern_fit``
+    as a diagnostic. It is not applied because this workflow has no model-selection
+    evidence that a DIFA term is warranted independently of focusing/geometry error.
+    """
+    first_pass = refine_ceo2_calibration(
+        ceo2_spectrum,
+        ceo2_phase,
+        polynomial_order=polynomial_order,
+        minimum_peaks=minimum_peaks,
+        progress_callback=None,
+        tof_min=tof_min,
+        tof_max=tof_max,
+    )
+    refined_seed_spectrum = spectrum_with_calibration(ceo2_spectrum, first_pass.single_peak_calibration)
+    result = refine_ceo2_calibration(
+        refined_seed_spectrum,
+        ceo2_phase,
+        polynomial_order=polynomial_order,
+        minimum_peaks=minimum_peaks,
+        progress_callback=progress_callback,
+        tof_min=tof_min,
+        tof_max=tof_max,
+    )
+    accepted = [peak for peak in result.peak_results if peak.accepted and peak.fitted_tof is not None]
+    d_values = np.asarray([peak.reflection.d_spacing for peak in accepted], dtype=float)
+    tof_values = np.asarray([float(peak.fitted_tof) for peak in accepted], dtype=float)
+    sigma = np.asarray(
+        [max(float(peak.tof_uncertainty), 1.0) if peak.tof_uncertainty is not None else 1.0 for peak in accepted],
+        dtype=float,
+    )
+    uncertainties: dict[str, float] = {}
+    if d_values.size > 2:
+        design = np.column_stack((d_values, np.ones(d_values.size)))
+        weighted = design / sigma[:, None]
+        residual = (tof_values - d_to_tof(d_values, result.single_peak_calibration)) / sigma
+        try:
+            covariance = np.linalg.pinv(weighted.T @ weighted) * (
+                float(np.sum(residual * residual)) / float(d_values.size - 2)
+            )
+            standard = np.sqrt(np.maximum(np.diag(covariance), 0.0))
+            uncertainties = {
+                "difc_uncertainty": float(standard[0]),
+                "tzero_uncertainty": float(standard[1]),
+            }
+        except np.linalg.LinAlgError:
+            uncertainties = {}
+    profile_parameters = dict(result.pattern_profile_parameters)
+    quadratic_difa_uncertainty = profile_parameters.pop("difa_uncertainty", None)
+    if quadratic_difa_uncertainty is not None:
+        profile_parameters["quadratic_difa_uncertainty_diagnostic"] = quadratic_difa_uncertainty
+    profile_parameters.update(uncertainties)
+    profile_parameters.update(
+        {
+            "accepted_calibration_model": "linear DIFC/TZERO",
+            "difa_model_selected": False,
+            "quadratic_pattern_fit_diagnostic_only": True,
+        }
+    )
+    return replace(
+        result,
+        calibration=result.single_peak_calibration,
+        rms_residual_tof=result.single_peak_rms_residual_tof,
+        pattern_profile_parameters=profile_parameters,
     )

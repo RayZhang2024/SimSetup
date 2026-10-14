@@ -82,6 +82,7 @@ from .normalization import apply_vanadium_normalization
 from .profile_metadata import calibration_profile_metadata, initial_profile_parameters_from_metadata
 from .pawley import fit_pawley
 from .profiles import PEAK_PROFILE_SPECS, PROFILE_EXP_VOIGT, PROFILE_GSAS_TOF, is_gsas_tof_profile
+from .raw_dialog import RawNexusCalibrationDialog
 
 try:
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -369,6 +370,9 @@ class CalibrationDialog(QDialog):
         self.close_button = QPushButton("Close")
         self.close_button.clicked.connect(self.accept)
         buttons.addWidget(self.run_button)
+        self.raw_nxs_button = QPushButton("Raw NXS workflow")
+        self.raw_nxs_button.clicked.connect(self.diffraction_tab.open_raw_nexus_dialog)
+        buttons.addWidget(self.raw_nxs_button)
         buttons.addStretch(1)
         buttons.addWidget(self.close_button)
         outer_layout.addLayout(buttons)
@@ -850,6 +854,7 @@ class DiffractionTab(QWidget):
         calibration_menu = menu_bar.addMenu("Calibration")
         self._add_menu_action(calibration_menu, "Open Calibration Dialog", self.open_calibration_dialog)
         self._add_menu_action(calibration_menu, "Run Calibration + Normalization", self.run_calibration_sequence)
+        self._add_menu_action(calibration_menu, "Raw ENGIN-X NXS Workflow", self.open_raw_nexus_dialog)
 
         view_menu = menu_bar.addMenu("View")
         self._add_menu_action(view_menu, "Show Raw Data", lambda: self._set_combo_data(self.data_combo, "raw"))
@@ -993,6 +998,20 @@ class DiffractionTab(QWidget):
     def open_calibration_dialog(self) -> None:
         dialog = CalibrationDialog(self)
         dialog.exec_()
+
+    def open_raw_nexus_dialog(self) -> None:
+        dialog = RawNexusCalibrationDialog(self)
+        dialog.exec_()
+
+    def add_processed_spectrum(self, spectrum: FocusedSpectrum) -> None:
+        self.spectra.append(spectrum)
+        self.corrected_spectra.append(None)
+        self.normalization_results.append(None)
+        bank = f" bank {spectrum.bank_number}" if spectrum.bank_number is not None else ""
+        run = f" run {spectrum.run_number}" if spectrum.run_number else ""
+        self.spectrum_combo.addItem(f"{spectrum.source_path.name}{run}{bank} raw-NXS processed")
+        self.spectrum_combo.setCurrentIndex(len(self.spectra) - 1)
+        self.update_plot()
 
     def open_fitting_settings_dialog(self) -> None:
         self._sync_fitting_settings_from_controls()

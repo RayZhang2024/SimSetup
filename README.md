@@ -28,6 +28,13 @@ Launch the desktop application from the repo-local virtual environment:
 python .\gui_app.py
 ```
 
+Raw ENGIN-X histogram NXS processing is available from **Calibration > Raw
+ENGIN-X NXS Workflow**. It focuses each 1,200-pixel diffraction bank before
+summation, excludes the 180-degree transmission spectra, uses recorded proton
+charge for exposure correction, and saves provisional bank calibration records.
+See [docs/raw-enginx-nxs.md](docs/raw-enginx-nxs.md) for the focusing convention,
+uncertainty model, and remaining scientific validation gaps.
+
 Optional startup inputs:
 
 ```powershell
