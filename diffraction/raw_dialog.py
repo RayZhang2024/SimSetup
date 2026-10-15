@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import (
     QLineEdit, QPushButton, QTextEdit, QVBoxLayout,
 )
 
+from .raw_previews import Ceo2FitPreview, LinearCalibrationPreview, OpenBeamPreview
 from .raw_workflow import RawCalibrationBundle, create_raw_calibration_bundle, save_raw_calibration_bundle
 
 
@@ -75,6 +76,7 @@ class CreateCalibrationDialog(QDialog):
         self.setWindowTitle("Create raw ENGIN-X calibration")
         self.resize(860, 680)
         self.bundle: Optional[RawCalibrationBundle] = None
+        self._run_diagnostics = None
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -100,6 +102,20 @@ class CreateCalibrationDialog(QDialog):
         actions.addWidget(self.save_button)
         actions.addStretch(1)
         layout.addLayout(actions)
+
+        previews = QHBoxLayout()
+        self.open_beam_preview_button = QPushButton("Open-beam preview")
+        self.ceo2_review_button = QPushButton("CeO2 fit review")
+        self.linear_review_button = QPushButton("Linear calibration fit review")
+        for button, preview_class in (
+            (self.open_beam_preview_button, OpenBeamPreview),
+            (self.ceo2_review_button, Ceo2FitPreview),
+            (self.linear_review_button, LinearCalibrationPreview),
+        ):
+            button.setEnabled(False)
+            button.clicked.connect(lambda _checked=False, cls=preview_class: self._open_preview(cls))
+            previews.addWidget(button)
+        layout.addLayout(previews)
 
         self.status = QLabel(
             "Select only the reference and CeO2 NXS files. Both 1,200-spectrum diffraction banks are processed; "
@@ -130,7 +146,10 @@ class CreateCalibrationDialog(QDialog):
 
     def process_banks(self) -> None:
         self.bundle = None
+        self._run_diagnostics = None
         self.save_button.setEnabled(False)
+        for button in (self.open_beam_preview_button, self.ceo2_review_button, self.linear_review_button):
+            button.setEnabled(False)
         try:
             reference = Path(self.reference_path.text().strip())
             ceo2 = Path(self.ceo2_path.text().strip())
@@ -141,17 +160,25 @@ class CreateCalibrationDialog(QDialog):
                 raise ValueError("The CeO2 phase definition is unavailable.")
             masks = {1: _parse_mask(self.bank1_mask.text()), 2: _parse_mask(self.bank2_mask.text())}
             self.status.setText("Processing both diffraction banks...")
-            self.bundle, _diagnostics = create_raw_calibration_bundle(
+            self.bundle, self._run_diagnostics = create_raw_calibration_bundle(
                 reference, ceo2, self.diffraction_tab.calibration_phase,
                 masked_spectrum_ids=masks,
                 smooth_reference=self.smooth_reference.isChecked(),
             )
             self.diagnostics.setPlainText(bundle_details(self.bundle))
             self.save_button.setEnabled(True)
+            for button in (self.open_beam_preview_button, self.ceo2_review_button, self.linear_review_button):
+                button.setEnabled(True)
             self.status.setText("Both banks processed. Review the diagnostics, then save the self-contained JSON.")
         except Exception as exc:
             self.diagnostics.clear()
             self.status.setText(f"Calibration creation failed: {exc}")
+
+    def _open_preview(self, preview_class) -> None:
+        if self.bundle is None or self._run_diagnostics is None:
+            return
+        preview = preview_class(self, self.bundle, self._run_diagnostics)
+        preview.exec_()
 
     def save_bundle(self) -> None:
         if self.bundle is None:

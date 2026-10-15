@@ -351,6 +351,72 @@ class RawNexusUiTests(unittest.TestCase):
         tab.close()
         app.processEvents()
 
+    def test_real_run_previews_use_measured_intermediates_without_activation(self) -> None:
+        import os
+
+        reference = Path.home() / "Downloads" / "ENGINX00377438.nxs"
+        ceo2 = Path.home() / "Downloads" / "ENGINX00377898.nxs"
+        if not reference.is_file() or not ceo2.is_file():
+            self.skipTest("Local ENGIN-X measurements are unavailable.")
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt5.QtWidgets import QApplication
+        from diffraction.raw_dialog import CreateCalibrationDialog
+        from diffraction.raw_previews import OpenBeamPreview, Ceo2FitPreview, LinearCalibrationPreview
+        from diffraction.tab import DiffractionTab
+
+        app = QApplication.instance() or QApplication([])
+        tab = DiffractionTab()
+        dialog = CreateCalibrationDialog(tab)
+        self.assertFalse(dialog.open_beam_preview_button.isEnabled())
+        self.assertFalse(dialog.ceo2_review_button.isEnabled())
+        self.assertFalse(dialog.linear_review_button.isEnabled())
+        dialog.reference_path.setText(str(reference))
+        dialog.ceo2_path.setText(str(ceo2))
+        dialog.process_banks()
+        self.assertIsNotNone(dialog.bundle, dialog.status.text())
+        fingerprint = bundle_fingerprint(dialog.bundle)
+        previews = [
+            OpenBeamPreview(dialog, dialog.bundle, dialog._run_diagnostics),
+            Ceo2FitPreview(dialog, dialog.bundle, dialog._run_diagnostics),
+            LinearCalibrationPreview(dialog, dialog.bundle, dialog._run_diagnostics),
+        ]
+        for button, preview in zip(
+            (dialog.open_beam_preview_button, dialog.ceo2_review_button, dialog.linear_review_button), previews
+        ):
+            self.assertTrue(button.isEnabled())
+            self.assertEqual(preview.tabs.count(), 2)
+        for bank in (1, 2):
+            page = previews[0].tabs.widget(bank - 1)
+            plotted = page.layout().itemAt(0).widget().figure.axes[0].lines
+            self.assertEqual(len(plotted), 2)
+            reference_spectrum = dialog._run_diagnostics[bank]["focused_reference"]
+            np.testing.assert_allclose(
+                plotted[0].get_ydata(),
+                reference_spectrum.y / reference_spectrum.metadata["proton_charge"],
+            )
+            local_fits = dialog._run_diagnostics[bank]["local_peak_fits"]
+            self.assertGreater(len(local_fits), 0)
+            selected = previews[1]._selectors[bank].currentData()
+            peak = dialog._run_diagnostics[bank]["calibration"].peak_results[selected]
+            fit = local_fits[peak.reflection.label]
+            local_axes = previews[1]._local_axes[bank]
+            np.testing.assert_allclose(local_axes[1].lines[1].get_ydata(), fit.fit_y)
+            np.testing.assert_allclose(local_axes[2].lines[0].get_ydata(), fit.observed_y - fit.fit_y)
+            linear_page = previews[2].tabs.widget(bank - 1)
+            linear_axis = linear_page.layout().itemAt(0).widget().figure.axes[0]
+            record = dialog.bundle.bank(bank)
+            fitted_line = next(line for line in linear_axis.lines if line.get_label() == "Weighted linear fit")
+            np.testing.assert_allclose(
+                fitted_line.get_ydata(), record.difc * fitted_line.get_xdata() + record.tzero
+            )
+        self.assertEqual(bundle_fingerprint(dialog.bundle), fingerprint)
+        self.assertIsNone(tab.active_raw_calibration)
+        for preview in previews:
+            preview.close()
+        dialog.close()
+        tab.close()
+        app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,15 @@ There are two separate workflows:
 2. **Analyze samples** reads an active calibration JSON and one or more sample NXS
    files. The original reference and CeO2 files are not required or reopened.
 
+After both banks finish calibration, **Create Calibration** offers three read-only
+popups. The open-beam preview overlays the bank-summed charge-normalized response
+and a smoothed comparison curve; only the selected smoothing option affects the
+stored response. The CeO2 review shows the corrected pattern, matched reflections,
+and selectable local Exp-Voigt fits with linear backgrounds and residuals. The
+linear-fit review plots fitted centres with their TOF uncertainties, the accepted
+weighted DIFC/TZERO line, residuals, and peak acceptance status. Opening these
+views does not activate or rewrite a calibration.
+
 The bank calibration convention is:
 
 ```text

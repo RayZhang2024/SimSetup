@@ -307,9 +307,25 @@ def create_raw_calibration_bundle(
             response_coverage_fraction=tuple(float(value) for value in response_coverage),
         )
         corrected_ceo2 = apply_saved_reference_response(focused_ceo2, provisional_record)
-        result = refine_raw_ceo2_bank_calibration(corrected_ceo2, ceo2_phase)
+        local_peak_fits: dict[str, object] = {}
+
+        def retain_local_fit(stage: str, payload: Mapping[str, object]) -> None:
+            if stage == "local_peak_fit":
+                reflection = payload["reflection"]
+                local_peak_fits[reflection.label] = payload["fit"]
+
+        result = refine_raw_ceo2_bank_calibration(
+            corrected_ceo2, ceo2_phase, progress_callback=retain_local_fit
+        )
         records.append(_bank_record_from_result(focused_reference, corrected_ceo2, result, smooth_reference=smooth_reference))
-        diagnostics[bank_number] = {"reference": reference_diagnostics, "ceo2": ceo2_diagnostics, "calibration": result}
+        diagnostics[bank_number] = {
+            "reference": reference_diagnostics,
+            "ceo2": ceo2_diagnostics,
+            "calibration": result,
+            "focused_reference": focused_reference,
+            "corrected_ceo2": corrected_ceo2,
+            "local_peak_fits": local_peak_fits,
+        }
     bundle = RawCalibrationBundle(
         processing_version=FOCUSING_CONVENTION_VERSION,
         source_runs={

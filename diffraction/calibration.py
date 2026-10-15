@@ -576,6 +576,11 @@ def refine_ceo2_calibration(
                 lorentz_fraction=fit_result.eta,
             )
         )
+        _emit_calibration_progress(
+            progress_callback,
+            "local_peak_fit",
+            {"reflection": reflection, "fit": fit_result},
+        )
 
     single_peak_calibration, single_peak_rms, updated_results = _linear_calibration_from_peaks(
         peak_results,
