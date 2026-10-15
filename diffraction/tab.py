@@ -654,6 +654,7 @@ class DiffractionTab(QWidget):
         self._batch_range: Optional[tuple[float, float]] = None
         self._batch_completed_count = 0
         self._span_selector = None
+        self._range_axis = AXIS_TOF
         self._build_ui()
         self._load_default_phase()
         self._load_default_calibration_phase()
@@ -683,10 +684,6 @@ class DiffractionTab(QWidget):
         self.load_button.clicked.connect(self.load_spectrum_dialog)
         self.remove_spectra_button = QPushButton("Remove spectrum(s)")
         self.remove_spectra_button.clicked.connect(self.remove_spectra_dialog)
-        self.calibration_button = QPushButton("Calibration details")
-        self.calibration_button.clicked.connect(self.open_calibration_details_dialog)
-        self.calibration_status_edit = QLineEdit()
-        self.calibration_status_edit.setReadOnly(True)
         self.phase_button = QPushButton("Load phase")
         self.phase_button.clicked.connect(self.load_phase_dialog)
         self.phase_status_edit = QLineEdit()
@@ -696,11 +693,7 @@ class DiffractionTab(QWidget):
         self.axis_combo = QComboBox()
         self.axis_combo.addItem("TOF", AXIS_TOF)
         self.axis_combo.addItem("d-spacing", AXIS_D_SPACING)
-        self.axis_combo.currentIndexChanged.connect(self.update_plot)
-        self.data_combo = QComboBox()
-        self.data_combo.addItem("Raw", "raw")
-        self.data_combo.addItem("Corrected", "corrected")
-        self.data_combo.currentIndexChanged.connect(self.update_plot)
+        self.axis_combo.currentIndexChanged.connect(self._axis_changed)
         self.fit_scope_combo = QComboBox()
         _populate_fit_scope_combo(self.fit_scope_combo)
         self.fit_scope_combo.currentIndexChanged.connect(self._sync_fitting_settings_from_controls)
@@ -718,11 +711,8 @@ class DiffractionTab(QWidget):
         self.y_view_max_edit = QLineEdit()
         self.y_view_min_edit.returnPressed.connect(self.update_plot)
         self.y_view_max_edit.returnPressed.connect(self.update_plot)
-        self.fit_button = QPushButton("Fit selected range")
+        self.fit_button = QPushButton("Fit single")
         self.fit_button.clicked.connect(self.fit_selected_range)
-        self.batch_scope_combo = QComboBox()
-        self.batch_scope_combo.addItem("Current spectrum", "current")
-        self.batch_scope_combo.addItem("All loaded spectra", "all")
         self.batch_fit_button = QPushButton("Fit batch")
         self.batch_fit_button.clicked.connect(self.fit_batch)
         self.cancel_batch_button = QPushButton("Cancel batch")
@@ -739,48 +729,42 @@ class DiffractionTab(QWidget):
         self._configure_view_limit_edits()
         self.menu_bar = self._build_menu_bar()
 
-        controls_layout.addWidget(self.calibration_button, 0, 0)
-        controls_layout.addWidget(self.calibration_status_edit, 0, 1)
-        controls_layout.addWidget(self.phase_button, 1, 0)
-        controls_layout.addWidget(self.phase_status_edit, 1, 1)
+        controls_layout.addWidget(self.phase_button, 0, 0)
+        controls_layout.addWidget(self.phase_status_edit, 0, 1)
         load_buttons = QWidget()
         load_buttons_layout = QHBoxLayout(load_buttons)
         load_buttons_layout.setContentsMargins(0, 0, 0, 0)
         load_buttons_layout.setSpacing(6)
         load_buttons_layout.addWidget(self.load_button)
         load_buttons_layout.addWidget(self.remove_spectra_button)
-        controls_layout.addWidget(load_buttons, 2, 0, 1, 2)
-        controls_layout.addWidget(QLabel("Spectrum"), 3, 0)
-        controls_layout.addWidget(self.spectrum_combo, 3, 1)
-        controls_layout.addWidget(QLabel("Axis"), 4, 0)
-        controls_layout.addWidget(self.axis_combo, 4, 1)
-        controls_layout.addWidget(QLabel("Data"), 5, 0)
-        controls_layout.addWidget(self.data_combo, 5, 1)
-        controls_layout.addWidget(QLabel("Fit scope"), 6, 0)
-        controls_layout.addWidget(self.fit_scope_combo, 6, 1)
-        controls_layout.addWidget(QLabel("Background order"), 7, 0)
-        controls_layout.addWidget(self.poly_order, 7, 1)
-        controls_layout.addWidget(QLabel("Range min"), 8, 0)
-        controls_layout.addWidget(self.range_min_edit, 8, 1)
-        controls_layout.addWidget(QLabel("Range max"), 9, 0)
-        controls_layout.addWidget(self.range_max_edit, 9, 1)
-        controls_layout.addWidget(self.fit_button, 10, 0, 1, 2)
-        controls_layout.addWidget(QLabel("Batch selection"), 11, 0)
-        controls_layout.addWidget(self.batch_scope_combo, 11, 1)
-        controls_layout.addWidget(self.batch_fit_button, 12, 0)
-        controls_layout.addWidget(self.cancel_batch_button, 12, 1)
-        controls_layout.addWidget(self.batch_progress, 13, 0, 1, 2)
-        controls_layout.addWidget(self.export_button, 14, 0, 1, 2)
-        controls_layout.addWidget(self.clear_results_button, 15, 0, 1, 2)
+        controls_layout.addWidget(load_buttons, 1, 0, 1, 2)
+        controls_layout.addWidget(QLabel("Spectrum"), 2, 0)
+        controls_layout.addWidget(self.spectrum_combo, 2, 1)
+        controls_layout.addWidget(QLabel("Axis"), 3, 0)
+        controls_layout.addWidget(self.axis_combo, 3, 1)
+        controls_layout.addWidget(QLabel("Fit scope"), 4, 0)
+        controls_layout.addWidget(self.fit_scope_combo, 4, 1)
+        controls_layout.addWidget(QLabel("Background order"), 5, 0)
+        controls_layout.addWidget(self.poly_order, 5, 1)
+        controls_layout.addWidget(QLabel("Range min"), 6, 0)
+        controls_layout.addWidget(self.range_min_edit, 6, 1)
+        controls_layout.addWidget(QLabel("Range max"), 7, 0)
+        controls_layout.addWidget(self.range_max_edit, 7, 1)
+        controls_layout.addWidget(self.fit_button, 8, 0, 1, 2)
+        controls_layout.addWidget(self.batch_fit_button, 9, 0)
+        controls_layout.addWidget(self.cancel_batch_button, 9, 1)
+        controls_layout.addWidget(self.batch_progress, 10, 0, 1, 2)
+        controls_layout.addWidget(self.export_button, 11, 0, 1, 2)
+        controls_layout.addWidget(self.clear_results_button, 12, 0, 1, 2)
         details_label = QLabel("Result details")
         self.result_details_edit = QTextEdit()
         self.result_details_edit.setReadOnly(True)
         self.result_details_edit.setMinimumHeight(120)
         self.result_details_edit.setPlaceholderText("Select a result row to view fit details.")
-        controls_layout.addWidget(details_label, 16, 0, 1, 2)
-        controls_layout.addWidget(self.result_details_edit, 17, 0, 1, 2)
+        controls_layout.addWidget(details_label, 13, 0, 1, 2)
+        controls_layout.addWidget(self.result_details_edit, 14, 0, 1, 2)
         controls_layout.setColumnStretch(1, 1)
-        controls_layout.setRowStretch(17, 1)
+        controls_layout.setRowStretch(14, 1)
 
         main_splitter = QSplitter(Qt.Horizontal)
         self.main_splitter = main_splitter
@@ -868,9 +852,6 @@ class DiffractionTab(QWidget):
         self.calibration_details_action.setEnabled(False)
 
         view_menu = menu_bar.addMenu("View")
-        self._add_menu_action(view_menu, "Show Raw Data", lambda: self._set_combo_data(self.data_combo, "raw"))
-        self._add_menu_action(view_menu, "Show Corrected Data", lambda: self._set_combo_data(self.data_combo, "corrected"))
-        view_menu.addSeparator()
         self._add_menu_action(view_menu, "TOF Axis", lambda: self._set_combo_data(self.axis_combo, AXIS_TOF))
         self._add_menu_action(view_menu, "d-spacing Axis", lambda: self._set_combo_data(self.axis_combo, AXIS_D_SPACING))
         view_menu.addSeparator()
@@ -881,7 +862,7 @@ class DiffractionTab(QWidget):
 
         fit_menu = menu_bar.addMenu("Fit")
         self._add_menu_action(fit_menu, "Fitting Settings...", self.open_fitting_settings_dialog)
-        self._add_menu_action(fit_menu, "Fit Selected Range", self.fit_selected_range)
+        self._add_menu_action(fit_menu, "Fit single", self.fit_selected_range)
         self._add_menu_action(fit_menu, "Fit Batch", self.fit_batch)
         fit_menu.addSeparator()
         self._add_menu_action(fit_menu, "Clear Fitting Results", self.clear_fitting_results)
@@ -971,6 +952,15 @@ class DiffractionTab(QWidget):
         bank = f" bank {spectrum.bank_number}" if spectrum.bank_number is not None else ""
         return f"{spectrum.source_path.name}{run}{bank}"
 
+    def _spectrum_label(self, spectrum: FocusedSpectrum) -> str:
+        if spectrum.run_number and spectrum.bank_number is not None:
+            return f"{spectrum.run_number}_{spectrum.bank_number}"
+        return spectrum.source_path.name
+
+    def _add_spectrum_item(self, spectrum: FocusedSpectrum) -> None:
+        self.spectrum_combo.addItem(self._spectrum_label(spectrum))
+        self.spectrum_combo.setItemData(self.spectrum_combo.count() - 1, str(spectrum.source_path), Qt.ToolTipRole)
+
     def _calibration_status_text(self) -> str:
         if self.active_raw_calibration is not None:
             filename = self.active_raw_calibration_path.name if self.active_raw_calibration_path else "unsaved calibration"
@@ -1004,8 +994,6 @@ class DiffractionTab(QWidget):
         return ""
 
     def _refresh_status_fields(self) -> None:
-        if hasattr(self, "calibration_status_edit"):
-            self.calibration_status_edit.setText(self._calibration_status_text())
         if hasattr(self, "phase_status_edit"):
             self.phase_status_edit.setText(self._phase_summary(self.phase))
 
@@ -1062,9 +1050,7 @@ class DiffractionTab(QWidget):
         self.spectra.append(spectrum)
         self.corrected_spectra.append(None)
         self.normalization_results.append(None)
-        bank = f" bank {spectrum.bank_number}" if spectrum.bank_number is not None else ""
-        run = f" run {spectrum.run_number}" if spectrum.run_number else ""
-        self.spectrum_combo.addItem(f"{spectrum.source_path.name}{run}{bank} raw-NXS processed")
+        self._add_spectrum_item(spectrum)
         self.spectrum_combo.setCurrentIndex(len(self.spectra) - 1)
         if update:
             self.update_plot()
@@ -1098,15 +1084,13 @@ class DiffractionTab(QWidget):
         index = self.spectrum_combo.currentIndex()
         if index < 0 or index >= len(self.spectra):
             return None
-        if (
-            hasattr(self, "data_combo")
-            and self.data_combo.currentData() == "corrected"
-            and index < len(self.corrected_spectra)
-            and self.corrected_spectra[index] is not None
-        ):
+        if self._data_mode_for_index(index) == "corrected":
             return self.corrected_spectra[index]
         raw = self.spectra[index]
         return self._with_refined_calibration_if_matching(raw)
+
+    def _data_mode_for_index(self, index: int) -> str:
+        return "corrected" if 0 <= index < len(self.corrected_spectra) and self.corrected_spectra[index] is not None else "raw"
 
     def _with_refined_calibration_if_matching(self, spectrum: FocusedSpectrum) -> FocusedSpectrum:
         if spectrum.metadata.get("calibration_source_kind") == "raw_nxs_json":
@@ -1174,9 +1158,7 @@ class DiffractionTab(QWidget):
             self.spectra.append(spectrum)
             self.corrected_spectra.append(None)
             self.normalization_results.append(None)
-            bank = f" bank {spectrum.bank_number}" if spectrum.bank_number is not None else ""
-            run = f" run {spectrum.run_number}" if spectrum.run_number else ""
-            self.spectrum_combo.addItem(f"{spectrum.source_path.name}{run}{bank}")
+            self._add_spectrum_item(spectrum)
             last_loaded_name = spectrum.source_path.name
             loaded_count += 1
             if self._can_auto_normalise_imports():
@@ -1189,7 +1171,6 @@ class DiffractionTab(QWidget):
         if loaded_count:
             self.spectrum_combo.setCurrentIndex(last_corrected_index if last_corrected_index is not None else len(self.spectra) - 1)
             if corrected_count:
-                self.data_combo.setCurrentIndex(1)
                 noun = "spectrum" if corrected_count == 1 else "spectra"
                 self._set_status(f"Loaded and auto-corrected {corrected_count} {noun}.")
             elif last_loaded_name:
@@ -1265,7 +1246,7 @@ class DiffractionTab(QWidget):
             remaining_spectra.append(spectrum)
             remaining_corrected.append(self.corrected_spectra[index] if index < len(self.corrected_spectra) else None)
             remaining_normalization.append(self.normalization_results[index] if index < len(self.normalization_results) else None)
-            remaining_labels.append(self.spectrum_combo.itemText(index) or spectrum.source_path.name)
+            remaining_labels.append(self.spectrum_combo.itemText(index) or self._spectrum_label(spectrum))
 
         self.spectra = remaining_spectra
         self.corrected_spectra = remaining_corrected
@@ -1275,9 +1256,12 @@ class DiffractionTab(QWidget):
             self.spectrum_combo.clear()
             for label in remaining_labels:
                 self.spectrum_combo.addItem(label)
-            if remaining_labels:
+            if hasattr(self.spectrum_combo, "setItemData"):
+                for index, spectrum in enumerate(remaining_spectra):
+                    self.spectrum_combo.setItemData(index, str(spectrum.source_path), Qt.ToolTipRole)
+            if remaining_spectra:
                 removed_before_or_at_current = sum(1 for index in remove_set if index <= old_current)
-                new_index = max(0, min(old_current - removed_before_or_at_current, len(remaining_labels) - 1))
+                new_index = max(0, min(old_current - removed_before_or_at_current, len(remaining_spectra) - 1))
                 self.spectrum_combo.setCurrentIndex(new_index)
         finally:
             self.spectrum_combo.blockSignals(combo_state)
@@ -1604,7 +1588,6 @@ class DiffractionTab(QWidget):
                 raise ValueError("Load an open beam normalization histogram first.")
             result = self._apply_normalisation_to_index(index)
             self.latest_fit_curve = None
-            self.data_combo.setCurrentIndex(1)
             self._set_status(
                 f"Applied open beam run {result.vanadium_run_number} to sample run {result.sample_run_number}: "
                 f"{result.valid_bins} valid bin(s), {result.invalid_bins} invalid."
@@ -1623,6 +1606,8 @@ class DiffractionTab(QWidget):
     def _apply_normalisation_to_index(self, index: int) -> NormalizationResult:
         if index < 0 or index >= len(self.spectra):
             raise ValueError("Spectrum index is out of range.")
+        if self.spectra[index].metadata.get("raw_nxs_processed"):
+            raise ValueError("Raw NXS spectra are already open-beam normalized and calibrated.")
         if self.vanadium_spectrum is None:
             raise ValueError("Load an open beam normalization histogram first.")
         result = apply_vanadium_normalization(self.spectra[index], self.vanadium_spectrum, self.calibration_result)
@@ -1633,6 +1618,34 @@ class DiffractionTab(QWidget):
 
     def _selected_axis(self) -> str:
         return str(self.axis_combo.currentData() or AXIS_TOF)
+
+    def _axis_changed(self) -> None:
+        axis = self._selected_axis()
+        previous = self._range_axis
+        if axis != previous:
+            minimum = self.range_min_edit.text().strip()
+            maximum = self.range_max_edit.text().strip()
+            if minimum or maximum:
+                try:
+                    spectrum = self.current_spectrum()
+                    if spectrum is None:
+                        raise ValueError("No spectrum is selected.")
+                    if not minimum or not maximum:
+                        raise ValueError("Both range endpoints are required.")
+                    endpoints = self._convert_axis_values(
+                        np.array([float(minimum), float(maximum)]), previous, axis, spectrum
+                    )
+                    if not np.all(np.isfinite(endpoints)):
+                        raise ValueError("Converted range is not finite.")
+                    low, high = sorted(float(value) for value in endpoints)
+                    self.range_min_edit.setText(f"{low:.10g}")
+                    self.range_max_edit.setText(f"{high:.10g}")
+                except (ValueError, OverflowError) as exc:
+                    self.range_min_edit.clear()
+                    self.range_max_edit.clear()
+                    self._set_status(f"Fit range cleared on axis change: {exc}")
+            self._range_axis = axis
+        self.update_plot()
 
     def _axis_data(self, spectrum: FocusedSpectrum) -> tuple[np.ndarray, str]:
         axis = self._selected_axis()
@@ -1734,7 +1747,7 @@ class DiffractionTab(QWidget):
         curve = self.latest_fit_curve
         spectrum_index = self.spectrum_combo.currentIndex()
         axis = self._selected_axis()
-        data_mode = str(self.data_combo.currentData() or "raw")
+        data_mode = self._data_mode_for_index(spectrum_index)
         if (
             curve is not None
             and curve.get("spectrum_index") == spectrum_index
@@ -1766,7 +1779,7 @@ class DiffractionTab(QWidget):
         self.latest_fit_curve = {
             "spectrum_index": self.spectrum_combo.currentIndex(),
             "axis": axis,
-            "data_mode": self.data_combo.currentData(),
+            "data_mode": self._data_mode_for_index(self.spectrum_combo.currentIndex()),
             "x": np.array(fit_x, dtype=float, copy=True),
             "fit_y": np.array(fit_y, dtype=float, copy=True),
             "observed_y": np.array(observed_y, dtype=float, copy=True),
@@ -2000,7 +2013,7 @@ class DiffractionTab(QWidget):
                     profile_details = ";profile_parameters=" + profile_details
                 self._append_structured_result_row(
                     [
-                        spectrum.source_path.name,
+                        self._spectrum_label(spectrum),
                         f"{result.lattice_a:.8g}",
                         self._format_optional_value(result.lattice_a_uncertainty),
                         f"{result.quality.reduced_chi_square:.6g}",
@@ -2010,7 +2023,7 @@ class DiffractionTab(QWidget):
                     "reported_value=lattice_a;reported_axis=d-spacing;fit_axis="
                         + fit_axis
                         + ";data_mode="
-                        + str(self.data_combo.currentData() or "raw")
+                        + self._data_mode_for_index(self.spectrum_combo.currentIndex())
                         + ";peak_function="
                         + result.profile_name
                         + ";scope_method=Whole pattern: Pawley"
@@ -2099,7 +2112,7 @@ class DiffractionTab(QWidget):
                 )
                 self._append_structured_result_row(
                     [
-                        spectrum.source_path.name,
+                        self._spectrum_label(spectrum),
                         "",
                         "",
                         f"{result.quality.reduced_chi_square:.6g}",
@@ -2109,7 +2122,7 @@ class DiffractionTab(QWidget):
                     "reported_value=peak_d;reported_axis=d-spacing;fit_axis="
                     + fit_axis
                     + ";data_mode="
-                    + str(self.data_combo.currentData() or "raw")
+                    + self._data_mode_for_index(self.spectrum_combo.currentIndex())
                     + ";peak_function="
                     + result.model_name
                     + ";scope_method=Individual peak fitting"
@@ -2142,7 +2155,7 @@ class DiffractionTab(QWidget):
         return self._with_refined_calibration_if_matching(self.spectra[index])
 
     def _fit_request(self, index: int, selected_range: tuple[float, float]) -> SpectrumFitRequest:
-        data_mode = str(self.data_combo.currentData() or "raw")
+        data_mode = self._data_mode_for_index(index)
         return SpectrumFitRequest(
             spectrum_index=index,
             spectrum=self._spectrum_for_fit(index, data_mode),
@@ -2202,8 +2215,7 @@ class DiffractionTab(QWidget):
             self._set_status(f"Batch fit cannot start: {exc}")
             return
 
-        current_index = self.spectrum_combo.currentIndex()
-        indices = [current_index] if self.batch_scope_combo.currentData() == "current" else list(range(len(self.spectra)))
+        indices = range(len(self.spectra))
         requests: list[SpectrumFitRequest] = []
         for index in indices:
             try:
@@ -2346,7 +2358,7 @@ class DiffractionTab(QWidget):
                 f"reflections={reflection_details}"
             )
             base_values = [
-                spectrum.source_path.name,
+                self._spectrum_label(spectrum),
                 f"{result.lattice_a:.8g}",
                 self._format_optional_value(result.lattice_a_uncertainty),
                 f"{result.quality.reduced_chi_square:.6g}", f"{result.quality.rwp_percent:.4g}",
@@ -2389,7 +2401,7 @@ class DiffractionTab(QWidget):
                 f"profile_parameters={profile_details};peaks={peak_details}"
             )
             base_values = [
-                spectrum.source_path.name,
+                self._spectrum_label(spectrum),
                 "", "",
                 f"{result.quality.reduced_chi_square:.6g}", f"{result.quality.rwp_percent:.4g}",
                 "Success", "",
@@ -2401,6 +2413,7 @@ class DiffractionTab(QWidget):
             details,
             peak_labels=peak_labels if record.settings.fit_scope == FIT_SCOPE_PEAK else None,
         )
+        self.results_table.item(row, 0).setToolTip(str(spectrum.source_path))
         self.fit_records_by_row[row] = record
         self.fit_records_by_spectrum[(record.spectrum_index, record.display_axis, record.data_mode)] = record
         curve_payload = self._fit_curve_payload(record)
@@ -2416,7 +2429,7 @@ class DiffractionTab(QWidget):
         curve_payload: Optional[dict[str, object]] = None,
     ) -> None:
         spectrum = self.spectra[index] if 0 <= index < len(self.spectra) else None
-        source = "" if spectrum is None else spectrum.source_path.name
+        source = "" if spectrum is None else self._spectrum_label(spectrum)
         run = "" if spectrum is None else spectrum.run_number or ""
         bank = "" if spectrum is None else str(spectrum.bank_number or "")
         row = self._append_structured_result_row(
@@ -2425,13 +2438,15 @@ class DiffractionTab(QWidget):
             f"status=failed;error={message};run={run};bank={bank};axis={self._selected_axis()};"
             f"range_min={selected_range[0]:.6g};range_max={selected_range[1]:.6g}",
         )
+        if spectrum is not None:
+            self.results_table.item(row, 0).setToolTip(str(spectrum.source_path))
         if curve_payload is not None:
             payload = dict(curve_payload)
             self.fit_curve_payloads_by_row[row] = payload
             key = (
                 int(payload.get("spectrum_index", index)),
                 str(payload.get("axis", self._selected_axis())),
-                str(payload.get("data_mode", self.data_combo.currentData() or "raw")),
+                str(payload.get("data_mode", self._data_mode_for_index(index))),
             )
             self.fit_curve_payloads_by_spectrum[key] = payload
         self.results_table.selectRow(row)
@@ -2441,7 +2456,6 @@ class DiffractionTab(QWidget):
         try:
             self.spectrum_combo.setCurrentIndex(record.spectrum_index)
             self._set_combo_data(self.axis_combo, record.display_axis)
-            self._set_combo_data(self.data_combo, record.data_mode)
             self.latest_fit_curve = self._fit_curve_payload(record)
         finally:
             self._result_selection_update = False
@@ -2452,7 +2466,6 @@ class DiffractionTab(QWidget):
         try:
             self.spectrum_combo.setCurrentIndex(int(payload.get("spectrum_index", -1)))
             self._set_combo_data(self.axis_combo, str(payload.get("axis", AXIS_TOF)))
-            self._set_combo_data(self.data_combo, str(payload.get("data_mode", "raw")))
             self.latest_fit_curve = payload
         finally:
             self._result_selection_update = False
@@ -2597,6 +2610,10 @@ class DiffractionTab(QWidget):
         for peak_index in range(self._peak_result_column_count):
             values.extend(peak_values_by_column.get(peak_index, [""] * len(PEAK_RESULT_FIELD_HEADERS)))
         row = self._append_result_row(values)
+        for spectrum in self.spectra:
+            if self._spectrum_label(spectrum) == values[0]:
+                self.results_table.item(row, 0).setToolTip(str(spectrum.source_path))
+                break
         self.results_table.setVerticalHeaderItem(row, QTableWidgetItem(str(row + 1)))
         header_item = self.results_table.verticalHeaderItem(row)
         if header_item is not None:
