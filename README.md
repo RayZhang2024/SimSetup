@@ -28,10 +28,13 @@ Launch the desktop application from the repo-local virtual environment:
 python .\gui_app.py
 ```
 
-Raw ENGIN-X histogram NXS processing is available from **Calibration > Raw
-ENGIN-X NXS Workflow**. It focuses each 1,200-pixel diffraction bank before
-summation, excludes the 180-degree transmission spectra, uses recorded proton
-charge for exposure correction, and saves provisional bank calibration records.
+Create a self-contained raw ENGIN-X calibration with **Calibration > Create
+Calibration…**, then activate it with **Calibration > Load Calibration JSON…**.
+Load sample NXS files through **File > Load Spectrum**. The workflow focuses each
+1,200-pixel diffraction bank before summation, excludes the 180-degree
+transmission spectra, and uses each run's recorded proton charge. Sample analysis
+requires only the saved JSON and sample NXS file; the original reference and CeO2
+files are not reopened.
 See [docs/raw-enginx-nxs.md](docs/raw-enginx-nxs.md) for the focusing convention,
 uncertainty model, and remaining scientific validation gaps.
 

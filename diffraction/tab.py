@@ -82,7 +82,13 @@ from .normalization import apply_vanadium_normalization
 from .profile_metadata import calibration_profile_metadata, initial_profile_parameters_from_metadata
 from .pawley import fit_pawley
 from .profiles import PEAK_PROFILE_SPECS, PROFILE_EXP_VOIGT, PROFILE_GSAS_TOF, is_gsas_tof_profile
-from .raw_dialog import RawNexusCalibrationDialog
+from .raw_dialog import CalibrationDetailsDialog, CreateCalibrationDialog
+from .raw_workflow import (
+    RawCalibrationBundle,
+    analyze_sample_nexus,
+    bundle_fingerprint,
+    load_raw_calibration_bundle,
+)
 
 try:
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -632,6 +638,8 @@ class DiffractionTab(QWidget):
         self.calibration_fit_spectrum: Optional[FocusedSpectrum] = None
         self.vanadium_spectrum: Optional[FocusedSpectrum] = None
         self.calibration_result: Optional[CalibrationResult] = None
+        self.active_raw_calibration: Optional[RawCalibrationBundle] = None
+        self.active_raw_calibration_path: Optional[Path] = None
         self.fitting_settings = FittingSettings()
         self.latest_fit_curve: Optional[dict[str, object]] = None
         self.fit_records_by_row: dict[int, SpectrumFitRecord] = {}
@@ -675,8 +683,8 @@ class DiffractionTab(QWidget):
         self.load_button.clicked.connect(self.load_spectrum_dialog)
         self.remove_spectra_button = QPushButton("Remove spectrum(s)")
         self.remove_spectra_button.clicked.connect(self.remove_spectra_dialog)
-        self.calibration_button = QPushButton("Calibration")
-        self.calibration_button.clicked.connect(self.open_calibration_dialog)
+        self.calibration_button = QPushButton("Calibration details")
+        self.calibration_button.clicked.connect(self.open_calibration_details_dialog)
         self.calibration_status_edit = QLineEdit()
         self.calibration_status_edit.setReadOnly(True)
         self.phase_button = QPushButton("Load phase")
@@ -852,9 +860,12 @@ class DiffractionTab(QWidget):
         self._add_menu_action(file_menu, "Export Selected Fit Curve", self.export_selected_curve_dialog)
 
         calibration_menu = menu_bar.addMenu("Calibration")
-        self._add_menu_action(calibration_menu, "Open Calibration Dialog", self.open_calibration_dialog)
-        self._add_menu_action(calibration_menu, "Run Calibration + Normalization", self.run_calibration_sequence)
-        self._add_menu_action(calibration_menu, "Raw ENGIN-X NXS Workflow", self.open_raw_nexus_dialog)
+        self._add_menu_action(calibration_menu, "Create Calibration…", self.open_create_calibration_dialog)
+        self._add_menu_action(calibration_menu, "Load Calibration JSON…", self.load_raw_calibration_json_dialog)
+        self.calibration_details_action = self._add_menu_action(
+            calibration_menu, "Calibration Details…", self.open_calibration_details_dialog
+        )
+        self.calibration_details_action.setEnabled(False)
 
         view_menu = menu_bar.addMenu("View")
         self._add_menu_action(view_menu, "Show Raw Data", lambda: self._set_combo_data(self.data_combo, "raw"))
@@ -961,6 +972,9 @@ class DiffractionTab(QWidget):
         return f"{spectrum.source_path.name}{run}{bank}"
 
     def _calibration_status_text(self) -> str:
+        if self.active_raw_calibration is not None:
+            filename = self.active_raw_calibration_path.name if self.active_raw_calibration_path else "unsaved calibration"
+            return f"Active: {filename} ({self.active_raw_calibration.scientific_status})"
         return "Calibrated" if self.calibration_result is not None else "Not calibrated"
 
     def _correction_summary(self, spectrum: Optional[FocusedSpectrum]) -> str:
@@ -999,11 +1013,52 @@ class DiffractionTab(QWidget):
         dialog = CalibrationDialog(self)
         dialog.exec_()
 
-    def open_raw_nexus_dialog(self) -> None:
-        dialog = RawNexusCalibrationDialog(self)
+    def open_create_calibration_dialog(self) -> None:
+        dialog = CreateCalibrationDialog(self)
         dialog.exec_()
 
-    def add_processed_spectrum(self, spectrum: FocusedSpectrum) -> None:
+    def open_raw_nexus_dialog(self) -> None:
+        """Compatibility entry point for the legacy calibration dialog."""
+        self.open_create_calibration_dialog()
+
+    def load_raw_calibration_json_dialog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load raw ENGIN-X calibration", str(Path.cwd()), "JSON (*.json)"
+        )
+        if not path:
+            return
+        try:
+            bundle = load_raw_calibration_bundle(path)
+            self.activate_raw_calibration(bundle, Path(path))
+            self._set_status(f"Loaded active calibration {Path(path).name}.")
+        except Exception as exc:
+            self._set_status(f"Could not load calibration JSON: {exc}")
+
+    def activate_raw_calibration(self, bundle: RawCalibrationBundle, path: Optional[Path] = None) -> None:
+        new_fingerprint = bundle_fingerprint(bundle)
+        stale = [
+            index for index, spectrum in enumerate(self.spectra)
+            if spectrum.metadata.get("raw_nxs_processed")
+            and spectrum.metadata.get("calibration_bundle_fingerprint") != new_fingerprint
+        ]
+        if stale:
+            self.remove_spectrum_indices(stale)
+        self.active_raw_calibration = bundle
+        self.active_raw_calibration_path = Path(path) if path is not None else None
+        if hasattr(self, "calibration_details_action"):
+            self.calibration_details_action.setEnabled(True)
+        self._refresh_status_fields()
+
+    def open_calibration_details_dialog(self) -> None:
+        if self.active_raw_calibration is None:
+            self._set_status("No calibration JSON is active.")
+            return
+        dialog = CalibrationDetailsDialog(
+            self, self.active_raw_calibration, self.active_raw_calibration_path
+        )
+        dialog.exec_()
+
+    def add_processed_spectrum(self, spectrum: FocusedSpectrum, *, update: bool = True) -> None:
         self.spectra.append(spectrum)
         self.corrected_spectra.append(None)
         self.normalization_results.append(None)
@@ -1011,7 +1066,8 @@ class DiffractionTab(QWidget):
         run = f" run {spectrum.run_number}" if spectrum.run_number else ""
         self.spectrum_combo.addItem(f"{spectrum.source_path.name}{run}{bank} raw-NXS processed")
         self.spectrum_combo.setCurrentIndex(len(self.spectra) - 1)
-        self.update_plot()
+        if update:
+            self.update_plot()
 
     def open_fitting_settings_dialog(self) -> None:
         self._sync_fitting_settings_from_controls()
@@ -1053,6 +1109,10 @@ class DiffractionTab(QWidget):
         return self._with_refined_calibration_if_matching(raw)
 
     def _with_refined_calibration_if_matching(self, spectrum: FocusedSpectrum) -> FocusedSpectrum:
+        if spectrum.metadata.get("calibration_source_kind") == "raw_nxs_json":
+            return spectrum
+        if int(spectrum.metadata.get("calibration_application_count", 0)) > 0:
+            return spectrum
         result = self.calibration_result
         if result is None:
             return spectrum
@@ -1079,7 +1139,7 @@ class DiffractionTab(QWidget):
             self,
             "Load focused diffraction data",
             str(Path.cwd() / "Hist"),
-            "Diffraction data (*.his *.xye *.dat *.csv);;All files (*.*)",
+            "Diffraction data (*.his *.xye *.dat *.csv *.nxs);;All files (*.*)",
         )
         self.load_spectrum_paths([Path(path_str) for path_str in paths])
 
@@ -1089,6 +1149,22 @@ class DiffractionTab(QWidget):
         last_corrected_index: Optional[int] = None
         last_loaded_name = ""
         for path in paths:
+            if path.suffix.lower() == ".nxs":
+                if self.active_raw_calibration is None:
+                    self._set_status(
+                        f"Cannot analyze {path.name}: load a compatible calibration JSON from the Calibration menu first."
+                    )
+                    continue
+                try:
+                    processed = analyze_sample_nexus(path, self.active_raw_calibration)
+                except Exception as exc:
+                    self._set_status(f"Failed to analyze {path.name}: {exc}")
+                    continue
+                for spectrum in processed:
+                    self.add_processed_spectrum(spectrum, update=False)
+                    loaded_count += 1
+                    last_loaded_name = spectrum.source_path.name
+                continue
             try:
                 spectrum = load_focused_spectrum(path)
             except Exception as exc:

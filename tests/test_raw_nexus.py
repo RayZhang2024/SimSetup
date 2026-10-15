@@ -7,14 +7,16 @@ from pathlib import Path
 
 import numpy as np
 
-from diffraction.focusing import focus_enginx_bank, geometric_difc, rebin_histogram_overlap
-from diffraction.models import FocusedSpectrum
+from diffraction.focusing import FOCUSING_CONVENTION_VERSION, focus_enginx_bank, geometric_difc, rebin_histogram_overlap
+from diffraction.models import FocusedSpectrum, InstrumentCalibration
 from diffraction.nexus import read_enginx_histogram_nexus
 from diffraction.normalization import apply_charge_reference_normalization
 from diffraction.raw_workflow import (
     RawBankCalibrationRecord,
     RawCalibrationBundle,
+    apply_saved_reference_response,
     apply_bundle_calibration,
+    bundle_fingerprint,
     load_raw_calibration_bundle,
     save_raw_calibration_bundle,
 )
@@ -85,6 +87,53 @@ def _write_synthetic_nexus(path: Path, *, reordered: bool = True) -> None:
         root.create_dataset("title", data=[b"synthetic"])
 
 
+def _record(bank: int) -> RawBankCalibrationRecord:
+    first_id = 1 if bank == 1 else 1201
+    return RawBankCalibrationRecord(
+        bank_number=bank,
+        bank_name=f"Bank {bank}",
+        calibration_model="linear DIFC/TZERO from individual CeO2 peak fits",
+        difc=18350.0 + bank,
+        tzero=-30.0,
+        difa=0.0,
+        coefficient_units={"difc": "microsecond/angstrom", "tzero": "microsecond", "difa": "microsecond/angstrom^2"},
+        difc_uncertainty=1.0,
+        tzero_uncertainty=2.0,
+        difa_uncertainty=None,
+        rms_residual_tof=3.0,
+        usable_tof_range_us=(0.0, 3.0),
+        peak_diagnostics=({"hkl": "111", "accepted": True},),
+        focusing={
+            "masked_spectrum_ids": [],
+            "target_geometric_difc": 18000.0,
+            "pixel_geometric_difc_by_spectrum": {str(first_id): 18000.0},
+        },
+        reference_response_settings={"smoothed": False},
+        response_bin_edges_us=(0.0, 1.0, 2.0, 3.0),
+        response_values_per_uah=(1.0, 1.0, 1.0),
+        response_uncertainties_per_uah=(0.1, 0.1, 0.1),
+        response_valid_mask=(True, True, True),
+        response_coverage_fraction=(1.0, 1.0, 1.0),
+    )
+
+
+def _bundle(offset: float = 0.0) -> RawCalibrationBundle:
+    records = []
+    for bank in (1, 2):
+        record = _record(bank)
+        if offset:
+            record = RawBankCalibrationRecord(**{**record.__dict__, "difc": record.difc + offset})
+        records.append(record)
+    return RawCalibrationBundle(
+        processing_version=FOCUSING_CONVENTION_VERSION,
+        source_runs={"reference": {"run": "1"}, "ceo2": {"run": "2"}},
+        ceo2_standard={"name": "CeO2", "lattice_parameter_angstrom": 5.41165},
+        scientific_status="provisional",
+        remaining_validation_gaps=("independent focused reference unavailable",),
+        banks=tuple(records),
+    )
+
+
 class RawNexusReaderTests(unittest.TestCase):
     def test_reader_maps_reordered_rows_by_spectrum_id_and_excludes_transmission(self) -> None:
         with _temporary_path(".nxs") as path:
@@ -148,6 +197,32 @@ class FocusingTests(unittest.TestCase):
         observed = focused.x_centres[int(np.argmax(focused.y))]
         self.assertAlmostEqual(observed, diagnostics.target_geometric_difc * d_spacing, delta=15.0)
 
+    def test_saved_pixel_basis_rejects_changed_geometry(self) -> None:
+        with _temporary_path(".nxs") as path:
+            _write_synthetic_nexus(path, reordered=False)
+            run = read_enginx_histogram_nexus(path)
+        focused, _ = focus_enginx_bank(run, 1)
+        saved = {int(key): float(value) for key, value in focused.metadata["pixel_geometric_difc_by_spectrum"].items()}
+        changed = dict(saved)
+        changed[1] *= 1.01
+        with self.assertRaisesRegex(ValueError, "geometry is incompatible"):
+            focus_enginx_bank(run, 1, pixel_geometric_difc_by_spectrum=changed)
+
+    def test_saved_basis_does_not_require_masked_pixel_entries(self) -> None:
+        with _temporary_path(".nxs") as path:
+            _write_synthetic_nexus(path, reordered=False)
+            run = read_enginx_histogram_nexus(path)
+        focused, _ = focus_enginx_bank(run, 1, masked_spectrum_ids={1})
+        saved = {int(key): float(value) for key, value in focused.metadata["pixel_geometric_difc_by_spectrum"].items()}
+        reapplied, _ = focus_enginx_bank(
+            run,
+            1,
+            masked_spectrum_ids={1},
+            target_geometric_difc=float(focused.metadata["target_geometric_difc"]),
+            pixel_geometric_difc_by_spectrum=saved,
+        )
+        np.testing.assert_allclose(reapplied.y, focused.y)
+
 
 class ChargeNormalizationTests(unittest.TestCase):
     @staticmethod
@@ -178,49 +253,53 @@ class ChargeNormalizationTests(unittest.TestCase):
 
 class PersistenceTests(unittest.TestCase):
     def test_round_trip_and_exactly_once_application(self) -> None:
-        record = RawBankCalibrationRecord(
-            bank_number=1,
-            bank_name="North/+90 degree",
-            difc=18350.0,
-            tzero=-30.0,
-            difa=0.0,
-            difc_uncertainty=1.0,
-            tzero_uncertainty=2.0,
-            difa_uncertainty=None,
-            rms_residual_tof=3.0,
-            usable_tof_range_us=(5000.0, 45000.0),
-            peak_diagnostics=({"hkl": "111", "accepted": True},),
-            focusing={"masked_spectrum_ids": []},
-            reference_response_settings={"smooth": False},
-        )
-        bundle = RawCalibrationBundle(
-            processing_version="test-v1",
-            source_runs={"ceo2": {"run": "1", "charge_uah": 2.0}},
-            ceo2_standard={"name": "CeO2", "lattice_parameter_angstrom": 5.41165},
-            scientific_status="provisional",
-            remaining_validation_gaps=("independent focused reference unavailable",),
-            banks=(record,),
-        )
+        bundle = _bundle()
         with _temporary_path(".json") as path:
             save_raw_calibration_bundle(bundle, path)
             loaded = load_raw_calibration_bundle(path)
         spectrum = FocusedSpectrum(
             source_path=Path("sample.nxs"),
-            x=np.array([5000.0, 10000.0, 20000.0]),
-            y=np.array([1.0, 2.0]),
+            x=np.array([0.0, 1.0, 2.0, 3.0]),
+            y=np.array([1.0, 2.0, 3.0]),
             x_is_edges=True,
-            metadata={"calibration_application_count": 0},
+            metadata={
+                "calibration_application_count": 0,
+                "processing_version": FOCUSING_CONVENTION_VERSION,
+                "target_geometric_difc": 18000.0,
+            },
             bank_number=1,
         )
         calibrated = apply_bundle_calibration(spectrum, loaded)
-        self.assertEqual(calibrated.calibration.difc, 18350.0)
+        self.assertEqual(calibrated.calibration.difc, 18351.0)
         self.assertEqual(calibrated.metadata["calibration_application_count"], 1)
         with self.assertRaisesRegex(ValueError, "already been applied"):
             apply_bundle_calibration(calibrated, loaded)
 
+    def test_response_rebin_is_unbiased_for_different_bin_widths(self) -> None:
+        sample = FocusedSpectrum(
+            source_path=Path("sample.nxs"),
+            x=np.array([0.0, 0.5, 1.5, 3.0]),
+            y=np.array([5.0, 10.0, 15.0]),
+            e=np.sqrt(np.array([5.0, 10.0, 15.0])),
+            x_is_edges=True,
+            metadata={"proton_charge": 10.0, "detector_coverage_fraction": [1.0, 1.0, 1.0]},
+            bank_number=1,
+        )
+        corrected = apply_saved_reference_response(sample, _record(1))
+        np.testing.assert_allclose(corrected.y, [1.0, 1.0, 1.0])
+        self.assertTrue(corrected.metadata["reference_response_rebinned"])
+
+    def test_partial_sample_detector_coverage_is_masked(self) -> None:
+        sample = FocusedSpectrum(
+            source_path=Path("sample.nxs"), x=np.arange(4.0), y=np.ones(3), x_is_edges=True,
+            metadata={"proton_charge": 1.0, "detector_coverage_fraction": [1.0, 0.8, 1.0]}, bank_number=1,
+        )
+        corrected = apply_saved_reference_response(sample, _record(1))
+        self.assertTrue(np.isnan(corrected.y[1]))
+
 
 class RawNexusUiTests(unittest.TestCase):
-    def test_raw_dialog_exposes_role_bank_mask_and_persistence_controls(self) -> None:
+    def test_calibration_menu_and_creation_dialog_have_separate_workflows(self) -> None:
         import os
 
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -233,11 +312,42 @@ class RawNexusUiTests(unittest.TestCase):
         app = QApplication.instance() or QApplication([])
         tab = DiffractionTab()
         dialog = RawNexusCalibrationDialog(tab)
-        self.assertEqual(dialog.bank_combo.count(), 2)
-        dialog.mask_edit.setText("1,3-5")
-        self.assertEqual(dialog._masked_spectrum_ids(), {1, 3, 4, 5})
+        self.assertFalse(hasattr(dialog, "sample_path"))
+        self.assertTrue(hasattr(dialog, "reference_path"))
+        self.assertTrue(hasattr(dialog, "ceo2_path"))
         self.assertFalse(dialog.smooth_reference.isChecked())
+        calibration_menu = next(action.menu() for action in tab.menu_bar.actions() if action.text() == "Calibration")
+        self.assertEqual(
+            [action.text() for action in calibration_menu.actions()],
+            ["Create Calibration…", "Load Calibration JSON…", "Calibration Details…"],
+        )
         dialog.close()
+        tab.close()
+        app.processEvents()
+
+    def test_raw_json_calibration_is_not_overwritten_and_stale_samples_are_removed(self) -> None:
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt5.QtWidgets import QApplication
+        from diffraction.tab import DiffractionTab
+
+        app = QApplication.instance() or QApplication([])
+        tab = DiffractionTab()
+        spectrum = FocusedSpectrum(
+            source_path=Path("sample.nxs"), x=np.arange(4.0), y=np.ones(3), x_is_edges=True,
+            calibration=InstrumentCalibration(18351.0, -30.0, 0.0), bank_number=1,
+            metadata={
+                "raw_nxs_processed": True,
+                "calibration_source_kind": "raw_nxs_json",
+                "calibration_application_count": 1,
+                "calibration_bundle_fingerprint": bundle_fingerprint(_bundle()),
+            },
+        )
+        tab.calibration_result = object()
+        self.assertIs(tab._with_refined_calibration_if_matching(spectrum), spectrum)
+        tab.add_processed_spectrum(spectrum, update=False)
+        tab.activate_raw_calibration(_bundle(10.0), Path("replacement.json"))
+        self.assertEqual(tab.spectra, [])
         tab.close()
         app.processEvents()
 
