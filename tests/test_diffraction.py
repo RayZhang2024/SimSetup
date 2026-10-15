@@ -1432,6 +1432,130 @@ class DiffractionFittingTests(unittest.TestCase):
         tab.close()
         app.processEvents()
 
+    def test_repeated_plot_range_selections_replace_previous_highlight(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from matplotlib.backend_bases import MouseEvent
+        from PyQt5.QtWidgets import QApplication
+        from diffraction.tab import DiffractionTab
+
+        app = QApplication.instance() or QApplication([])
+        tab = DiffractionTab()
+        try:
+            tab.load_spectrum_paths([HIST / "ENGINX373922_1.his"])
+            for low, high in ((20000.0, 21000.0), (23000.0, 22000.0), (25000.0, 26000.0)):
+                tab._on_span_selected(low, high)
+                tab.update_plot()
+                self.assertEqual(float(tab.range_min_edit.text()), min(low, high))
+                self.assertEqual(float(tab.range_max_edit.text()), max(low, high))
+                visible = [patch for patch in tab.axes.patches if patch.get_visible()]
+                self.assertEqual(len(visible), 1)
+                self.assertAlmostEqual(visible[0].get_x(), min(low, high))
+                self.assertAlmostEqual(visible[0].get_x() + visible[0].get_width(), max(low, high))
+            tab.canvas.draw()
+            y_mid = sum(tab.axes.get_ylim()) / 2.0
+            for name, x_value in (("button_press_event", 27000.0), ("motion_notify_event", 28000.0), ("button_release_event", 28000.0)):
+                pixel_x, pixel_y = tab.axes.transData.transform((x_value, y_mid))
+                event = MouseEvent(name, tab.canvas, pixel_x, pixel_y, button=1)
+                tab.canvas.callbacks.process(name, event)
+            self.assertAlmostEqual(float(tab.range_min_edit.text()), 27000.0, places=2)
+            self.assertAlmostEqual(float(tab.range_max_edit.text()), 28000.0, places=2)
+            self.assertEqual(sum(patch.get_visible() for patch in tab.axes.patches), 1)
+        finally:
+            tab.close()
+            app.processEvents()
+
+    def test_delete_selected_results_reindexes_records_curves_and_details(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt5.QtCore import QItemSelectionModel
+        from PyQt5.QtWidgets import QApplication
+        from diffraction.batch_fitting import SpectrumFitRecord
+        from diffraction.tab import DiffractionTab
+
+        app = QApplication.instance() or QApplication([])
+        tab = DiffractionTab()
+        try:
+            calibration = load_focused_spectrum(HIST / "ENGINX373922_1.his").calibration
+            x = np.linspace(19500.0, 20500.0, 120)
+            y = 2.0 + 100.0 * pseudo_voigt_profile(x, 20000.0, 80.0, 0.4)
+            fit = fit_peak_profile(PROFILE_VOIGT, x, y, polynomial_order=0)
+            settings = FittingSettings(fit_scope=FIT_SCOPE_PEAK, use_uncertainties=False)
+            for index in range(2):
+                spectrum = FocusedSpectrum(
+                    source_path=Path(f"spectrum_{index}.xye"), x=x, y=y,
+                    calibration=calibration, run_number=str(index), bank_number=1,
+                )
+                tab.spectra.append(spectrum)
+                tab.corrected_spectra.append(None)
+                tab.normalization_results.append(None)
+                tab._add_spectrum_item(spectrum)
+            records = []
+            for index, scale in ((0, 1.0), (1, 1.1), (0, 1.2)):
+                record = SpectrumFitRecord(
+                    spectrum_index=index, spectrum=tab.spectra[index], settings=settings,
+                    display_axis=AXIS_TOF, fit_axis=AXIS_TOF, data_mode="raw",
+                    selected_range=(19500.0, 20500.0), result=fit,
+                    curve_x=fit.fit_x, fit_y=fit.fit_y * scale, observed_y=fit.observed_y,
+                )
+                records.append(record)
+                tab._append_fit_record(record)
+            self.assertEqual(tab.results_table.rowCount(), 3)
+            self.assertTrue(tab.delete_selected_button.isEnabled())
+            tab._batch_thread = object()
+            tab._update_delete_selected_button()
+            self.assertFalse(tab.delete_selected_button.isEnabled())
+            tab.delete_selected_results()
+            self.assertEqual(tab.results_table.rowCount(), 3)
+            tab._batch_thread = None
+            tab.results_table.selectRow(1)
+            tab.delete_selected_results()
+            self.assertEqual(tab.results_table.rowCount(), 2)
+            self.assertEqual(tab.result_details_edit.toPlainText(), "")
+            self.assertEqual(len(tab.spectra), 2)
+            self.assertIs(tab.fit_records_by_row[1], records[2])
+            self.assertIs(tab.fit_records_by_spectrum[(0, AXIS_TOF, "raw")], records[2])
+            self.assertNotIn((1, AXIS_TOF, "raw"), tab.fit_records_by_spectrum)
+            self.assertEqual(tab.results_table.verticalHeaderItem(1).text(), "2")
+            tab.results_table.selectRow(1)
+            tab.delete_selected_results()
+            self.assertEqual(tab.results_table.rowCount(), 1)
+            self.assertIs(tab.fit_records_by_spectrum[(0, AXIS_TOF, "raw")], records[0])
+            self.assertIs(tab.fit_curve_payloads_by_spectrum[(0, AXIS_TOF, "raw")], tab.fit_curve_payloads_by_row[0])
+            tab.spectrum_combo.setCurrentIndex(0)
+            np.testing.assert_allclose(tab._current_fit_curve()["fit_y"], fit.fit_y)
+            tab._append_fit_record(records[1])
+            tab._append_fit_record(records[2])
+            tab.results_table.selectRow(1)
+            self.assertIn("run: 1", tab.result_details_edit.toPlainText())
+            model = tab.results_table.selectionModel()
+            model.select(tab.results_table.model().index(2, 0), QItemSelectionModel.Select | QItemSelectionModel.Rows)
+            self.assertEqual(len(model.selectedRows()), 2)
+            tab.delete_selected_results()
+            self.assertEqual(tab.results_table.rowCount(), 1)
+            self.assertIs(tab.fit_records_by_row[0], records[0])
+            tab.results_table.selectRow(0)
+            tab.delete_selected_results()
+            self.assertEqual(tab.results_table.rowCount(), 0)
+            partial_curve = {
+                "spectrum_index": 0, "axis": AXIS_TOF, "data_mode": "raw",
+                "x": fit.fit_x, "fit_y": fit.fit_y, "observed_y": fit.observed_y,
+                "label": "Partial fit",
+            }
+            tab._append_failed_fit(0, "Timed out", (19500.0, 20500.0), curve_payload=partial_curve)
+            self.assertIs(tab._current_fit_curve(), tab.fit_curve_payloads_by_row[0])
+            tab.delete_selected_results()
+            self.assertEqual(tab.results_table.rowCount(), 0)
+            self.assertFalse(tab.fit_records_by_row)
+            self.assertFalse(tab.fit_records_by_spectrum)
+            self.assertFalse(tab.fit_curve_payloads_by_row)
+            self.assertFalse(tab.fit_curve_payloads_by_spectrum)
+            self.assertIsNone(tab._current_fit_curve())
+            self.assertEqual(tab.result_details_edit.toPlainText(), "")
+            self.assertFalse(tab.delete_selected_button.isEnabled())
+            self.assertEqual(len(tab.spectra), 2)
+        finally:
+            tab.close()
+            app.processEvents()
+
     def test_remove_multiple_loaded_spectra_clears_stale_fit_state(self) -> None:
         try:
             from diffraction.tab import DiffractionTab

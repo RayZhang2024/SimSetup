@@ -726,6 +726,9 @@ class DiffractionTab(QWidget):
         self.export_button.clicked.connect(self.export_results_dialog)
         self.clear_results_button = QPushButton("Clear fitting results")
         self.clear_results_button.clicked.connect(self.clear_fitting_results)
+        self.delete_selected_button = QPushButton("Delete selected")
+        self.delete_selected_button.clicked.connect(self.delete_selected_results)
+        self.delete_selected_button.setEnabled(False)
         self._configure_view_limit_edits()
         self.menu_bar = self._build_menu_bar()
 
@@ -755,7 +758,8 @@ class DiffractionTab(QWidget):
         controls_layout.addWidget(self.cancel_batch_button, 9, 1)
         controls_layout.addWidget(self.batch_progress, 10, 0, 1, 2)
         controls_layout.addWidget(self.export_button, 11, 0, 1, 2)
-        controls_layout.addWidget(self.clear_results_button, 12, 0, 1, 2)
+        controls_layout.addWidget(self.delete_selected_button, 12, 0)
+        controls_layout.addWidget(self.clear_results_button, 12, 1)
         details_label = QLabel("Result details")
         self.result_details_edit = QTextEdit()
         self.result_details_edit.setReadOnly(True)
@@ -795,6 +799,7 @@ class DiffractionTab(QWidget):
         self.results_table = QTableWidget(0, len(RESULT_HEADERS))
         self.results_table.setHorizontalHeaderLabels(RESULT_HEADERS)
         self.results_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.results_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.results_table.setAlternatingRowColors(True)
         self.results_table.setWordWrap(False)
         self.results_table.itemSelectionChanged.connect(self._update_selected_result_details)
@@ -1655,6 +1660,9 @@ class DiffractionTab(QWidget):
     def update_plot(self) -> None:
         if not hasattr(self, "axes"):
             return
+        if self._span_selector is not None:
+            self._span_selector.disconnect_events()
+            self._span_selector = None
         self.axes.clear()
         self.residual_axes.clear()
         spectrum = self.current_spectrum()
@@ -1790,6 +1798,7 @@ class DiffractionTab(QWidget):
         low, high = sorted((float(xmin), float(xmax)))
         self.range_min_edit.setText(f"{low:.6g}")
         self.range_max_edit.setText(f"{high:.6g}")
+        self.update_plot()
 
     def _current_range_or_none(self) -> Optional[tuple[float, float]]:
         try:
@@ -2258,6 +2267,7 @@ class DiffractionTab(QWidget):
         self.fit_button.setEnabled(False)
         self.batch_fit_button.setEnabled(False)
         self.clear_results_button.setEnabled(False)
+        self.delete_selected_button.setEnabled(False)
         self.cancel_batch_button.setEnabled(True)
         self._set_status(f"Batch fitting 0/{len(requests)} spectra...")
         thread.start()
@@ -2302,6 +2312,7 @@ class DiffractionTab(QWidget):
         self._batch_cancel_event = None
         self._batch_range = None
         self._batch_completed_count = 0
+        self._update_delete_selected_button()
 
     def _fit_completion_text(self, record: SpectrumFitRecord) -> str:
         result = record.result
@@ -2502,8 +2513,54 @@ class DiffractionTab(QWidget):
         self._peak_result_labels = []
         self._update_lattice_column_visibility()
         self.result_details_edit.clear()
+        self._update_delete_selected_button()
         self.update_plot()
         self._set_status("Cleared all diffraction fitting results.")
+
+    def delete_selected_results(self) -> None:
+        if self._batch_thread is not None:
+            self._set_status("Cancel the active batch before deleting fitting results.")
+            return
+        selected = {index.row() for index in self.results_table.selectedIndexes()}
+        if not selected:
+            return
+        remaining = [row for row in range(self.results_table.rowCount()) if row not in selected]
+        records = {new: self.fit_records_by_row[old] for new, old in enumerate(remaining) if old in self.fit_records_by_row}
+        curves = {new: self.fit_curve_payloads_by_row[old] for new, old in enumerate(remaining) if old in self.fit_curve_payloads_by_row}
+        was_blocked = self.results_table.blockSignals(True)
+        try:
+            self.results_table.clearSelection()
+            for row in sorted(selected, reverse=True):
+                self.results_table.removeRow(row)
+            for row in range(self.results_table.rowCount()):
+                if self.results_table.verticalHeaderItem(row) is None:
+                    self.results_table.setVerticalHeaderItem(row, QTableWidgetItem())
+                self.results_table.verticalHeaderItem(row).setText(str(row + 1))
+        finally:
+            self.results_table.blockSignals(was_blocked)
+        self.fit_records_by_row = records
+        self.fit_curve_payloads_by_row = curves
+        self.fit_records_by_spectrum.clear()
+        self.fit_curve_payloads_by_spectrum.clear()
+        for row in range(self.results_table.rowCount()):
+            record = records.get(row)
+            if record is not None:
+                self.fit_records_by_spectrum[(record.spectrum_index, record.display_axis, record.data_mode)] = record
+            curve = curves.get(row)
+            if curve is not None:
+                key = (int(curve["spectrum_index"]), str(curve["axis"]), str(curve["data_mode"]))
+                self.fit_curve_payloads_by_spectrum[key] = curve
+        self.latest_fit_curve = None
+        self.result_details_edit.clear()
+        self._update_lattice_column_visibility()
+        self._update_delete_selected_button()
+        self.update_plot()
+        self._set_status(f"Deleted {len(selected)} fitting result(s).")
+
+    def _update_delete_selected_button(self) -> None:
+        self.delete_selected_button.setEnabled(
+            self._batch_thread is None and bool(self.results_table.selectedIndexes())
+        )
 
     def _append_result_row(self, values: list[str]) -> int:
         row = self.results_table.rowCount()
@@ -2623,6 +2680,7 @@ class DiffractionTab(QWidget):
     def _update_selected_result_details(self) -> None:
         if not hasattr(self, "result_details_edit"):
             return
+        self._update_delete_selected_button()
         selected_rows = sorted({index.row() for index in self.results_table.selectedIndexes()})
         if not selected_rows:
             self.result_details_edit.clear()
