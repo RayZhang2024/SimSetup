@@ -236,14 +236,14 @@ def _bank_record_from_result(
     return RawBankCalibrationRecord(
         bank_number=focused_ceo2.bank_number,
         bank_name=focused_ceo2.bank_name or f"Bank {focused_ceo2.bank_number}",
-        calibration_model="linear DIFC/TZERO from individual CeO2 peak fits",
+        calibration_model="quadratic DIFC/DIFA/TZERO from individual CeO2 peak fits",
         difc=calibration_result.calibration.difc,
         tzero=calibration_result.calibration.tzero,
-        difa=0.0,
+        difa=calibration_result.calibration.difa,
         coefficient_units={"difc": "microsecond/angstrom", "tzero": "microsecond", "difa": "microsecond/angstrom^2"},
         difc_uncertainty=_optional_float(fit_parameters.get("difc_uncertainty")),
         tzero_uncertainty=_optional_float(fit_parameters.get("tzero_uncertainty")),
-        difa_uncertainty=None,
+        difa_uncertainty=_optional_float(fit_parameters.get("difa_uncertainty")),
         rms_residual_tof=calibration_result.rms_residual_tof,
         usable_tof_range_us=(float(valid_centres.min()), float(valid_centres.max())),
         peak_diagnostics=peak_diagnostics,
@@ -338,6 +338,7 @@ def create_raw_calibration_bundle(
             "No independently trusted focused ENGIN-X reference was available for absolute validation.",
             "The 50 m primary flight path is nominal; NXS source_detector_distance is zero.",
             "V-Nb reference structure and detector-efficiency separation remain unvalidated.",
+            "The empirical fitted DIFA has not been independently separated from focusing or geometry error.",
         ),
         banks=tuple(records),
     )
@@ -351,8 +352,15 @@ def validate_raw_calibration_bundle(bundle: RawCalibrationBundle) -> None:
     if {record.bank_number for record in bundle.banks} != {1, 2}:
         raise ValueError("Raw calibration must contain complete records for banks 1 and 2.")
     for record in bundle.banks:
-        if record.calibration_model != "linear DIFC/TZERO from individual CeO2 peak fits" or record.difa != 0.0:
-            raise ValueError(f"Bank {record.bank_number} does not contain the accepted linear DIFA=0 model.")
+        legacy = record.calibration_model == "linear DIFC/TZERO from individual CeO2 peak fits" and record.difa == 0.0
+        quadratic = record.calibration_model == "quadratic DIFC/DIFA/TZERO from individual CeO2 peak fits"
+        if not (legacy or quadratic) or not np.all(np.isfinite([record.difc, record.difa, record.tzero])):
+            raise ValueError(f"Bank {record.bank_number} has invalid calibration coefficients or model.")
+        if quadratic and any(
+            value is None or not np.isfinite(value) or value < 0.0
+            for value in (record.difc_uncertainty, record.difa_uncertainty, record.tzero_uncertainty)
+        ):
+            raise ValueError(f"Bank {record.bank_number} has invalid quadratic coefficient uncertainties.")
         edges = np.asarray(record.response_bin_edges_us, dtype=float)
         values = np.asarray(record.response_values_per_uah, dtype=float)
         uncertainty = np.asarray(record.response_uncertainties_per_uah, dtype=float)
@@ -447,7 +455,7 @@ def apply_bundle_calibration(spectrum: FocusedSpectrum, bundle: RawCalibrationBu
         raise ValueError("Spectrum TOF range does not overlap the saved calibration's usable range.")
     return spectrum_with_calibration(
         spectrum,
-        InstrumentCalibration(difc=record.difc, tzero=record.tzero, difa=0.0),
+        InstrumentCalibration(difc=record.difc, tzero=record.tzero, difa=record.difa),
         {
             "calibration_application_count": 1,
             "raw_calibration_processing_version": bundle.processing_version,

@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QLineEdit, QPushButton, QTextEdit, QVBoxLayout,
 )
 
-from .raw_previews import Ceo2FitPreview, LinearCalibrationPreview, OpenBeamPreview
+from .raw_previews import Ceo2FitPreview, OpenBeamPreview, QuadraticCalibrationPreview
 from .raw_workflow import RawCalibrationBundle, create_raw_calibration_bundle, save_raw_calibration_bundle
 
 
@@ -31,11 +31,13 @@ def _parse_mask(text: str) -> set[int]:
 
 
 def bundle_details(bundle: RawCalibrationBundle, filename: Optional[str] = None) -> str:
+    legacy = all(record.calibration_model.startswith("linear") for record in bundle.banks)
     lines = [
         f"Active calibration: {filename or '(not yet saved)'}",
         f"Status: {bundle.scientific_status}",
         f"Processing convention: {bundle.processing_version}",
-        "Accepted model: TOF = DIFC * d + TZERO; DIFA = 0",
+        "Accepted model: TOF = DIFC * d + TZERO (DIFA = 0)" if legacy
+        else "Accepted model: TOF = DIFC * d + DIFA * d^2 + TZERO",
         "Reference response: charge-normalized histogram bin integrals (counts/uAh)",
     ]
     for record in bundle.banks:
@@ -44,15 +46,17 @@ def bundle_details(bundle: RawCalibrationBundle, filename: Optional[str] = None)
         lines.extend([
             "",
             f"Bank {record.bank_number}",
-            f"  Linear calibration: DIFC={record.difc:.8g} {record.coefficient_units.get('difc')}, "
-            f"TZERO={record.tzero:.8g} {record.coefficient_units.get('tzero')}, DIFA=0",
-            f"  Uncertainties: DIFC={record.difc_uncertainty}, TZERO={record.tzero_uncertainty}",
+            f"  Calibration ({record.calibration_model}): DIFC={record.difc:.8g} {record.coefficient_units.get('difc')}, "
+            f"DIFA={record.difa:.8g} {record.coefficient_units.get('difa')}, "
+            f"TZERO={record.tzero:.8g} {record.coefficient_units.get('tzero')}",
+            f"  Uncertainties: DIFC={record.difc_uncertainty}, DIFA={record.difa_uncertainty}, "
+            f"TZERO={record.tzero_uncertainty}",
             f"  RMS residual={record.rms_residual_tof:.6g} us",
             f"  Reference bins={len(record.response_values_per_uah)}, valid={int(valid.sum())}, "
             f"full coverage={int(np.count_nonzero(coverage >= 1.0 - 1e-9))}",
             f"  Fixed target geometric DIFC={record.focusing.get('target_geometric_difc')}",
             f"  Masked spectra={record.focusing.get('masked_spectrum_ids', [])}",
-            "  Individual-peak linear calibration diagnostics:",
+            f"  Individual-peak {'linear' if record.calibration_model.startswith('linear') else 'quadratic'} calibration diagnostics:",
         ])
         for peak in record.peak_diagnostics:
             state = "accepted" if peak.get("accepted") else f"rejected: {peak.get('rejection_reason')}"
@@ -106,11 +110,11 @@ class CreateCalibrationDialog(QDialog):
         previews = QHBoxLayout()
         self.open_beam_preview_button = QPushButton("Open-beam preview")
         self.ceo2_review_button = QPushButton("CeO2 fit review")
-        self.linear_review_button = QPushButton("Linear calibration fit review")
+        self.quadratic_review_button = QPushButton("Quadratic calibration fit review")
         for button, preview_class in (
             (self.open_beam_preview_button, OpenBeamPreview),
             (self.ceo2_review_button, Ceo2FitPreview),
-            (self.linear_review_button, LinearCalibrationPreview),
+            (self.quadratic_review_button, QuadraticCalibrationPreview),
         ):
             button.setEnabled(False)
             button.clicked.connect(lambda _checked=False, cls=preview_class: self._open_preview(cls))
@@ -148,7 +152,7 @@ class CreateCalibrationDialog(QDialog):
         self.bundle = None
         self._run_diagnostics = None
         self.save_button.setEnabled(False)
-        for button in (self.open_beam_preview_button, self.ceo2_review_button, self.linear_review_button):
+        for button in (self.open_beam_preview_button, self.ceo2_review_button, self.quadratic_review_button):
             button.setEnabled(False)
         try:
             reference = Path(self.reference_path.text().strip())
@@ -167,7 +171,7 @@ class CreateCalibrationDialog(QDialog):
             )
             self.diagnostics.setPlainText(bundle_details(self.bundle))
             self.save_button.setEnabled(True)
-            for button in (self.open_beam_preview_button, self.ceo2_review_button, self.linear_review_button):
+            for button in (self.open_beam_preview_button, self.ceo2_review_button, self.quadratic_review_button):
                 button.setEnabled(True)
             self.status.setText("Both banks processed. Review the diagnostics, then save the self-contained JSON.")
         except Exception as exc:

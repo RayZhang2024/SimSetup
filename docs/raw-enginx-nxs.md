@@ -19,19 +19,25 @@ popups. The open-beam preview overlays the bank-summed charge-normalized respons
 and a smoothed comparison curve; only the selected smoothing option affects the
 stored response. The CeO2 review shows the corrected pattern, matched reflections,
 and selectable local Exp-Voigt fits with linear backgrounds and residuals. The
-linear-fit review plots fitted centres with their TOF uncertainties, the accepted
-weighted DIFC/TZERO line, residuals, and peak acceptance status. Opening these
+quadratic-fit review plots fitted centres with their TOF uncertainties, the accepted
+weighted DIFC/DIFA/TZERO curve, residuals, and peak acceptance status. Opening these
 views does not activate or rewrite a calibration.
 
 The bank calibration convention is:
 
 ```text
-TOF (microsecond) = DIFC (microsecond/angstrom) * d (angstrom) + TZERO (microsecond)
+TOF (microsecond) = DIFC (microsecond/angstrom) * d (angstrom)
+                  + DIFA (microsecond/angstrom^2) * d^2 (angstrom^2) + TZERO (microsecond)
 ```
 
-The accepted raw-workflow calibration is linear. A quadratic whole-pattern fit
-may be retained as a diagnostic, but `DIFA` is not applied without independent
-model-selection evidence.
+The accepted raw-workflow calibration is a weighted quadratic least-squares fit
+of individual CeO2 peak centres using their TOF uncertainties. Peak residuals
+and outlier handling use this fitted model; the whole-pattern quadratic fit is
+retained only as a diagnostic and its DIFA is not substituted. At least four
+accepted peaks with three distinct d-spacings and a well-conditioned fit are
+required. Coefficient uncertainties come from the weighted fit covariance,
+inflated when the reduced chi-square exceeds one. DIFA=0 is only a peak-matching
+seed, not a constraint on the accepted calibration.
 
 ## Spectrum and bank mapping
 
@@ -79,7 +85,7 @@ support from biasing the ratio.
 
 Geometry therefore provides relative alignment, not an independent absolute
 calibration. The unlabeled `user_table07`-`user_table09` datasets are ignored.
-CeO2 peak fitting corrects the bank-level DIFC/TZERO once after focusing.
+CeO2 peak fitting corrects the bank-level DIFC/DIFA/TZERO once after focusing.
 
 ## Exposure and reference correction
 
@@ -106,7 +112,8 @@ units, statistical uncertainties, validity and detector-coverage masks, file
 identity, run and charge data, instrument-profile provenance, grouping and pixel
 masks, the fixed focusing basis, CeO2 standard, fitted coefficients and
 uncertainties, individual-peak acceptance and residuals, usable TOF range,
-processing version, and scientific validation gaps. `DIFA=0` is required.
+processing version, and scientific validation gaps. New bundles store fitted
+DIFA and its uncertainty; previously saved linear DIFA=0 bundles remain loadable.
 
 Loading another JSON invalidates sample spectra processed with a different
 bundle fingerprint. Raw-NXS spectra retain the accepted JSON calibration during
@@ -119,4 +126,6 @@ The three supplied runs have been processed locally and produce internally
 consistent bank-level CeO2 fits. This does not establish independent absolute
 accuracy. Remaining gaps are an independently trusted focused reference,
 confirmation of the nominal geometry provenance, and separation of V-Nb
-structure from detector response.
+structure from detector response. The fitted DIFA is empirical and has not
+been independently separated from focusing or geometry error; the different
+whole-pattern estimate is retained for comparison, not substituted.

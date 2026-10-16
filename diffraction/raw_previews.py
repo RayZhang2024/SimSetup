@@ -149,9 +149,9 @@ class Ceo2FitPreview(_BankPreview):
         canvas.draw()
 
 
-class LinearCalibrationPreview(_BankPreview):
+class QuadraticCalibrationPreview(_BankPreview):
     def __init__(self, parent, bundle: RawCalibrationBundle, diagnostics: Mapping[int, Mapping[str, object]]):
-        super().__init__(parent, "Linear calibration fit review", bundle, diagnostics)
+        super().__init__(parent, "Quadratic calibration fit review", bundle, diagnostics)
         for record in bundle.banks:
             bank = record.bank_number
             page = self._page(bank)
@@ -165,12 +165,12 @@ class LinearCalibrationPreview(_BankPreview):
                 for peak in accepted
             ])
             line_d = np.linspace(float(d.min()), float(d.max()), 300)
-            fitted_line = record.difc * line_d + record.tzero
-            residual = centres - (record.difc * d + record.tzero)
+            fitted_line = record.difc * line_d + record.difa * line_d**2 + record.tzero
+            residual = centres - (record.difc * d + record.difa * d**2 + record.tzero)
             canvas, axes, residual_axes = _plot(page, residuals=True)
             axes.errorbar(d, centres, yerr=sigma, fmt="o", ms=4, color="#2877ae", capsize=2,
                           label="Accepted fitted peak centres (TOF uncertainty)")
-            axes.plot(line_d, fitted_line, color="#bf513c", lw=1.4, label="Weighted linear fit")
+            axes.plot(line_d, fitted_line, color="#bf513c", lw=1.4, label="Weighted quadratic fit")
             for peak in rejected:
                 if peak.fitted_tof is not None:
                     axes.plot(peak.reflection.d_spacing, peak.fitted_tof, "x", color="#777777")
@@ -180,18 +180,27 @@ class LinearCalibrationPreview(_BankPreview):
             residual_axes.set_ylabel("Residual (us)")
             residual_axes.set_xlabel("Known CeO2 d-spacing (A)")
             axes.set_title(
-                f"Bank {bank}: DIFC={record.difc:.8g} us/A, TZERO={record.tzero:.8g} us, "
-                f"RMS={record.rms_residual_tof:.5g} us, DIFA=0"
+                f"Bank {bank}: DIFC={record.difc:.8g} us/A, DIFA={record.difa:.8g} us/A^2, "
+                f"TZERO={record.tzero:.8g} us, RMS={record.rms_residual_tof:.5g} us"
             )
             axes.legend(loc="best")
             canvas.draw()
             status = QTextEdit(page)
             status.setReadOnly(True)
             status.setMaximumHeight(110)
-            status.setPlainText("\n".join(
+            status.setPlainText(
+                f"TOF = DIFC*d + DIFA*d^2 + TZERO; coefficient uncertainties: "
+                f"DIFC={record.difc_uncertainty}, DIFA={record.difa_uncertainty}, "
+                f"TZERO={record.tzero_uncertainty}\n"
+                f"Full-pattern diagnostic only: DIFC={result.pattern_profile_parameters.get('pattern_difc_diagnostic')}, "
+                f"DIFA={result.pattern_profile_parameters.get('pattern_difa_diagnostic')}, "
+                f"TZERO={result.pattern_profile_parameters.get('pattern_tzero_diagnostic')}\n" + "\n".join(
                 f"{peak.reflection.label}: {'accepted' if peak.accepted else 'rejected (' + peak.rejection_reason + ')'}; "
                 f"d={peak.reflection.d_spacing:.7g} A; centre={peak.fitted_tof} us; "
                 f"uncertainty={peak.tof_uncertainty} us; residual={peak.residual_tof} us"
                 for peak in result.peak_results
             ))
             page.layout().addWidget(status)
+
+
+LinearCalibrationPreview = QuadraticCalibrationPreview

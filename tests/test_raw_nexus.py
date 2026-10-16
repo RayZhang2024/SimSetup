@@ -9,18 +9,21 @@ from unittest.mock import patch
 
 import numpy as np
 
+from diffraction.calibration import _quadratic_calibration_from_peaks
 from diffraction.focusing import FOCUSING_CONVENTION_VERSION, focus_enginx_bank, geometric_difc, rebin_histogram_overlap
-from diffraction.models import FocusedSpectrum, InstrumentCalibration
+from diffraction.models import CalibrationPeakResult, FocusedSpectrum, InstrumentCalibration, Reflection, d_to_tof, tof_to_d
 from diffraction.nexus import read_enginx_histogram_nexus
 from diffraction.normalization import apply_charge_reference_normalization
 from diffraction.raw_workflow import (
     RawBankCalibrationRecord,
     RawCalibrationBundle,
+    analyze_sample_nexus,
     apply_saved_reference_response,
     apply_bundle_calibration,
     bundle_fingerprint,
     load_raw_calibration_bundle,
     save_raw_calibration_bundle,
+    validate_raw_calibration_bundle,
 )
 
 
@@ -134,6 +137,48 @@ def _bundle(offset: float = 0.0) -> RawCalibrationBundle:
         remaining_validation_gaps=("independent focused reference unavailable",),
         banks=tuple(records),
     )
+
+
+class QuadraticCalibrationTests(unittest.TestCase):
+    @staticmethod
+    def _peaks(d_values: np.ndarray, *, outlier_index: int | None = None) -> list[CalibrationPeakResult]:
+        calibration = InstrumentCalibration(difc=18350.0, difa=-72.0, tzero=-28.0)
+        peaks = []
+        for index, d in enumerate(d_values):
+            expected = float(d_to_tof(d, calibration))
+            observed = expected + (500.0 if index == outlier_index else 0.05 * (-1)**index)
+            peaks.append(CalibrationPeakResult(
+                reflection=Reflection(index + 1, 0, 0, float(d)),
+                expected_tof=expected, observed_tof=observed, fitted_tof=observed,
+                residual_tof=observed - expected, prominence=100.0, accepted=True,
+                tof_uncertainty=2.0 + index * 0.1,
+            ))
+        return peaks
+
+    def test_weighted_quadratic_recovers_coefficients_and_residuals(self) -> None:
+        peaks = self._peaks(np.linspace(1.0, 2.4, 8))
+        calibration, rms, updated, uncertainties = _quadratic_calibration_from_peaks(peaks, 4)
+        self.assertAlmostEqual(calibration.difc, 18350.0, delta=1.0)
+        self.assertAlmostEqual(calibration.difa, -72.0, delta=1.0)
+        self.assertAlmostEqual(calibration.tzero, -28.0, delta=1.0)
+        self.assertLess(rms, 0.1)
+        self.assertTrue(all(peak.accepted for peak in updated))
+        self.assertTrue(all(np.isfinite(value) and value > 0.0 for value in uncertainties.values()))
+        for peak in updated:
+            self.assertAlmostEqual(peak.residual_tof, peak.fitted_tof - d_to_tof(peak.reflection.d_spacing, calibration))
+
+    def test_quadratic_outlier_and_insufficient_span_are_reported(self) -> None:
+        peaks = self._peaks(np.linspace(1.0, 2.4, 8), outlier_index=3)
+        calibration, _rms, updated, _uncertainties = _quadratic_calibration_from_peaks(peaks, 4)
+        self.assertFalse(updated[3].accepted)
+        self.assertIn("outlier", updated[3].rejection_reason)
+        self.assertAlmostEqual(calibration.difa, -72.0, delta=1.0)
+        with self.assertRaisesRegex(ValueError, "span is too small"):
+            _quadratic_calibration_from_peaks(self._peaks(np.linspace(1.0, 1.000001, 5)), 4)
+        incomplete = self._peaks(np.linspace(1.0, 2.0, 4))
+        incomplete[0] = replace(incomplete[0], tof_uncertainty=None)
+        with self.assertRaisesRegex(ValueError, "finite, positive TOF uncertainties"):
+            _quadratic_calibration_from_peaks(incomplete, 4)
 
 
 class RawNexusReaderTests(unittest.TestCase):
@@ -281,6 +326,33 @@ class ChargeNormalizationTests(unittest.TestCase):
 
 
 class PersistenceTests(unittest.TestCase):
+    def test_quadratic_bundle_round_trip_and_sample_application(self) -> None:
+        records = tuple(replace(
+            record,
+            calibration_model="quadratic DIFC/DIFA/TZERO from individual CeO2 peak fits",
+            difa=-42.0,
+            difa_uncertainty=3.0,
+        ) for record in _bundle().banks)
+        bundle = replace(_bundle(), banks=records)
+        with _temporary_path(".json") as path:
+            save_raw_calibration_bundle(bundle, path)
+            loaded = load_raw_calibration_bundle(path)
+        self.assertEqual(loaded.bank(1).difa, -42.0)
+        self.assertEqual(loaded.bank(1).difa_uncertainty, 3.0)
+        spectrum = FocusedSpectrum(
+            source_path=Path("sample.nxs"), x=np.array([0.0, 1.0, 2.0, 3.0]),
+            y=np.ones(3), x_is_edges=True,
+            metadata={"processing_version": FOCUSING_CONVENTION_VERSION, "target_geometric_difc": 18000.0},
+            bank_number=1,
+        )
+        calibrated = apply_bundle_calibration(spectrum, loaded)
+        self.assertEqual(calibrated.calibration.difa, -42.0)
+        d = np.array([1.2, 1.8])
+        np.testing.assert_allclose(tof_to_d(d_to_tof(d, calibrated.calibration), calibrated.calibration), d)
+        invalid = replace(bundle, banks=(replace(records[0], difa=float("nan")), records[1]))
+        with self.assertRaisesRegex(ValueError, "invalid calibration coefficients"):
+            validate_raw_calibration_bundle(invalid)
+
     def test_round_trip_and_exactly_once_application(self) -> None:
         bundle = _bundle()
         with _temporary_path(".json") as path:
@@ -390,7 +462,7 @@ class RawNexusUiTests(unittest.TestCase):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PyQt5.QtWidgets import QApplication
         from diffraction.raw_dialog import CreateCalibrationDialog
-        from diffraction.raw_previews import OpenBeamPreview, Ceo2FitPreview, LinearCalibrationPreview
+        from diffraction.raw_previews import OpenBeamPreview, Ceo2FitPreview, QuadraticCalibrationPreview
         from diffraction.tab import DiffractionTab
 
         app = QApplication.instance() or QApplication([])
@@ -398,7 +470,7 @@ class RawNexusUiTests(unittest.TestCase):
         dialog = CreateCalibrationDialog(tab)
         self.assertFalse(dialog.open_beam_preview_button.isEnabled())
         self.assertFalse(dialog.ceo2_review_button.isEnabled())
-        self.assertFalse(dialog.linear_review_button.isEnabled())
+        self.assertFalse(dialog.quadratic_review_button.isEnabled())
         dialog.reference_path.setText(str(reference))
         dialog.ceo2_path.setText(str(ceo2))
         dialog.process_banks()
@@ -407,10 +479,10 @@ class RawNexusUiTests(unittest.TestCase):
         previews = [
             OpenBeamPreview(dialog, dialog.bundle, dialog._run_diagnostics),
             Ceo2FitPreview(dialog, dialog.bundle, dialog._run_diagnostics),
-            LinearCalibrationPreview(dialog, dialog.bundle, dialog._run_diagnostics),
+            QuadraticCalibrationPreview(dialog, dialog.bundle, dialog._run_diagnostics),
         ]
         for button, preview in zip(
-            (dialog.open_beam_preview_button, dialog.ceo2_review_button, dialog.linear_review_button), previews
+            (dialog.open_beam_preview_button, dialog.ceo2_review_button, dialog.quadratic_review_button), previews
         ):
             self.assertTrue(button.isEnabled())
             self.assertEqual(preview.tabs.count(), 2)
@@ -434,10 +506,28 @@ class RawNexusUiTests(unittest.TestCase):
             linear_page = previews[2].tabs.widget(bank - 1)
             linear_axis = linear_page.layout().itemAt(0).widget().figure.axes[0]
             record = dialog.bundle.bank(bank)
-            fitted_line = next(line for line in linear_axis.lines if line.get_label() == "Weighted linear fit")
+            self.assertTrue(np.isfinite(record.difa))
+            self.assertIsNotNone(record.difa_uncertainty)
+            self.assertGreater(record.difa_uncertainty, 0.0)
+            for peak in record.peak_diagnostics:
+                if peak["fitted_tof_us"] is not None:
+                    predicted = (record.difc * peak["d_spacing_angstrom"]
+                                 + record.difa * peak["d_spacing_angstrom"]**2 + record.tzero)
+                    self.assertAlmostEqual(peak["residual_tof_us"], peak["fitted_tof_us"] - predicted, places=5)
+            fitted_line = next(line for line in linear_axis.lines if line.get_label() == "Weighted quadratic fit")
             np.testing.assert_allclose(
-                fitted_line.get_ydata(), record.difc * fitted_line.get_xdata() + record.tzero
+                fitted_line.get_ydata(), record.difc * fitted_line.get_xdata()
+                + record.difa * fitted_line.get_xdata()**2 + record.tzero
             )
+        sample_path = Path.home() / "Downloads" / "ENGINX00378089.nxs"
+        if sample_path.is_file():
+            with _temporary_path(".json") as calibration_path:
+                save_raw_calibration_bundle(dialog.bundle, calibration_path)
+                reloaded = load_raw_calibration_bundle(calibration_path)
+            processed = analyze_sample_nexus(sample_path, reloaded)
+            self.assertEqual(len(processed), 2)
+            for spectrum in processed:
+                self.assertEqual(spectrum.calibration.difa, reloaded.bank(spectrum.bank_number).difa)
         self.assertEqual(bundle_fingerprint(dialog.bundle), fingerprint)
         self.assertIsNone(tab.active_raw_calibration)
         for preview in previews:
