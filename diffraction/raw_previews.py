@@ -64,9 +64,12 @@ class OpenBeamPreview(_BankPreview):
             unsmoothed = np.asarray(reference.y, dtype=float) / charge
             smoothed_density, available = _smooth_response(unsmoothed / widths)
             canvas, axes, _ = _plot(page)
-            axes.plot(centres, unsmoothed, color="#2877ae", lw=0.8, label="Focused open beam (unsmoothed)")
+            applied_smoothing = bool(record.reference_response_settings.get("smoothed"))
+            unsmoothed_label = "Measured open beam (used)" if not applied_smoothing else "Measured open beam"
+            axes.plot(centres, unsmoothed, color="#2877ae", lw=0.8, label=unsmoothed_label)
             if available:
-                axes.plot(centres, smoothed_density * widths, color="#cf6d28", lw=1.2, label="Smoothed preview")
+                smoothed_label = "Smoothed open beam (used)" if applied_smoothing else "Smoothed preview"
+                axes.plot(centres, smoothed_density * widths, color="#cf6d28", lw=1.2, label=smoothed_label)
             axes.set_xlabel("Time of flight (us)")
             axes.set_ylabel("Reference response (counts/uAh per bin)")
             axes.set_title(f"Bank {bank}: {record.bank_name}")

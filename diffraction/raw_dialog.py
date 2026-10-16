@@ -93,6 +93,7 @@ class CreateCalibrationDialog(QDialog):
         self.bank2_mask.setPlaceholderText("Optional spectrum IDs, e.g. 1215,1218,1221-1224")
         form.addRow("Bank 2 pixel mask", self.bank2_mask)
         self.smooth_reference = QCheckBox("Smooth reference response")
+        self.smooth_reference.setChecked(True)
         form.addRow("Reference processing", self.smooth_reference)
         layout.addLayout(form)
 

@@ -416,6 +416,8 @@ class RawNexusUiTests(unittest.TestCase):
         self.assertFalse(hasattr(dialog, "sample_path"))
         self.assertTrue(hasattr(dialog, "reference_path"))
         self.assertTrue(hasattr(dialog, "ceo2_path"))
+        self.assertTrue(dialog.smooth_reference.isChecked())
+        dialog.smooth_reference.setChecked(False)
         self.assertFalse(dialog.smooth_reference.isChecked())
         calibration_menu = next(action.menu() for action in tab.menu_bar.actions() if action.text() == "Calibration")
         self.assertEqual(
@@ -475,6 +477,7 @@ class RawNexusUiTests(unittest.TestCase):
         dialog.ceo2_path.setText(str(ceo2))
         dialog.process_banks()
         self.assertIsNotNone(dialog.bundle, dialog.status.text())
+        self.assertTrue(dialog.smooth_reference.isChecked())
         fingerprint = bundle_fingerprint(dialog.bundle)
         previews = [
             OpenBeamPreview(dialog, dialog.bundle, dialog._run_diagnostics),
@@ -506,6 +509,8 @@ class RawNexusUiTests(unittest.TestCase):
             linear_page = previews[2].tabs.widget(bank - 1)
             linear_axis = linear_page.layout().itemAt(0).widget().figure.axes[0]
             record = dialog.bundle.bank(bank)
+            self.assertTrue(record.reference_response_settings["smoothed"])
+            np.testing.assert_allclose(plotted[1].get_ydata(), record.response_values_per_uah)
             self.assertTrue(np.isfinite(record.difa))
             self.assertIsNotNone(record.difa_uncertainty)
             self.assertGreater(record.difa_uncertainty, 0.0)
@@ -530,6 +535,29 @@ class RawNexusUiTests(unittest.TestCase):
                 self.assertEqual(spectrum.calibration.difa, reloaded.bank(spectrum.bank_number).difa)
         self.assertEqual(bundle_fingerprint(dialog.bundle), fingerprint)
         self.assertIsNone(tab.active_raw_calibration)
+        with _temporary_path(".json") as calibration_path:
+            save_raw_calibration_bundle(dialog.bundle, calibration_path)
+            saved = load_raw_calibration_bundle(calibration_path)
+            for bank in (1, 2):
+                self.assertTrue(saved.bank(bank).reference_response_settings["smoothed"])
+                np.testing.assert_allclose(saved.bank(bank).response_values_per_uah,
+                                           dialog.bundle.bank(bank).response_values_per_uah)
+        dialog.smooth_reference.setChecked(False)
+        dialog.process_banks()
+        self.assertIsNotNone(dialog.bundle, dialog.status.text())
+        for bank in (1, 2):
+            record = dialog.bundle.bank(bank)
+            reference_spectrum = dialog._run_diagnostics[bank]["focused_reference"]
+            self.assertFalse(record.reference_response_settings["smoothed"])
+            np.testing.assert_allclose(
+                record.response_values_per_uah,
+                reference_spectrum.y / reference_spectrum.metadata["proton_charge"],
+            )
+        with _temporary_path(".json") as calibration_path:
+            save_raw_calibration_bundle(dialog.bundle, calibration_path)
+            self.assertFalse(
+                load_raw_calibration_bundle(calibration_path).bank(1).reference_response_settings["smoothed"]
+            )
         for preview in previews:
             preview.close()
         dialog.close()

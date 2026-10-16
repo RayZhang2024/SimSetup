@@ -91,7 +91,7 @@ CeO2 peak fitting corrects the bank-level DIFC/DIFA/TZERO once after focusing.
 
 The period-specific `/raw_data_1/periods/proton_charge` value is required in
 `uAh` and must be finite and positive. Reference response values are stored as
-charge-normalized histogram bin integrals in `counts/uAh`. The unsmoothed default
+charge-normalized histogram bin integrals in `counts/uAh`. The unsmoothed
 correction is:
 
 ```text
@@ -102,8 +102,9 @@ When sample and calibration bin edges differ, saved response integrals and
 variances are overlap-rebinned. This preserves integrated intensity and avoids
 bin-width bias; center interpolation is not used. Nonfinite, nonpositive, or
 incompletely covered reference bins are masked. V-Nb can contain structure, so
-response smoothing is explicit and disabled by default. Charge normalization
-does not by itself prove detector-efficiency or reference-structure correction.
+response smoothing is enabled by default in Create Calibration and can be turned
+off. Charge normalization does not by itself prove detector-efficiency or
+reference-structure correction.
 
 ## Calibration persistence
 
