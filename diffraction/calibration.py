@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
@@ -17,6 +18,7 @@ from .models import (
     PawleyReflectionResult,
     PhaseModel,
     d_to_tof,
+    spectrum_with_calibration,
     tof_to_d,
 )
 from .profiles import (
@@ -574,6 +576,11 @@ def refine_ceo2_calibration(
                 lorentz_fraction=fit_result.eta,
             )
         )
+        _emit_calibration_progress(
+            progress_callback,
+            "local_peak_fit",
+            {"reflection": reflection, "fit": fit_result},
+        )
 
     single_peak_calibration, single_peak_rms, updated_results = _linear_calibration_from_peaks(
         peak_results,
@@ -611,4 +618,193 @@ def refine_ceo2_calibration(
         pattern_profile_parameters=pattern_fit.profile_parameters,
         pattern_lattice_a=pattern_fit.lattice_a,
         pattern_lattice_a_uncertainty=pattern_fit.lattice_a_uncertainty,
+    )
+
+
+def _quadratic_calibration_from_peaks(
+    peaks: list[CalibrationPeakResult],
+    minimum_peaks: int,
+) -> tuple[InstrumentCalibration, float, list[CalibrationPeakResult], dict[str, float]]:
+    required = max(int(minimum_peaks), 4)
+    candidates = [
+        peak for peak in peaks
+        if peak.accepted and peak.fitted_tof is not None and peak.tof_uncertainty is not None
+        and np.isfinite(peak.tof_uncertainty) and peak.tof_uncertainty > 0.0
+    ]
+    if len(candidates) < required:
+        raise ValueError(
+            f"Quadratic CeO2 calibration requires at least {required} accepted peaks with finite, "
+            f"positive TOF uncertainties; found {len(candidates)}."
+        )
+    d = np.asarray([peak.reflection.d_spacing for peak in candidates], dtype=float)
+    tof = np.asarray([peak.fitted_tof for peak in candidates], dtype=float)
+    sigma = np.asarray([max(float(peak.tof_uncertainty), 1e-6) for peak in candidates])
+    if not np.all(np.isfinite(d)) or not np.all(np.isfinite(tof)):
+        raise ValueError("Quadratic CeO2 calibration contains nonfinite peak positions.")
+    active = np.ones(len(candidates), dtype=bool)
+
+    def fit(mask: np.ndarray) -> tuple[InstrumentCalibration, np.ndarray]:
+        active_d = d[mask]
+        if np.unique(active_d).size < 3:
+            raise ValueError("Quadratic CeO2 calibration needs at least three distinct d-spacings.")
+        centre = float(np.mean(active_d))
+        scale = float(np.ptp(active_d)) / 2.0
+        if not np.isfinite(scale) or scale <= 0.0 or scale / max(abs(centre), 1.0) < 1e-4:
+            raise ValueError("Quadratic CeO2 calibration d-spacing span is too small for a stable fit.")
+        x = (active_d - centre) / scale
+        design = np.column_stack((x, x * x, np.ones(x.size)))
+        weighted = design / sigma[mask, None]
+        try:
+            singular = np.linalg.svd(weighted, compute_uv=False)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("Quadratic CeO2 calibration is numerically ill-conditioned.") from exc
+        if singular[-1] <= 0.0 or singular[0] / singular[-1] > 1e8:
+            raise ValueError("Quadratic CeO2 calibration is ill-conditioned; use more distinct reflections.")
+        try:
+            coefficients = np.linalg.lstsq(weighted, tof[mask] / sigma[mask], rcond=None)[0]
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("Quadratic CeO2 calibration least-squares fit did not converge.") from exc
+        transform = np.array([
+            [1.0 / scale, -2.0 * centre / scale**2, 0.0],
+            [0.0, 1.0 / scale**2, 0.0],
+            [-centre / scale, centre**2 / scale**2, 1.0],
+        ])
+        difc, difa, tzero = transform @ coefficients
+        calibration = InstrumentCalibration(difc=float(difc), difa=float(difa), tzero=float(tzero))
+        if not np.all(np.isfinite([difc, difa, tzero])) or np.any(
+            difc + 2.0 * difa * np.array([active_d.min(), active_d.max()]) <= 0.0
+        ):
+            raise ValueError("Quadratic CeO2 calibration is nonfinite or nonmonotonic over the fitted d-spacing range.")
+        weighted_residual = (tof[mask] - d_to_tof(active_d, calibration)) / sigma[mask]
+        dof = len(active_d) - 3
+        if dof <= 0:
+            raise ValueError("Quadratic CeO2 calibration needs more peaks than fit coefficients.")
+        try:
+            covariance = np.linalg.inv(weighted.T @ weighted) * max(
+                1.0, float(np.sum(weighted_residual**2)) / dof
+            )
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("Quadratic CeO2 calibration covariance is ill-conditioned.") from exc
+        standard = np.sqrt(np.maximum(np.diag(transform @ covariance @ transform.T), 0.0))
+        if not np.all(np.isfinite(standard)):
+            raise ValueError("Quadratic CeO2 calibration coefficient uncertainties are not finite.")
+        return calibration, standard
+
+    for _ in range(4):
+        calibration, _standard = fit(active)
+        residuals = tof - d_to_tof(d, calibration)
+        median = float(np.median(residuals[active]))
+        mad = float(np.median(np.abs(residuals[active] - median)))
+        cutoff = max(60.0, 4.0 * 1.4826 * mad)
+        deviations = np.abs(residuals - median)
+        next_active = active & (deviations <= cutoff)
+        if np.array_equal(next_active, active) and int(np.count_nonzero(active)) > required:
+            ranked = np.argsort(deviations[active])
+            active_indices = np.flatnonzero(active)
+            worst = active_indices[ranked[-1]]
+            second = deviations[active_indices[ranked[-2]]]
+            if deviations[worst] > max(60.0, 2.0 * second):
+                next_active[worst] = False
+        if np.array_equal(next_active, active):
+            break
+        if int(np.count_nonzero(next_active)) < required:
+            raise ValueError("Too few CeO2 peaks remain for quadratic calibration after outlier rejection.")
+        active = next_active
+    calibration, standard = fit(active)
+    residuals = tof - d_to_tof(d, calibration)
+    rms = float(np.sqrt(np.mean(residuals[active] ** 2)))
+    candidate_by_key = {
+        (peak.reflection.h, peak.reflection.k, peak.reflection.l): index
+        for index, peak in enumerate(candidates)
+    }
+    updated: list[CalibrationPeakResult] = []
+    for peak in peaks:
+        key = (peak.reflection.h, peak.reflection.k, peak.reflection.l)
+        candidate_index = candidate_by_key.get(key)
+        accepted = peak.accepted and (candidate_index is not None and active[candidate_index])
+        reason = peak.rejection_reason
+        if peak.accepted and candidate_index is None:
+            reason = "missing or invalid TOF uncertainty"
+        elif peak.accepted and not accepted:
+            reason = "quadratic calibration residual outlier"
+        expected = float(d_to_tof(peak.reflection.d_spacing, calibration))
+        updated.append(replace(
+            peak, expected_tof=expected,
+            residual_tof=None if peak.fitted_tof is None else float(peak.fitted_tof - expected),
+            accepted=bool(accepted), rejection_reason=reason,
+        ))
+    return calibration, rms, updated, {
+        "difc_uncertainty": float(standard[0]),
+        "difa_uncertainty": float(standard[1]),
+        "tzero_uncertainty": float(standard[2]),
+    }
+
+
+def refine_raw_ceo2_bank_calibration(
+    ceo2_spectrum: FocusedSpectrum,
+    ceo2_phase: PhaseModel,
+    *,
+    polynomial_order: int = 1,
+    minimum_peaks: int = 4,
+    progress_callback: Optional[CalibrationProgressCallback] = None,
+    tof_min: float = OPENGENIE_CALIBRATION_TOF_MIN,
+    tof_max: float = OPENGENIE_CALIBRATION_TOF_MAX,
+) -> CalibrationResult:
+    """Fit raw-focused CeO2 peak centres with a weighted quadratic TOF/d model."""
+    first_pass = refine_ceo2_calibration(
+        ceo2_spectrum,
+        ceo2_phase,
+        polynomial_order=polynomial_order,
+        minimum_peaks=minimum_peaks,
+        progress_callback=None,
+        tof_min=tof_min,
+        tof_max=tof_max,
+    )
+    refined_seed_spectrum = spectrum_with_calibration(ceo2_spectrum, first_pass.single_peak_calibration)
+
+    def raw_progress(stage: str, payload: Mapping[str, object]) -> None:
+        if stage != "linear_fit":
+            _emit_calibration_progress(progress_callback, stage, payload)
+
+    result = refine_ceo2_calibration(
+        refined_seed_spectrum,
+        ceo2_phase,
+        polynomial_order=polynomial_order,
+        minimum_peaks=minimum_peaks,
+        progress_callback=raw_progress,
+        tof_min=tof_min,
+        tof_max=tof_max,
+    )
+    calibration, rms, updated_peaks, uncertainties = _quadratic_calibration_from_peaks(
+        list(result.peak_results), minimum_peaks
+    )
+    profile_parameters = dict(result.pattern_profile_parameters)
+    for key in ("difc_uncertainty", "difa_uncertainty", "tzero_uncertainty"):
+        diagnostic = profile_parameters.pop(key, None)
+        if diagnostic is not None:
+            profile_parameters[f"pattern_{key}_diagnostic"] = diagnostic
+    profile_parameters.update(uncertainties)
+    profile_parameters.update(
+        {
+            "accepted_calibration_model": "quadratic DIFC/DIFA/TZERO from individual CeO2 peak fits",
+            "difa_model_selected": True,
+            "quadratic_pattern_fit_diagnostic_only": True,
+            "pattern_difc_diagnostic": result.calibration.difc,
+            "pattern_difa_diagnostic": result.calibration.difa,
+            "pattern_tzero_diagnostic": result.calibration.tzero,
+        }
+    )
+    _emit_calibration_progress(
+        progress_callback,
+        "quadratic_fit",
+        {"peaks": tuple(updated_peaks), "calibration": calibration, "rms_residual_tof": rms},
+    )
+    return replace(
+        result,
+        calibration=calibration,
+        single_peak_calibration=calibration,
+        peak_results=tuple(updated_peaks),
+        rms_residual_tof=rms,
+        single_peak_rms_residual_tof=rms,
+        pattern_profile_parameters=profile_parameters,
     )

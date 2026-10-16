@@ -7,3 +7,4 @@ astropy
 tifffile
 scipy
 matplotlib
+h5py

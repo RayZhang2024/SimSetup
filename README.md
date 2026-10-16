@@ -28,6 +28,16 @@ Launch the desktop application from the repo-local virtual environment:
 python .\gui_app.py
 ```
 
+Create a self-contained raw ENGIN-X calibration with **Calibration > Create
+Calibration…**, then activate it with **Calibration > Load Calibration JSON…**.
+Load sample NXS files through **File > Load Spectrum**. The workflow focuses each
+1,200-pixel diffraction bank before summation, excludes the 180-degree
+transmission spectra, and uses each run's recorded proton charge. Sample analysis
+requires only the saved JSON and sample NXS file; the original reference and CeO2
+files are not reopened.
+See [docs/raw-enginx-nxs.md](docs/raw-enginx-nxs.md) for the focusing convention,
+uncertainty model, and remaining scientific validation gaps.
+
 Optional startup inputs:
 
 ```powershell
