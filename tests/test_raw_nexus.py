@@ -3,7 +3,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -135,6 +137,33 @@ def _bundle(offset: float = 0.0) -> RawCalibrationBundle:
 
 
 class RawNexusReaderTests(unittest.TestCase):
+    def test_calibration_save_dialog_suggests_source_run_numbers(self) -> None:
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt5.QtWidgets import QApplication
+        from diffraction.raw_dialog import CreateCalibrationDialog
+        from diffraction.tab import DiffractionTab
+
+        app = QApplication.instance() or QApplication([])
+        tab = DiffractionTab()
+        dialog = CreateCalibrationDialog(tab)
+        try:
+            dialog.bundle = replace(
+                _bundle(),
+                source_runs={"reference": {"run": "377438"}, "ceo2": {"run": "377898"}},
+            )
+            with patch("diffraction.raw_dialog.QFileDialog.getSaveFileName", return_value=("", "")) as choose_path:
+                dialog.save_bundle()
+            self.assertEqual(choose_path.call_args.args[2], "ENGINX_377438_377898_calibration.json")
+            dialog.bundle = _bundle()
+            with patch("diffraction.raw_dialog.QFileDialog.getSaveFileName", return_value=("", "")) as choose_path:
+                dialog.save_bundle()
+            self.assertEqual(choose_path.call_args.args[2], "ENGINX_000001_000002_calibration.json")
+        finally:
+            dialog.close()
+            tab.close()
+            app.processEvents()
+
     def test_reader_maps_reordered_rows_by_spectrum_id_and_excludes_transmission(self) -> None:
         with _temporary_path(".nxs") as path:
             _write_synthetic_nexus(path)

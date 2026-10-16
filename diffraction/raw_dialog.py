@@ -184,8 +184,11 @@ class CreateCalibrationDialog(QDialog):
         if self.bundle is None:
             self.status.setText("Process both banks before saving.")
             return
+        reference_run = str(self.bundle.source_runs["reference"]["run"]).zfill(6)
+        ceo2_run = str(self.bundle.source_runs["ceo2"]["run"]).zfill(6)
+        default_name = f"ENGINX_{reference_run}_{ceo2_run}_calibration.json"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save raw ENGIN-X calibration", "enginx_raw_calibration.json", "JSON (*.json)"
+            self, "Save raw ENGIN-X calibration", default_name, "JSON (*.json)"
         )
         if path:
             try:
