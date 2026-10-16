@@ -121,6 +121,54 @@ bundle fingerprint. Raw-NXS spectra retain the accepted JSON calibration during
 plotting and fitting; the legacy focused-histogram calibration cannot replace it.
 An application counter also prevents applying calibration twice.
 
+## Default smoothing: real-run comparison
+
+The default-smoothed calibration was compared with an explicitly unsmoothed
+calibration using reference run 377438, CeO2 run 377898, sample run 378089,
+the same CeO2 phase (`Hist/CEO2.EXP`), and no pixel masks in either run. Both
+banks used the same focusing settings. The quadratic coefficients below are
+from accepted individual peak centres; each uncertainty is one standard error
+from the weighted fit. DIFA is in `us/angstrom^2`, DIFC in `us/angstrom`, and
+TZERO and RMS in `us`.
+
+| Response | Bank | DIFC +/- uncertainty | DIFA +/- uncertainty | TZERO +/- uncertainty | RMS | Valid reference bins | Valid corrected sample bins |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Smoothed (default) | 1 | 18414.6862 +/- 7.5180 | -4.1477 +/- 2.5792 | -14.3816 +/- 5.1562 | 0.6057 | 10186/10186 | 8936/10186 |
+| Smoothed (default) | 2 | 18405.1995 +/- 8.9330 | -8.8240 +/- 3.0787 | -25.8746 +/- 6.1014 | 1.1715 | 10186/10186 | 8932/10186 |
+| Unsmoothed (comparison) | 1 | 18416.9626 +/- 8.5801 | -4.8453 +/- 2.9417 | -16.3017 +/- 5.8857 | 0.8564 | 10181/10186 | 8936/10186 |
+| Unsmoothed (comparison) | 2 | 18405.8610 +/- 9.0400 | -9.1679 +/- 3.1134 | -26.0497 +/- 6.1802 | 1.2102 | 10185/10186 | 8931/10186 |
+
+Each bank and both settings accepted the same 11 reflections: 442, 531, 440,
+333, 422, 420, 331, 400, 222, 311, and 220. Reflections 600 and 511 were
+rejected as already matched. The full-pattern fit is diagnostic only and was
+not substituted for the accepted individual-peak calibration:
+
+| Response | Bank | Full-pattern DIFC | Full-pattern DIFA | Full-pattern TZERO |
+| --- | ---: | ---: | ---: | ---: |
+| Smoothed (default) | 1 | 18434.5551 | -12.0310 | -21.3430 |
+| Smoothed (default) | 2 | 18418.9724 | -14.5393 | -28.9790 |
+| Unsmoothed (comparison) | 1 | 18436.3205 | -12.5323 | -22.8131 |
+| Unsmoothed (comparison) | 2 | 18419.6349 | -14.8425 | -29.2375 |
+
+Across bins valid in both reference responses, the median absolute smoothed
+versus unsmoothed change was 1.74% (bank 1) and 1.78% (bank 2); the 95th
+percentiles were 40.17% and 39.37%. The very large maxima (30442% and 9221%)
+occur where the unsmoothed response is close to zero, so percentage changes
+there are unstable. On matching TOF bins with finite, nonzero corrected sample
+intensity in both runs (7655 and 7798 bins), median absolute changes were
+1.35% and 1.43%; 95th percentiles were 6.41% and 7.43%, and 99th percentiles
+were 17.57% and 20.00%. The medians of corrected sample intensity changed
+from 0.55651 to 0.55573 (bank 1) and from 0.80145 to 0.80184 (bank 2).
+Thus the bulk sample response changes modestly, but localized differences
+are material and should not be interpreted as a detector-efficiency correction
+without independent validation. Bank 2 gained one valid corrected sample bin
+with smoothing; bank 1's valid-bin count was unchanged.
+
+Each mode's bundle was saved and reloaded before sample analysis. The reloaded
+JSON preserved the exact response arrays and bin edges used in calibration,
+and recorded `reference_response_settings.smoothed` as `true` or `false`
+respectively. These comparison JSON files were temporary and are not committed.
+
 ## Current scientific status
 
 The three supplied runs have been processed locally and produce internally
