@@ -44,6 +44,7 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QShortcut,
     QSizePolicy,
+    QSlider,
     QStackedWidget,
     QSplitter,
     QStatusBar,
@@ -105,6 +106,7 @@ from placement_fit import (
     save_json_report,
 )
 from auto_realign import AutoRealignError, estimate_auto_realign, triangulated_faces
+from corner_detection import CornerDetectionError, detect_surface_corners
 from diffraction.acquisition import (
     AcquisitionObservation,
     MaterialAcquisitionProfile,
@@ -2211,11 +2213,14 @@ class PointPickerPanel(QWidget):
         self.slice_mesh = None
         self.clipped_mesh = None
         self.picked_points_mesh = None
+        self.corner_candidates_mesh = None
         self.local_origin_mesh = None
         self.local_axes_mesh = None
         self.picked_points: List[Tuple[str, np.ndarray]] = []
         self.active_local_origin = np.zeros(3, dtype=float)
         self.active_local_basis = np.eye(3, dtype=float)
+        self._plane_value_bounds: Optional[Tuple[float, float]] = None
+        self._plane_value_initialized = False
         self.draft_local_origin: Optional[np.ndarray] = None
         self.draft_local_axis_point: Optional[np.ndarray] = None
         self.draft_plane_normal: Optional[np.ndarray] = None
@@ -2268,6 +2273,26 @@ class PointPickerPanel(QWidget):
         repair_mesh_button = QPushButton("Check / repair mesh")
         repair_mesh_button.clicked.connect(self.open_mesh_repair_dialog)
         mesh_tools_layout.addWidget(repair_mesh_button)
+        corner_settings = QFormLayout()
+        self.corner_feature_angle_spin = make_spin_box(60.0, 1.0, 179.0)
+        self.corner_feature_angle_spin.setToolTip(
+            "Minimum angle between neighboring face normals for an edge to count as sharp."
+        )
+        self.corner_turn_angle_spin = make_spin_box(60.0, 1.0, 179.0)
+        self.corner_turn_angle_spin.setToolTip(
+            "Minimum direction change along a sharp edge for a point to count as a corner."
+        )
+        self.corner_scale_percent_spin = make_spin_box(0.5, 0.1, 25.0)
+        self.corner_scale_percent_spin.setToolTip(
+            "Minimum edge length used to smooth over small STL irregularities, as a percentage of the model size."
+        )
+        corner_settings.addRow("Surface angle (deg)", self.corner_feature_angle_spin)
+        corner_settings.addRow("Corner turn (deg)", self.corner_turn_angle_spin)
+        corner_settings.addRow("Corner scale (%)", self.corner_scale_percent_spin)
+        mesh_tools_layout.addLayout(corner_settings)
+        detect_corners_button = QPushButton("Detect surface corners")
+        detect_corners_button.clicked.connect(self.detect_corner_candidates)
+        mesh_tools_layout.addWidget(detect_corners_button)
         controls_layout.addWidget(mesh_tools_group)
 
         slice_group = QGroupBox("Slice Plane Picking")
@@ -2287,9 +2312,22 @@ class PointPickerPanel(QWidget):
         self.plane_axis_combo.addItems(["X", "Y", "Z"])
         self.plane_axis_combo.currentTextChanged.connect(self.on_plane_definition_changed)
         self.plane_value_spin = make_spin_box(0.0, -100000.0, 100000.0)
+        self.plane_value_spin.setDecimals(6)
         self.plane_value_spin.valueChanged.connect(self.on_plane_definition_changed)
+        self.plane_position_slider = QSlider(Qt.Horizontal)
+        self.plane_position_slider.setRange(0, 100)
+        self.plane_position_slider.setSingleStep(1)
+        self.plane_position_slider.setPageStep(10)
+        self.plane_position_slider.setTickInterval(10)
+        self.plane_position_slider.setTickPosition(QSlider.TicksBelow)
+        self.plane_position_slider.setEnabled(False)
+        self.plane_position_slider.setToolTip(
+            "Move the slice from 0% (minimum) to 100% (maximum) along the selected plane axis."
+        )
+        self.plane_position_slider.valueChanged.connect(self.on_plane_position_slider_changed)
         axis_mode_layout.addRow("Plane axis", self.plane_axis_combo)
         axis_mode_layout.addRow("Plane value", self.plane_value_spin)
+        axis_mode_layout.addRow("Plane position (%)", self.plane_position_slider)
         self.plane_mode_stack.addWidget(axis_mode_widget)
 
         point_normal_widget = QWidget()
@@ -2662,10 +2700,19 @@ class PointPickerPanel(QWidget):
             self.pending_frame_pick = None
             self.update_frame_status_labels()
             self.refresh_points_table()
+        else:
+            self.picked_points = [
+                (label, point)
+                for label, point in self.picked_points
+                if not self.is_corner_candidate_label(label)
+            ]
+            self.renumber_point_labels()
+            self.refresh_points_table()
         self.mesh_path = mesh_path
         self.model_mesh = mesh.copy(deep=True) if mesh is not None else None
         if self.model_mesh is None or self.model_mesh.n_points == 0:
             self.clear_scene()
+            self.update_plane_value_range()
             self.status_label.setText(
                 "Load a mesh in this tab, then use the plane or direct coordinates to add model points."
             )
@@ -2804,6 +2851,8 @@ class PointPickerPanel(QWidget):
             "picker_local_axes_labels",
             "picker_points",
             "picker_point_labels",
+            "picker_corner_candidates",
+            "picker_corner_candidate_labels",
         ):
             self.plotter.remove_actor(actor_name, render=False)
         self.plane_mesh = None
@@ -2811,6 +2860,7 @@ class PointPickerPanel(QWidget):
         self.slice_mesh = None
         self.clipped_mesh = None
         self.picked_points_mesh = None
+        self.corner_candidates_mesh = None
         self.local_origin_mesh = None
         self.local_axes_mesh = None
         self.plotter.render()
@@ -2818,6 +2868,7 @@ class PointPickerPanel(QWidget):
     def configure_coordinate_ranges(self) -> None:
         if self.model_mesh is None or self.model_mesh.n_points == 0:
             return
+        self._plane_value_initialized = False
         bounds = np.array(self.model_mesh.bounds, dtype=float)
         mesh_min = np.array([bounds[0], bounds[2], bounds[4]], dtype=float)
         mesh_max = np.array([bounds[1], bounds[3], bounds[5]], dtype=float)
@@ -2873,19 +2924,52 @@ class PointPickerPanel(QWidget):
 
     def update_plane_value_range(self) -> None:
         if self.model_mesh is None or self.model_mesh.n_points == 0:
+            self._plane_value_bounds = None
+            self._plane_value_initialized = False
+            if hasattr(self, "plane_position_slider"):
+                self.plane_position_slider.setEnabled(False)
             return
         frame_origin, frame_basis = self.displayed_local_coordinate_frame()
         active_points = np.linalg.solve(frame_basis, (self.model_mesh.points - frame_origin).T).T
         axis_index = {"X": 0, "Y": 1, "Z": 2}[self.plane_axis_combo.currentText()]
         axis_bounds = (float(np.min(active_points[:, axis_index])), float(np.max(active_points[:, axis_index])))
         center_value = 0.5 * (axis_bounds[0] + axis_bounds[1])
+        self._plane_value_bounds = axis_bounds
         was_blocked = self.plane_value_spin.blockSignals(True)
         self.plane_value_spin.setRange(float(axis_bounds[0]), float(axis_bounds[1]))
-        if self.plane_value_spin.value() < axis_bounds[0] or self.plane_value_spin.value() > axis_bounds[1]:
+        value_tolerance = max(
+            0.51 * 10.0 ** (-self.plane_value_spin.decimals()),
+            np.finfo(float).eps * max(abs(axis_bounds[0]), abs(axis_bounds[1]), 1.0) * 8.0,
+        )
+        if (
+            not self._plane_value_initialized
+            or self.plane_value_spin.value() < axis_bounds[0] - value_tolerance
+            or self.plane_value_spin.value() > axis_bounds[1] + value_tolerance
+        ):
             self.plane_value_spin.setValue(center_value)
-        elif abs(self.plane_value_spin.value()) < 1e-12:
-            self.plane_value_spin.setValue(center_value)
+        self._plane_value_initialized = True
         self.plane_value_spin.blockSignals(was_blocked)
+        if hasattr(self, "plane_position_slider"):
+            span = axis_bounds[1] - axis_bounds[0]
+            self.plane_position_slider.setEnabled(span > 1e-12)
+            percentage = 50 if span <= 1e-12 else int(
+                round((self.plane_value_spin.value() - axis_bounds[0]) / span * 100.0)
+            )
+            was_slider_blocked = self.plane_position_slider.blockSignals(True)
+            self.plane_position_slider.setValue(int(np.clip(percentage, 0, 100)))
+            self.plane_position_slider.blockSignals(was_slider_blocked)
+
+    def on_plane_position_slider_changed(self, percentage: int) -> None:
+        if self._plane_value_bounds is None:
+            return
+        lower, upper = self._plane_value_bounds
+        if percentage <= 0:
+            value = lower
+        elif percentage >= 100:
+            value = upper
+        else:
+            value = lower + (upper - lower) * float(percentage) / 100.0
+        self.plane_value_spin.setValue(value)
 
     def initialize_three_point_plane_defaults(
         self,
@@ -3795,40 +3879,32 @@ class PointPickerPanel(QWidget):
             )
             self.plotter.remove_actor("picker_local_axes_labels", render=False)
 
-        if self.picked_points:
-            picked_coordinates = np.array([point for _label, point in self.picked_points], dtype=float)
-            picked_cloud = pv.PolyData(picked_coordinates)
-            picked_cloud["labels"] = np.array([label for label, _point in self.picked_points], dtype=object)
-            self.set_or_add_mesh(
-                "picked_points_mesh",
-                picked_cloud,
-                "picker_points",
-                render_points_as_spheres=True,
-                point_size=12,
-                color="#14b8a6",
-            )
-            self.plotter.remove_actor("picker_point_labels", render=False)
-            self.plotter.add_point_labels(
-                self.picked_points_mesh,
-                "labels",
-                font_size=self.viewer_font_size(gui_like_label_font_size(self) - 1),
-                shape=None,
-                point_color="#14b8a6",
-                text_color="black",
-                always_visible=True,
-                name="picker_point_labels",
-                render=False,
-            )
-        else:
-            self.set_or_add_mesh(
-                "picked_points_mesh",
-                pv.PolyData(np.empty((0, 3), dtype=float)),
-                "picker_points",
-                render_points_as_spheres=True,
-                point_size=12,
-                color="#14b8a6",
-            )
-            self.plotter.remove_actor("picker_point_labels", render=False)
+        manual_points = [
+            (label, point)
+            for label, point in self.picked_points
+            if not self.is_corner_candidate_label(label)
+        ]
+        corner_candidates = [
+            (label, point)
+            for label, point in self.picked_points
+            if self.is_corner_candidate_label(label)
+        ]
+        self.update_labeled_point_actor(
+            manual_points,
+            attr_name="picked_points_mesh",
+            actor_name="picker_points",
+            label_actor_name="picker_point_labels",
+            color="#14b8a6",
+            point_size=12,
+        )
+        self.update_labeled_point_actor(
+            corner_candidates,
+            attr_name="corner_candidates_mesh",
+            actor_name="picker_corner_candidates",
+            label_actor_name="picker_corner_candidate_labels",
+            color="#f59e0b",
+            point_size=17,
+        )
 
         if camera_state is not None:
             restore_camera_state(self.plotter, camera_state)
@@ -3891,6 +3967,50 @@ class PointPickerPanel(QWidget):
         else:
             existing.deep_copy(mesh)
 
+    def update_labeled_point_actor(
+        self,
+        points: List[Tuple[str, np.ndarray]],
+        *,
+        attr_name: str,
+        actor_name: str,
+        label_actor_name: str,
+        color: str,
+        point_size: int,
+    ) -> None:
+        if points:
+            cloud = pv.PolyData(np.array([point for _label, point in points], dtype=float))
+            cloud["labels"] = np.array([label for label, _point in points], dtype=object)
+            self.set_or_add_mesh(
+                attr_name,
+                cloud,
+                actor_name,
+                render_points_as_spheres=True,
+                point_size=point_size,
+                color=color,
+            )
+            self.plotter.remove_actor(label_actor_name, render=False)
+            self.plotter.add_point_labels(
+                getattr(self, attr_name),
+                "labels",
+                font_size=self.viewer_font_size(gui_like_label_font_size(self) - 1),
+                shape=None,
+                point_color=color,
+                text_color="black",
+                always_visible=True,
+                name=label_actor_name,
+                render=False,
+            )
+        else:
+            self.set_or_add_mesh(
+                attr_name,
+                pv.PolyData(np.empty((0, 3), dtype=float)),
+                actor_name,
+                render_points_as_spheres=True,
+                point_size=point_size,
+                color=color,
+            )
+            self.plotter.remove_actor(label_actor_name, render=False)
+
     def add_point(self, point: np.ndarray, label: Optional[str] = None) -> None:
         if self.model_mesh is None or self.model_mesh.n_points == 0:
             return
@@ -3911,7 +4031,11 @@ class PointPickerPanel(QWidget):
                 "The selected point is outside the model volume. Move the slice plane or enter coordinates inside the mesh.",
             )
             return
-        next_label = label or f"G{len(self.picked_points) + 1}"
+        manual_point_count = sum(
+            not self.is_corner_candidate_label(existing_label)
+            for existing_label, _existing_point in self.picked_points
+        )
+        next_label = label or f"G{manual_point_count + 1}"
         self.picked_points.append((next_label, point.copy()))
         self.refresh_points_table()
         self.refresh_scene(reset_camera=False)
@@ -3960,6 +4084,49 @@ class PointPickerPanel(QWidget):
         )
         self.add_point(self.local_to_model_point(display_point))
 
+    @staticmethod
+    def is_corner_candidate_label(label: str) -> bool:
+        return label.startswith("C")
+
+    def detect_corner_candidates(self) -> None:
+        if self.model_mesh is None or self.model_mesh.n_points == 0:
+            QMessageBox.warning(self, "No mesh", "Load a mesh before detecting surface corners.")
+            return
+        try:
+            corners = detect_surface_corners(
+                self.model_mesh,
+                feature_angle_degrees=float(self.corner_feature_angle_spin.value()),
+                turn_angle_degrees=float(self.corner_turn_angle_spin.value()),
+                corner_scale_fraction=float(self.corner_scale_percent_spin.value()) / 100.0,
+            )
+        except (CornerDetectionError, RuntimeError, ValueError) as exc:
+            self.status_label.setText(f"Corner detection failed: {exc}")
+            return
+
+        self.picked_points = [
+            (label, point)
+            for label, point in self.picked_points
+            if not self.is_corner_candidate_label(label)
+        ]
+        self.picked_points.extend(
+            (f"C{index + 1}", np.asarray(point, dtype=float).copy())
+            for index, point in enumerate(corners)
+        )
+        self.renumber_point_labels()
+        self.refresh_points_table()
+        if self.plotter is not None:
+            self.refresh_scene(reset_camera=False)
+
+        if len(corners) == 0:
+            self.status_label.setText(
+                "No sharp corner candidates found. Lower the angle thresholds or use manual point picking."
+            )
+        else:
+            self.status_label.setText(
+                f"Detected {len(corners)} corner candidates. They are listed as C1…C{len(corners)} "
+                "and highlighted in the viewer. Adjust the angle thresholds and run detection again to refine them."
+            )
+
     def refresh_points_table(self) -> None:
         self.points_table.setRowCount(len(self.picked_points))
         for row_index, (label, point) in enumerate(self.picked_points):
@@ -3974,7 +4141,17 @@ class PointPickerPanel(QWidget):
                 self.points_table.setItem(row_index, column_index, QTableWidgetItem(value))
 
     def renumber_point_labels(self) -> None:
-        self.picked_points = [(f"G{index + 1}", point) for index, (_label, point) in enumerate(self.picked_points)]
+        manual_index = 1
+        corner_index = 1
+        renumbered = []
+        for label, point in self.picked_points:
+            if self.is_corner_candidate_label(label):
+                renumbered.append((f"C{corner_index}", point))
+                corner_index += 1
+            else:
+                renumbered.append((f"G{manual_index}", point))
+                manual_index += 1
+        self.picked_points = renumbered
 
     def remove_selected_points(self) -> None:
         rows = sorted({index.row() for index in self.points_table.selectedIndexes()}, reverse=True)
@@ -6218,20 +6395,10 @@ class MainWindow(QMainWindow):
         )
         load_csv_button = make_toolbar_action_button("act_table_load", "Load CSV", self.load_prediction_csv_dialog)
         save_csv_button = make_toolbar_action_button("act_table_save", "Save CSV", self.save_prediction_csv_dialog)
-        generate_button = make_toolbar_action_button(
+        generate_outputs_button = make_toolbar_action_button(
             "act_readouts",
-            "Generate stage readouts",
-            self.generate_prediction_stage_readouts,
-        )
-        generate_paths_button = make_toolbar_action_button(
-            "act_paths",
-            "Generate paths",
-            self.generate_prediction_diffraction_paths,
-        )
-        estimate_time_button = make_toolbar_action_button(
-            "act_time",
-            "Estimate UAmp",
-            self.generate_prediction_estimated_times,
+            "Generate readouts, paths & UAmp",
+            self.generate_prediction_outputs,
         )
         create_scan_file_button = make_toolbar_action_button(
             "act_scan",
@@ -6243,9 +6410,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(remove_row_button)
         layout.addWidget(load_csv_button)
         layout.addWidget(save_csv_button)
-        layout.addWidget(generate_button)
-        layout.addWidget(generate_paths_button)
-        layout.addWidget(estimate_time_button)
+        layout.addWidget(generate_outputs_button)
         layout.addWidget(create_scan_file_button)
         layout.addStretch(1)
         return self._wrap_toolbar_for_narrow_panel(toolbar)
@@ -6326,6 +6491,7 @@ class MainWindow(QMainWindow):
             self.load_csv(example_path)
 
     def on_view_parameter_changed(self) -> None:
+        self.clear_prediction_generated_values()
         self.invalidate_detector_map(update_scene=False)
         self.update_scene(reset_camera=False)
 
@@ -6717,6 +6883,8 @@ class MainWindow(QMainWindow):
         if item.column() == 0:
             self.update_scene(reset_camera=False)
             return
+        if item.column() in {1, 2, 3}:
+            self.clear_prediction_generated_values(rows=(item.row(),))
         text = item.text().strip()
         if text == "":
             self.update_scene(reset_camera=False)
@@ -8149,6 +8317,7 @@ class MainWindow(QMainWindow):
         try:
             self.model_mesh = load_mesh_as_polydata(path)
             self.mesh_path = path
+            self.clear_prediction_generated_values()
             self.refresh_report_box()
             self.invalidate_detector_map(update_scene=False)
             self.update_placement_status()
@@ -8160,6 +8329,7 @@ class MainWindow(QMainWindow):
     def clear_mesh(self) -> None:
         self.mesh_path = None
         self.model_mesh = None
+        self.clear_prediction_generated_values()
         self.refresh_report_box()
         self.invalidate_detector_map(update_scene=False)
         self.update_placement_status()
@@ -8171,6 +8341,7 @@ class MainWindow(QMainWindow):
             transform, residual_rows = fit_from_measurements(measurements)
             self.fit_transform = transform
             self.residual_rows = residual_rows
+            self.clear_prediction_generated_values()
             self.update_placement_status()
             self.update_placement_summary_fields()
             self.invalidate_detector_map(update_scene=False)
@@ -8232,60 +8403,49 @@ class MainWindow(QMainWindow):
         for row in rows:
             self.prediction_table.removeRow(row)
 
-    def generate_prediction_stage_readouts(self) -> None:
-        if self.prediction_table.rowCount() == 0:
-            self.show_error("No prediction rows", "Add one or more prediction rows first.")
+    def clear_prediction_generated_values(self, rows=None) -> None:
+        table = getattr(self, "prediction_table", None)
+        if table is None:
             return
-        rotation, translation, placement_source = self.current_model_to_stage_transform()
-        if placement_source == "as-is":
-            self.statusBar().showMessage(
-                "Generated stage readouts using the imported model orientation as the active transform.",
-                5000,
-            )
-        else:
-            self.statusBar().showMessage(
-                f"Generated stage readouts using the active {placement_source} placement transform.",
-                5000,
-            )
-
-        was_blocked = self.prediction_table.blockSignals(True)
+        target_rows = range(table.rowCount()) if rows is None else rows
+        was_blocked = table.blockSignals(True)
         try:
-            for row in range(self.prediction_table.rowCount()):
-                label_item = self.prediction_table.item(row, 0)
-                if label_item is None:
-                    self.prediction_table.setItem(row, 0, QTableWidgetItem(f"G{row + 1}"))
-                model_values = []
-                for column in range(1, 4):
-                    item = self.prediction_table.item(row, column)
-                    text = "" if item is None else item.text().strip()
-                    if text == "":
-                        raise ValueError(f"Prediction row {row + 1} is missing model coordinates.")
-                    model_values.append(float(text))
-                model_point = np.array(model_values, dtype=float)
-                stage_point = (rotation @ model_point) + translation
-                stage_readout = -stage_point
-                for index, value in enumerate(stage_readout, start=4):
-                    item = self.prediction_table.item(row, index)
+            for row in target_rows:
+                if row < 0 or row >= table.rowCount():
+                    continue
+                for column in range(4, len(PREDICTION_TABLE_HEADERS)):
+                    item = table.item(row, column)
                     if item is None:
                         item = QTableWidgetItem()
-                        self.prediction_table.setItem(row, index, item)
-                    item.setText(format_decimal(float(value)))
-        except Exception as exc:
-            self.show_error("Generate stage readouts failed", str(exc))
+                        if column in table.read_only_columns:
+                            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        table.setItem(row, column, item)
+                    item.setText("")
         finally:
-            self.prediction_table.blockSignals(was_blocked)
+            table.blockSignals(was_blocked)
 
-    def generate_prediction_diffraction_paths(self) -> None:
+    def generate_prediction_outputs(self) -> None:
         if self.prediction_table.rowCount() == 0:
+            self.clear_prediction_generated_values()
             self.show_error("No prediction rows", "Add one or more prediction rows first.")
             return
-        if self.model_mesh is None:
-            self.show_error("No mesh loaded", "Load a sample mesh before generating diffraction paths.")
-            return
 
-        omega_deg = self.pose_omega.value()
-        was_blocked = self.prediction_table.blockSignals(True)
         try:
+            if self.model_mesh is None:
+                raise ValueError("Load a sample mesh before generating paths and UAmp.")
+
+            rotation, translation, placement_source = self.current_model_to_stage_transform()
+            omega_deg = float(self.pose_omega.value())
+            gauge_volume_mm3 = (
+                self.slit_width.value()
+                * self.slit_height.value()
+                * float(self.collimator.currentText())
+            )
+            count_time_material = self.count_time_material.currentText()
+            custom_profile = self.custom_acquisition_profiles.get(count_time_material)
+            target_uncertainty = self.target_uncertainty.value()
+            calculated_rows = []
+
             for row in range(self.prediction_table.rowCount()):
                 model_values = []
                 for column in range(1, 4):
@@ -8294,75 +8454,89 @@ class MainWindow(QMainWindow):
                     if text == "":
                         raise ValueError(f"Prediction row {row + 1} is missing model coordinates.")
                     model_values.append(float(text))
-                model_point = np.array(model_values, dtype=float)
-                stage_readout_local = self.stage_readout_for_model_point(model_point)
-                bank_1_state, bank_2_state = self.compute_diffraction_bank_states_for_pose(stage_readout_local, omega_deg)
-                for index, value in enumerate(
-                    (float(bank_1_state["average_length"]), float(bank_2_state["average_length"])),
-                    start=7,
-                ):
-                    item = self.prediction_table.item(row, index)
-                    if item is None:
-                        item = QTableWidgetItem()
-                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                        self.prediction_table.setItem(row, index, item)
-                    item.setText(f"{float(value):.1f}")
-            self.statusBar().showMessage("Generated diffraction path columns using the current live Omega.", 5000)
-        except Exception as exc:
-            self.show_error("Generate diffraction paths failed", str(exc))
-        finally:
-            self.prediction_table.blockSignals(was_blocked)
+                model_point = np.asarray(model_values, dtype=float)
+                if not np.all(np.isfinite(model_point)):
+                    raise ValueError(f"Prediction row {row + 1} has non-finite model coordinates.")
 
-    def generate_prediction_estimated_times(self) -> None:
-        if self.prediction_table.rowCount() == 0:
-            self.show_error("No prediction rows", "Add one or more prediction rows first.")
-            return
-
-        gauge_volume_mm3 = self.slit_width.value() * self.slit_height.value() * float(self.collimator.currentText())
-        count_time_material = self.count_time_material.currentText()
-        custom_profile = self.custom_acquisition_profiles.get(count_time_material)
-        target_uncertainty = self.target_uncertainty.value()
-        was_blocked = self.prediction_table.blockSignals(True)
-        try:
-            for row in range(self.prediction_table.rowCount()):
-                path_values = []
-                for column in (7, 8):
-                    item = self.prediction_table.item(row, column)
-                    text = "" if item is None else item.text().strip()
-                    if text == "":
-                        raise ValueError(
-                            f"Prediction row {row + 1} is missing Path {column - 6}. Generate paths first."
-                        )
-                    path_values.append(float(text))
+                stage_readout = -((rotation @ model_point) + translation)
+                bank_1_state, bank_2_state = self.compute_diffraction_bank_states_for_pose(
+                    stage_readout,
+                    omega_deg,
+                )
+                path_values = (
+                    float(bank_1_state["average_length"]),
+                    float(bank_2_state["average_length"]),
+                )
                 if custom_profile is None:
-                    values = (
-                        enginx_rietveld_count_time_minutes(path_values[0], gauge_volume_mm3, count_time_material),
-                        enginx_rietveld_count_time_minutes(path_values[1], gauge_volume_mm3, count_time_material),
+                    uamp_values = (
+                        enginx_rietveld_count_time_minutes(
+                            path_values[0], gauge_volume_mm3, count_time_material
+                        ),
+                        enginx_rietveld_count_time_minutes(
+                            path_values[1], gauge_volume_mm3, count_time_material
+                        ),
                     )
                 else:
-                    values = (
+                    uamp_values = (
                         custom_profile.required_uamp(path_values[0], gauge_volume_mm3, target_uncertainty),
                         custom_profile.required_uamp(path_values[1], gauge_volume_mm3, target_uncertainty),
                     )
-                for index, value in enumerate(values, start=9):
-                    item = self.prediction_table.item(row, index)
-                    if item is None:
-                        item = QTableWidgetItem()
-                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                        self.prediction_table.setItem(row, index, item)
-                    item.setText(str(ceil_exposure_uamp(value)))
-            if custom_profile is None:
-                message = f"Estimated reference Rietveld exposure using built-in {count_time_material} data."
-            else:
-                message = (
-                    f"Estimated {custom_profile.exposure_unit} using {count_time_material} for "
-                    f"{target_uncertainty:g} {custom_profile.uncertainty_metric}."
+                calculated_rows.append(
+                    (
+                        stage_readout,
+                        path_values,
+                        tuple(ceil_exposure_uamp(value) for value in uamp_values),
+                    )
                 )
-            self.statusBar().showMessage(message, 5000)
+
+            was_blocked = self.prediction_table.blockSignals(True)
+            try:
+                for row, (stage_readout, path_values, uamp_values) in enumerate(calculated_rows):
+                    label_item = self.prediction_table.item(row, 0)
+                    if label_item is None:
+                        self.prediction_table.setItem(row, 0, QTableWidgetItem(f"G{row + 1}"))
+                    for column, value in enumerate(stage_readout, start=4):
+                        item = self.prediction_table.item(row, column)
+                        if item is None:
+                            item = QTableWidgetItem()
+                            self.prediction_table.setItem(row, column, item)
+                        item.setText(format_decimal(float(value)))
+                    for column, value in enumerate(path_values, start=7):
+                        item = self.prediction_table.item(row, column)
+                        if item is None:
+                            item = QTableWidgetItem()
+                            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                            self.prediction_table.setItem(row, column, item)
+                        item.setText(f"{value:.1f}")
+                    for column, value in enumerate(uamp_values, start=9):
+                        item = self.prediction_table.item(row, column)
+                        if item is None:
+                            item = QTableWidgetItem()
+                            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                            self.prediction_table.setItem(row, column, item)
+                        item.setText(str(value))
+            finally:
+                self.prediction_table.blockSignals(was_blocked)
+
+            placement_description = (
+                "the imported model orientation"
+                if placement_source == "as-is"
+                else f"the active {placement_source} placement"
+            )
+            if custom_profile is None:
+                exposure_description = f"built-in {count_time_material} data"
+            else:
+                exposure_description = (
+                    f"{count_time_material} for {target_uncertainty:g} {custom_profile.uncertainty_metric}"
+                )
+            self.statusBar().showMessage(
+                f"Generated stage readouts, diffraction paths, and UAmp using {placement_description} and "
+                f"{exposure_description} (Omega {omega_deg:g}°).",
+                7000,
+            )
         except Exception as exc:
-            self.show_error("Estimate UAmp failed", str(exc))
-        finally:
-            self.prediction_table.blockSignals(was_blocked)
+            self.clear_prediction_generated_values()
+            self.show_error("Generate prediction outputs failed", str(exc))
 
     def prompt_scan_file_options(self, default_title: str = "scan_file") -> Optional[Tuple[str, str]]:
         dialog = QDialog(self)
@@ -8467,6 +8641,7 @@ class MainWindow(QMainWindow):
             self.show_error("Create scan file failed", str(exc))
 
     def on_manual_placement_mode_toggled(self, checked: bool) -> None:
+        self.clear_prediction_generated_values()
         self.update_placement_status()
         self.update_placement_summary_fields()
         self.invalidate_detector_map(update_scene=False)
@@ -8477,6 +8652,7 @@ class MainWindow(QMainWindow):
     def on_manual_placement_changed(self) -> None:
         if not self.manual_placement_enabled_checkbox.isChecked():
             return
+        self.clear_prediction_generated_values()
         self.update_placement_status()
         self.update_placement_summary_fields()
         self.invalidate_detector_map(update_scene=False)
@@ -8505,6 +8681,7 @@ class MainWindow(QMainWindow):
 
         if not self.manual_placement_enabled_checkbox.isChecked():
             return
+        self.clear_prediction_generated_values()
         self.update_placement_status()
         self.update_placement_summary_fields()
         self.invalidate_detector_map(update_scene=False)
@@ -8524,6 +8701,7 @@ class MainWindow(QMainWindow):
         self.manual_rotation_matrix = np.eye(3, dtype=float)
         self.manual_rotation_display_values = np.zeros(3, dtype=float)
         self.sync_manual_rotation_spin_boxes_from_matrix()
+        self.clear_prediction_generated_values()
         self.update_placement_status()
         self.update_placement_summary_fields()
         self.invalidate_detector_map(update_scene=False)
@@ -8554,6 +8732,7 @@ class MainWindow(QMainWindow):
         previous_toggle_state = self.manual_placement_enabled_checkbox.blockSignals(True)
         self.manual_placement_enabled_checkbox.setChecked(True)
         self.manual_placement_enabled_checkbox.blockSignals(previous_toggle_state)
+        self.clear_prediction_generated_values()
         self.update_placement_status()
         self.update_placement_summary_fields()
         self.invalidate_detector_map(update_scene=False)
@@ -8581,6 +8760,7 @@ class MainWindow(QMainWindow):
 
         self.fit_transform = None
         self.residual_rows = []
+        self.clear_prediction_generated_values()
         self.set_report_body(
             "Placement cleared.\n\n"
             "The model is now shown as imported.\n"
