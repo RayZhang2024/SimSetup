@@ -104,6 +104,7 @@ from placement_fit import (
     rotation_z_deg,
     save_json_report,
 )
+from auto_realign import AutoRealignError, estimate_auto_realign, triangulated_faces
 from diffraction.acquisition import (
     AcquisitionObservation,
     MaterialAcquisitionProfile,
@@ -2218,6 +2219,7 @@ class PointPickerPanel(QWidget):
         self.draft_local_origin: Optional[np.ndarray] = None
         self.draft_local_axis_point: Optional[np.ndarray] = None
         self.draft_plane_normal: Optional[np.ndarray] = None
+        self.draft_auto_alignment_summary: Optional[str] = None
         self.view_buttons: dict[str, QToolButton] = {}
         self.view_button_group: Optional[QButtonGroup] = None
         self.interaction_buttons: dict[str, QToolButton] = {}
@@ -2353,6 +2355,11 @@ class PointPickerPanel(QWidget):
 
         self.clip_invert_checkbox = QCheckBox("Flip clip side")
         self.clip_invert_checkbox.toggled.connect(self.on_plane_definition_changed)
+        self.show_whole_model_checkbox = QCheckBox("Show whole model")
+        self.show_whole_model_checkbox.setToolTip(
+            "Show both sides of the mesh while keeping the slice plane and intersection visible."
+        )
+        self.show_whole_model_checkbox.toggled.connect(self.on_plane_definition_changed)
         self.require_inside_checkbox = QCheckBox("Require point inside model")
         self.require_inside_checkbox.setChecked(True)
         normal_view_button = QPushButton("Normal view")
@@ -2361,6 +2368,7 @@ class PointPickerPanel(QWidget):
         slice_layout.addWidget(self.plane_mode_stack)
         shared_controls = QFormLayout()
         shared_controls.addRow(self.clip_invert_checkbox)
+        shared_controls.addRow(self.show_whole_model_checkbox)
         shared_controls.addRow(self.require_inside_checkbox)
         shared_controls.addRow(normal_view_button)
         slice_layout.addLayout(shared_controls)
@@ -2413,12 +2421,16 @@ class PointPickerPanel(QWidget):
         self.sync_in_plane_axis_options()
         self.frame_origin_label = QLabel("Origin: -")
         self.frame_axis_point_label = QLabel("Axis point: -")
+        auto_frame_button = QPushButton("Auto realign from mesh")
+        auto_frame_button.clicked.connect(self.suggest_auto_local_coordinate_frame)
         pick_origin_button = QPushButton("Pick origin on plane")
         pick_origin_button.clicked.connect(self.begin_pick_frame_origin)
         pick_axis_button = QPushButton("Pick in-plane axis point")
         pick_axis_button.clicked.connect(self.begin_pick_frame_axis_point)
         confirm_frame_button = QPushButton("Confirm and apply")
         confirm_frame_button.clicked.connect(self.confirm_local_coordinate_frame)
+        cancel_frame_button = QPushButton("Cancel draft")
+        cancel_frame_button.clicked.connect(self.cancel_local_coordinate_frame_draft)
         reset_frame_button = QPushButton("Reset")
         reset_frame_button.clicked.connect(self.reset_local_coordinate_frame)
         save_frame_model_button = QPushButton("Save model with frame")
@@ -2427,9 +2439,13 @@ class PointPickerPanel(QWidget):
         coordinate_layout.addRow("Plane point axis", self.in_plane_axis_combo)
         coordinate_layout.addRow(self.frame_origin_label)
         coordinate_layout.addRow(self.frame_axis_point_label)
+        coordinate_layout.addRow(auto_frame_button)
         coordinate_layout.addRow(pick_origin_button)
         coordinate_layout.addRow(pick_axis_button)
-        coordinate_layout.addRow(confirm_frame_button)
+        frame_action_row = QHBoxLayout()
+        frame_action_row.addWidget(confirm_frame_button)
+        frame_action_row.addWidget(cancel_frame_button)
+        coordinate_layout.addRow(frame_action_row)
         coordinate_layout.addRow(save_frame_model_button)
         coordinate_layout.addRow(reset_frame_button)
         controls_layout.addWidget(coordinate_group)
@@ -2642,6 +2658,7 @@ class PointPickerPanel(QWidget):
             self.draft_local_origin = None
             self.draft_local_axis_point = None
             self.draft_plane_normal = None
+            self.draft_auto_alignment_summary = None
             self.pending_frame_pick = None
             self.update_frame_status_labels()
             self.refresh_points_table()
@@ -2857,7 +2874,8 @@ class PointPickerPanel(QWidget):
     def update_plane_value_range(self) -> None:
         if self.model_mesh is None or self.model_mesh.n_points == 0:
             return
-        active_points = np.array([self.model_to_local_point(point) for point in self.model_mesh.points], dtype=float)
+        frame_origin, frame_basis = self.displayed_local_coordinate_frame()
+        active_points = np.linalg.solve(frame_basis, (self.model_mesh.points - frame_origin).T).T
         axis_index = {"X": 0, "Y": 1, "Z": 2}[self.plane_axis_combo.currentText()]
         axis_bounds = (float(np.min(active_points[:, axis_index])), float(np.max(active_points[:, axis_index])))
         center_value = 0.5 * (axis_bounds[0] + axis_bounds[1])
@@ -2963,6 +2981,7 @@ class PointPickerPanel(QWidget):
             QMessageBox.warning(self, "No mesh", "Load a mesh before picking a local coordinate origin.")
             return
         self.pending_frame_pick = "origin"
+        self.draft_auto_alignment_summary = None
         self.status_label.setText("Right-click the slice plane in the viewer to draft the local-coordinate origin.")
 
     def begin_pick_frame_axis_point(self) -> None:
@@ -2973,6 +2992,7 @@ class PointPickerPanel(QWidget):
             QMessageBox.warning(self, "No origin", "Pick an origin before picking the in-plane axis point.")
             return
         self.pending_frame_pick = "axis"
+        self.draft_auto_alignment_summary = None
         axis_name = self.in_plane_axis_combo.currentText()
         self.status_label.setText(
             f"Right-click the slice plane in the viewer to draft the local +{axis_name} axis direction."
@@ -2991,11 +3011,83 @@ class PointPickerPanel(QWidget):
             f"+{axis_name} point: {self.format_frame_point(self.draft_local_axis_point)}"
         )
 
+    def suggest_auto_local_coordinate_frame(self) -> None:
+        if self.model_mesh is None or self.model_mesh.n_points == 0:
+            QMessageBox.warning(self, "No mesh", "Load a mesh before estimating a local coordinate frame.")
+            return
+
+        normal_axis = self.axis_name_to_index(self.normal_axis_combo.currentText())
+        in_plane_axis = self.axis_name_to_index(self.in_plane_axis_combo.currentText())
+        try:
+            suggestion = estimate_auto_realign(
+                self.model_mesh.points,
+                triangulated_faces(self.model_mesh),
+                preferred_normal=self.active_local_basis[:, normal_axis],
+                preferred_in_plane=self.active_local_basis[:, in_plane_axis],
+            )
+        except AutoRealignError as exc:
+            QMessageBox.information(
+                self,
+                "Auto realignment unavailable",
+                f"{exc}\n\nUse the manual local-coordinate-frame controls for this mesh.",
+            )
+            return
+
+        diagonal = float(np.linalg.norm(np.ptp(self.model_mesh.points, axis=0)))
+        axis_length = max(diagonal * 0.2, 1.0)
+        self.draft_local_origin = suggestion.origin.copy()
+        self.draft_plane_normal = suggestion.plane_normal.copy()
+        self.draft_local_axis_point = suggestion.origin + suggestion.in_plane_axis * axis_length
+        self.pending_frame_pick = None
+        self.draft_auto_alignment_summary = suggestion.summary
+        self.update_plane_value_range()
+        self.update_frame_status_labels()
+        if self.plotter is not None:
+            try:
+                self.refresh_scene(reset_camera=False)
+            except ValueError as exc:
+                self.cancel_local_coordinate_frame_draft()
+                QMessageBox.warning(self, "Auto realignment preview failed", str(exc))
+                return
+        note = " Review the red axes, then choose Confirm and apply or Cancel draft."
+        self.status_label.setText(suggestion.summary + note)
+
+    def cancel_local_coordinate_frame_draft(self) -> None:
+        self.draft_local_origin = None
+        self.draft_local_axis_point = None
+        self.draft_plane_normal = None
+        self.draft_auto_alignment_summary = None
+        self.pending_frame_pick = None
+        self.update_plane_value_range()
+        self.update_frame_status_labels()
+        if self.plotter is not None:
+            self.refresh_scene(reset_camera=False)
+        self.status_label.setText("Discarded the draft frame; the active coordinate frame is unchanged.")
+
     def local_coordinate_origin(self) -> np.ndarray:
         return self.active_local_origin.copy()
 
     def local_axis_basis(self) -> np.ndarray:
         return self.active_local_basis.copy()
+
+    def displayed_local_coordinate_frame(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return the draft frame during preview, otherwise the active frame."""
+        if (
+            self.draft_local_origin is not None
+            and self.draft_local_axis_point is not None
+            and self.draft_plane_normal is not None
+        ):
+            try:
+                basis = self.build_local_basis(
+                    self.draft_local_origin,
+                    self.draft_local_axis_point,
+                    self.draft_plane_normal,
+                )
+            except ValueError:
+                pass
+            else:
+                return self.draft_local_origin.copy(), basis
+        return self.active_local_origin.copy(), self.active_local_basis.copy()
 
     def model_to_local_point(self, point: np.ndarray) -> np.ndarray:
         offset = np.asarray(point, dtype=float) - self.active_local_origin
@@ -3061,6 +3153,7 @@ class PointPickerPanel(QWidget):
         self.draft_local_origin = None
         self.draft_local_axis_point = None
         self.draft_plane_normal = None
+        self.draft_auto_alignment_summary = None
         self.pending_frame_pick = None
         self.update_plane_value_range()
         self.update_frame_status_labels()
@@ -3118,6 +3211,7 @@ class PointPickerPanel(QWidget):
         self.draft_local_origin = None
         self.draft_local_axis_point = None
         self.draft_plane_normal = None
+        self.draft_auto_alignment_summary = None
         self.pending_frame_pick = None
         self.update_plane_value_range()
         self.update_frame_status_labels()
@@ -3129,6 +3223,7 @@ class PointPickerPanel(QWidget):
     def current_plane_definition(self) -> Tuple[np.ndarray, np.ndarray, float]:
         if self.model_mesh is None or self.model_mesh.n_points == 0:
             raise ValueError("No mesh is loaded.")
+        frame_origin, frame_basis = self.displayed_local_coordinate_frame()
         bounds = np.array(self.model_mesh.bounds, dtype=float)
         mesh_min = np.array([bounds[0], bounds[2], bounds[4]], dtype=float)
         mesh_max = np.array([bounds[1], bounds[3], bounds[5]], dtype=float)
@@ -3137,11 +3232,11 @@ class PointPickerPanel(QWidget):
         mode = self.plane_mode_combo.currentText()
         if mode == "Axis aligned":
             axis_index = {"X": 0, "Y": 1, "Z": 2}[self.plane_axis_combo.currentText()]
-            active_center = self.model_to_local_point(center)
+            active_center = np.linalg.solve(frame_basis, center - frame_origin)
             active_origin = active_center.copy()
             active_origin[axis_index] = self.plane_value_spin.value()
-            origin = self.local_to_model_point(active_origin)
-            normal = normalized(self.active_local_basis[:, axis_index])
+            origin = frame_origin + frame_basis @ active_origin
+            normal = normalized(frame_basis[:, axis_index])
         elif mode == "Point + normal":
             active_origin = np.array(
                 [
@@ -3161,8 +3256,8 @@ class PointPickerPanel(QWidget):
             )
             if np.linalg.norm(active_normal) < 1e-9:
                 raise ValueError("Plane normal must be non-zero.")
-            origin = self.local_to_model_point(active_origin)
-            normal = self.active_local_basis @ active_normal
+            origin = frame_origin + frame_basis @ active_origin
+            normal = frame_basis @ active_normal
             normal = normalized(normal)
         elif mode == "Three points":
             active_point_1 = np.array(
@@ -3177,9 +3272,9 @@ class PointPickerPanel(QWidget):
                 [self.plane_p3_x_spin.value(), self.plane_p3_y_spin.value(), self.plane_p3_z_spin.value()],
                 dtype=float,
             )
-            point_1 = self.local_to_model_point(active_point_1)
-            point_2 = self.local_to_model_point(active_point_2)
-            point_3 = self.local_to_model_point(active_point_3)
+            point_1 = frame_origin + frame_basis @ active_point_1
+            point_2 = frame_origin + frame_basis @ active_point_2
+            point_3 = frame_origin + frame_basis @ active_point_3
             normal = np.cross(point_2 - point_1, point_3 - point_1)
             if np.linalg.norm(normal) < 1e-9:
                 raise ValueError("Three-point plane requires non-collinear points.")
@@ -3190,12 +3285,27 @@ class PointPickerPanel(QWidget):
         plane_size = max(float(np.linalg.norm(spans)), 1.0) * 1.35
         return origin, normal, plane_size
 
+    def mesh_for_slice_display(self, origin: np.ndarray, normal: np.ndarray) -> pv.PolyData:
+        if self.show_whole_model_checkbox.isChecked():
+            return self.model_mesh
+        return self.model_mesh.clip(
+            normal=normal,
+            origin=origin,
+            invert=self.clip_invert_checkbox.isChecked(),
+        )
+
     def current_grid_definition(
         self,
         origin: np.ndarray,
         normal: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float]:
-        base_u, base_v = orthogonal_plane_basis(normal, np.array([0.0, 0.0, 1.0], dtype=float))
+        normal_unit = normalized(np.asarray(normal, dtype=float))
+        _frame_origin, frame_basis = self.displayed_local_coordinate_frame()
+        up_hint = frame_basis[:, 2]
+        projected_up = up_hint - normal_unit * float(np.dot(up_hint, normal_unit))
+        if np.linalg.norm(projected_up) < 1e-9:
+            up_hint = frame_basis[:, 0]
+        base_u, base_v = orthogonal_plane_basis(normal_unit, up_hint)
         rotation = np.radians(self.grid_rotation_spin.value())
         cos_theta = float(np.cos(rotation))
         sin_theta = float(np.sin(rotation))
@@ -3335,8 +3445,10 @@ class PointPickerPanel(QWidget):
         reference = self.mesh_camera_reference()
         if reference is None:
             return
-        center, spans, diagonal = reference
-        basis = self.local_axis_basis()
+        center, _world_spans, diagonal = reference
+        frame_origin, basis = self.displayed_local_coordinate_frame()
+        local_points = np.linalg.solve(basis, (self.model_mesh.points - frame_origin).T).T
+        spans = np.ptp(local_points, axis=0)
         axis_specs = {
             "x": (
                 basis[:, 0],
@@ -3388,10 +3500,9 @@ class PointPickerPanel(QWidget):
             self.status_label.setText(str(exc))
             return
         normal = normalized(normal)
-        if abs(float(np.dot(normal, np.array([0.0, 0.0, 1.0], dtype=float)))) > 0.97:
-            view_up = np.array([0.0, 1.0, 0.0], dtype=float)
-        else:
-            view_up = np.array([0.0, 0.0, 1.0], dtype=float)
+        _frame_origin, frame_basis = self.displayed_local_coordinate_frame()
+        up_index = int(np.argmin(np.abs(frame_basis.T @ normal)))
+        _view_right, view_up = orthogonal_plane_basis(normal, frame_basis[:, up_index])
         distance = max(plane_size * 1.25, 10.0)
         position = origin + normal * distance
         self.plotter.camera_position = [tuple(position), tuple(origin), tuple(view_up)]
@@ -3484,7 +3595,8 @@ class PointPickerPanel(QWidget):
         if point is None:
             self.live_coordinate_label.setText("Cursor: -")
             return
-        local_point = self.model_to_local_point(point)
+        frame_origin, frame_basis = self.displayed_local_coordinate_frame()
+        local_point = np.linalg.solve(frame_basis, np.asarray(point, dtype=float) - frame_origin)
         coordinate_text = (
             f"Cursor: X={format_decimal(local_point[0])}, "
             f"Y={format_decimal(local_point[1])}, Z={format_decimal(local_point[2])}"
@@ -3516,7 +3628,7 @@ class PointPickerPanel(QWidget):
         origin, normal, plane_size = self.current_plane_definition()
         plane = pv.Plane(center=origin, direction=normal, i_size=plane_size, j_size=plane_size)
         slice_mesh = self.model_mesh.slice(normal=normal, origin=origin)
-        clipped_mesh = self.model_mesh.clip(normal=normal, origin=origin, invert=self.clip_invert_checkbox.isChecked())
+        clipped_mesh = self.mesh_for_slice_display(origin, normal)
         self.set_or_add_mesh(
             "clipped_mesh",
             clipped_mesh,
@@ -3748,6 +3860,8 @@ class PointPickerPanel(QWidget):
             axes_status = " Draft frame pending confirmation."
         elif self.has_custom_local_coordinate_frame():
             axes_status = " Custom coordinate system active."
+        if self.draft_auto_alignment_summary:
+            axes_status += f" {self.draft_auto_alignment_summary}"
         grid_status = ""
         if self.grid_enabled_checkbox.isChecked():
             grid_status = (
