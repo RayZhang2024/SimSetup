@@ -190,7 +190,7 @@ MESH_FILE_FILTER = "Mesh/CAD files (*.stl *.sat *.ply *.obj *.off *.glb *.gltf);
 MICROSTRAIN_SCALE = 1_000_000.0
 DEFAULT_UI_FONT_POINT_SIZE = 7.0
 MIN_UI_FONT_POINT_SIZE = 3.0
-PLACEMENT_FORM_LABEL_WIDTH = 100
+PLACEMENT_FORM_LABEL_WIDTH = 140
 PLACEMENT_FORM_FIELD_WIDTH = 80
 
 RIETVELD_COUNT_TIME_LAWS = {
@@ -2208,6 +2208,9 @@ class PointPickerPanel(QWidget):
         self.enable_3d = enable_3d
         self.model_mesh: Optional[pv.PolyData] = None
         self.mesh_path: Optional[Path] = None
+        self._corner_feature_angle_degrees = 60.0
+        self._corner_turn_angle_degrees = 60.0
+        self._corner_scale_percent = 0.5
         self.plane_mesh = None
         self.grid_mesh = None
         self.slice_mesh = None
@@ -2270,29 +2273,9 @@ class PointPickerPanel(QWidget):
         mesh_tools_layout = QVBoxLayout(mesh_tools_group)
         mesh_tools_layout.setContentsMargins(8, 8, 8, 8)
         mesh_tools_layout.setSpacing(6)
-        repair_mesh_button = QPushButton("Check / repair mesh")
-        repair_mesh_button.clicked.connect(self.open_mesh_repair_dialog)
+        repair_mesh_button = QPushButton("Check / repair mesh…")
+        repair_mesh_button.clicked.connect(self.open_mesh_tools_dialog)
         mesh_tools_layout.addWidget(repair_mesh_button)
-        corner_settings = QFormLayout()
-        self.corner_feature_angle_spin = make_spin_box(60.0, 1.0, 179.0)
-        self.corner_feature_angle_spin.setToolTip(
-            "Minimum angle between neighboring face normals for an edge to count as sharp."
-        )
-        self.corner_turn_angle_spin = make_spin_box(60.0, 1.0, 179.0)
-        self.corner_turn_angle_spin.setToolTip(
-            "Minimum direction change along a sharp edge for a point to count as a corner."
-        )
-        self.corner_scale_percent_spin = make_spin_box(0.5, 0.1, 25.0)
-        self.corner_scale_percent_spin.setToolTip(
-            "Minimum edge length used to smooth over small STL irregularities, as a percentage of the model size."
-        )
-        corner_settings.addRow("Surface angle (deg)", self.corner_feature_angle_spin)
-        corner_settings.addRow("Corner turn (deg)", self.corner_turn_angle_spin)
-        corner_settings.addRow("Corner scale (%)", self.corner_scale_percent_spin)
-        mesh_tools_layout.addLayout(corner_settings)
-        detect_corners_button = QPushButton("Detect surface corners")
-        detect_corners_button.clicked.connect(self.detect_corner_candidates)
-        mesh_tools_layout.addWidget(detect_corners_button)
         controls_layout.addWidget(mesh_tools_group)
 
         slice_group = QGroupBox("Slice Plane Picking")
@@ -2310,9 +2293,11 @@ class PointPickerPanel(QWidget):
         axis_mode_layout = QFormLayout(axis_mode_widget)
         self.plane_axis_combo = NoWheelComboBox()
         self.plane_axis_combo.addItems(["X", "Y", "Z"])
+        self.plane_axis_combo.setFixedWidth(88)
         self.plane_axis_combo.currentTextChanged.connect(self.on_plane_definition_changed)
         self.plane_value_spin = make_spin_box(0.0, -100000.0, 100000.0)
         self.plane_value_spin.setDecimals(6)
+        self.plane_value_spin.setFixedWidth(132)
         self.plane_value_spin.valueChanged.connect(self.on_plane_definition_changed)
         self.plane_position_slider = QSlider(Qt.Horizontal)
         self.plane_position_slider.setRange(0, 100)
@@ -2325,8 +2310,16 @@ class PointPickerPanel(QWidget):
             "Move the slice from 0% (minimum) to 100% (maximum) along the selected plane axis."
         )
         self.plane_position_slider.valueChanged.connect(self.on_plane_position_slider_changed)
-        axis_mode_layout.addRow("Plane axis", self.plane_axis_combo)
-        axis_mode_layout.addRow("Plane value", self.plane_value_spin)
+        plane_axis_value_row = QWidget(axis_mode_widget)
+        plane_axis_value_layout = QHBoxLayout(plane_axis_value_row)
+        plane_axis_value_layout.setContentsMargins(0, 0, 0, 0)
+        plane_axis_value_layout.setSpacing(6)
+        plane_axis_value_layout.addWidget(QLabel("Plane axis"))
+        plane_axis_value_layout.addWidget(self.plane_axis_combo)
+        plane_axis_value_layout.addWidget(QLabel("Plane value"))
+        plane_axis_value_layout.addWidget(self.plane_value_spin)
+        plane_axis_value_layout.addStretch(1)
+        axis_mode_layout.addRow(plane_axis_value_row)
         axis_mode_layout.addRow("Plane position (%)", self.plane_position_slider)
         self.plane_mode_stack.addWidget(axis_mode_widget)
 
@@ -2425,8 +2418,8 @@ class PointPickerPanel(QWidget):
         self.grid_rotation_spin = make_spin_box(0.0, -3600.0, 3600.0)
         self.grid_u_size_spin = make_spin_box(100.0, 0.001, 100000.0)
         self.grid_v_size_spin = make_spin_box(100.0, 0.001, 100000.0)
-        self.grid_u_spacing_spin = make_spin_box(10.0, 0.001, 100000.0)
-        self.grid_v_spacing_spin = make_spin_box(10.0, 0.001, 100000.0)
+        self.grid_u_spacing_spin = make_spin_box(2.0, 0.001, 100000.0)
+        self.grid_v_spacing_spin = make_spin_box(2.0, 0.001, 100000.0)
         for spin_box in (
             self.grid_offset_u_spin,
             self.grid_offset_v_spin,
@@ -2450,7 +2443,32 @@ class PointPickerPanel(QWidget):
         controls_layout.addWidget(slice_group)
 
         coordinate_group = QGroupBox("Local Coordinate Frame")
-        coordinate_layout = QFormLayout(coordinate_group)
+        coordinate_layout = QVBoxLayout(coordinate_group)
+        auto_frame_button = QPushButton("Auto realign from mesh")
+        auto_frame_button.clicked.connect(self.suggest_auto_local_coordinate_frame)
+        manual_align_button = QPushButton("Manual align…")
+        manual_align_button.clicked.connect(self.show_manual_align_dialog)
+        confirm_frame_button = QPushButton("Confirm and apply")
+        confirm_frame_button.clicked.connect(self.confirm_local_coordinate_frame)
+        cancel_frame_button = QPushButton("Cancel draft")
+        cancel_frame_button.clicked.connect(self.cancel_local_coordinate_frame_draft)
+        coordinate_layout.addWidget(auto_frame_button)
+        coordinate_layout.addWidget(manual_align_button)
+        frame_action_row = QHBoxLayout()
+        frame_action_row.addWidget(confirm_frame_button)
+        frame_action_row.addWidget(cancel_frame_button)
+        coordinate_layout.addLayout(frame_action_row)
+
+        self.manual_align_dialog = QDialog(self)
+        self.manual_align_dialog.setWindowTitle("Manual Coordinate Frame Alignment")
+        self.manual_align_dialog.setModal(False)
+        manual_align_layout = QVBoxLayout(self.manual_align_dialog)
+        manual_align_instructions = QLabel(
+            "Choose the frame axes, then pick an origin and an in-plane axis point on the slice plane."
+        )
+        manual_align_instructions.setWordWrap(True)
+        manual_align_layout.addWidget(manual_align_instructions)
+        manual_align_form = QFormLayout()
         self.normal_axis_combo = NoWheelComboBox()
         self.normal_axis_combo.addItems(["X", "Y", "Z"])
         self.normal_axis_combo.currentTextChanged.connect(self.on_frame_axis_selection_changed)
@@ -2459,49 +2477,51 @@ class PointPickerPanel(QWidget):
         self.sync_in_plane_axis_options()
         self.frame_origin_label = QLabel("Origin: -")
         self.frame_axis_point_label = QLabel("Axis point: -")
-        auto_frame_button = QPushButton("Auto realign from mesh")
-        auto_frame_button.clicked.connect(self.suggest_auto_local_coordinate_frame)
         pick_origin_button = QPushButton("Pick origin on plane")
         pick_origin_button.clicked.connect(self.begin_pick_frame_origin)
         pick_axis_button = QPushButton("Pick in-plane axis point")
         pick_axis_button.clicked.connect(self.begin_pick_frame_axis_point)
-        confirm_frame_button = QPushButton("Confirm and apply")
-        confirm_frame_button.clicked.connect(self.confirm_local_coordinate_frame)
-        cancel_frame_button = QPushButton("Cancel draft")
-        cancel_frame_button.clicked.connect(self.cancel_local_coordinate_frame_draft)
         reset_frame_button = QPushButton("Reset")
         reset_frame_button.clicked.connect(self.reset_local_coordinate_frame)
         save_frame_model_button = QPushButton("Save model with frame")
         save_frame_model_button.clicked.connect(self.save_model_with_local_coordinate_frame)
-        coordinate_layout.addRow("Plane normal axis", self.normal_axis_combo)
-        coordinate_layout.addRow("Plane point axis", self.in_plane_axis_combo)
-        coordinate_layout.addRow(self.frame_origin_label)
-        coordinate_layout.addRow(self.frame_axis_point_label)
-        coordinate_layout.addRow(auto_frame_button)
-        coordinate_layout.addRow(pick_origin_button)
-        coordinate_layout.addRow(pick_axis_button)
-        frame_action_row = QHBoxLayout()
-        frame_action_row.addWidget(confirm_frame_button)
-        frame_action_row.addWidget(cancel_frame_button)
-        coordinate_layout.addRow(frame_action_row)
-        coordinate_layout.addRow(save_frame_model_button)
-        coordinate_layout.addRow(reset_frame_button)
-        controls_layout.addWidget(coordinate_group)
+        manual_align_form.addRow("Plane normal axis", self.normal_axis_combo)
+        manual_align_form.addRow("Plane point axis", self.in_plane_axis_combo)
+        manual_align_layout.addLayout(manual_align_form)
+        manual_align_layout.addWidget(self.frame_origin_label)
+        manual_align_layout.addWidget(self.frame_axis_point_label)
+        manual_align_layout.addWidget(pick_origin_button)
+        manual_align_layout.addWidget(pick_axis_button)
+        manual_align_layout.addWidget(save_frame_model_button)
+        manual_align_layout.addWidget(reset_frame_button)
+        close_manual_align_button = QPushButton("Close")
+        close_manual_align_button.clicked.connect(self.manual_align_dialog.close)
+        manual_align_layout.addWidget(close_manual_align_button)
+        controls_layout.insertWidget(2, coordinate_group)
 
         manual_group = QGroupBox("Direct Coordinates")
         manual_layout = QFormLayout(manual_group)
         self.manual_x_spin = make_spin_box(0.0, -100000.0, 100000.0)
         self.manual_y_spin = make_spin_box(0.0, -100000.0, 100000.0)
         self.manual_z_spin = make_spin_box(0.0, -100000.0, 100000.0)
-        add_manual_button = QPushButton("Add manual point")
+        add_manual_button = QPushButton("Add coordinates")
         add_manual_button.clicked.connect(self.add_manual_point)
+        detect_corners_button = QPushButton("Detect surface corners")
+        detect_corners_button.clicked.connect(
+            lambda _checked=False: self.detect_corner_candidates(
+                self._corner_feature_angle_degrees,
+                self._corner_turn_angle_degrees,
+                self._corner_scale_percent,
+            )
+        )
         manual_layout.addRow("Model X", self.manual_x_spin)
         manual_layout.addRow("Model Y", self.manual_y_spin)
         manual_layout.addRow("Model Z", self.manual_z_spin)
         manual_layout.addRow(add_manual_button)
+        manual_layout.addRow(detect_corners_button)
         controls_layout.addWidget(manual_group)
 
-        points_group = QGroupBox("Picked Points")
+        points_group = QGroupBox("Picked Points (Right click to pick a point)")
         points_layout = QVBoxLayout(points_group)
         points_button_row = QHBoxLayout()
         remove_button = QPushButton("Remove selected")
@@ -2732,24 +2752,73 @@ class PointPickerPanel(QWidget):
         if hasattr(parent, "pick_point_mesh_path"):
             parent.pick_point_mesh_path = self.mesh_path
 
-    def open_mesh_repair_dialog(self) -> None:
+    def open_mesh_tools_dialog(self) -> None:
         if self.model_mesh is None or self.model_mesh.n_points == 0:
-            QMessageBox.warning(self, "No mesh", "Load a mesh in the Pick Point tab before repairing it.")
+            QMessageBox.warning(self, "No mesh", "Load a mesh in the Pick Point tab before using mesh tools.")
             return
 
-        before_diagnostics = mesh_repair_diagnostics(self.model_mesh)
-        default_hole_size = max(float(before_diagnostics.get("diagonal", 0.0)), 1.0)
+        mesh_bounds = np.asarray(self.model_mesh.bounds, dtype=float)
+        mesh_diagonal = float(
+            np.linalg.norm(
+                [
+                    mesh_bounds[1] - mesh_bounds[0],
+                    mesh_bounds[3] - mesh_bounds[2],
+                    mesh_bounds[5] - mesh_bounds[4],
+                ]
+            )
+        )
+        default_hole_size = max(mesh_diagonal, 1.0)
         repaired_mesh: Optional[pv.PolyData] = None
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Check / Repair Mesh")
-        layout = QVBoxLayout(dialog)
+        dialog.setWindowTitle("Mesh Tools")
+        dialog_layout = QVBoxLayout(dialog)
+        scroll_area = QScrollArea(dialog)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        content_widget = QWidget(scroll_area)
+        layout = QVBoxLayout(content_widget)
+        scroll_area.setWidget(content_widget)
+        dialog_layout.addWidget(scroll_area, stretch=1)
 
-        report = QPlainTextEdit(dialog)
+        corner_group = QGroupBox("Corner Detection Settings", dialog)
+        corner_layout = QFormLayout(corner_group)
+        corner_feature_angle_spin = make_spin_box(self._corner_feature_angle_degrees, 1.0, 179.0)
+        corner_feature_angle_spin.setToolTip(
+            "Minimum angle between neighboring face normals for an edge to count as sharp."
+        )
+        corner_turn_angle_spin = make_spin_box(self._corner_turn_angle_degrees, 1.0, 179.0)
+        corner_turn_angle_spin.setToolTip(
+            "Minimum direction change along a sharp edge for a point to count as a corner."
+        )
+        corner_scale_percent_spin = make_spin_box(self._corner_scale_percent, 0.1, 25.0)
+        corner_scale_percent_spin.setToolTip(
+            "Minimum edge length used to smooth over small STL irregularities, as a percentage of the model size."
+        )
+        corner_feature_angle_spin.valueChanged.connect(
+            lambda value: setattr(self, "_corner_feature_angle_degrees", float(value))
+        )
+        corner_turn_angle_spin.valueChanged.connect(
+            lambda value: setattr(self, "_corner_turn_angle_degrees", float(value))
+        )
+        corner_scale_percent_spin.valueChanged.connect(
+            lambda value: setattr(self, "_corner_scale_percent", float(value))
+        )
+        corner_layout.addRow("Surface angle (deg)", corner_feature_angle_spin)
+        corner_layout.addRow("Corner turn (deg)", corner_turn_angle_spin)
+        corner_layout.addRow("Corner scale (%)", corner_scale_percent_spin)
+        layout.addWidget(corner_group)
+
+        check_group = QGroupBox("Mesh Check", dialog)
+        check_layout = QVBoxLayout(check_group)
+        report = QPlainTextEdit(check_group)
         report.setReadOnly(True)
-        report.setMinimumHeight(260)
-        report.setPlainText(format_mesh_repair_diagnostics("Current mesh", before_diagnostics))
-        layout.addWidget(report)
+        report.setMinimumHeight(190)
+        report.setPlainText("Click Run check to inspect the current mesh.")
+        check_layout.addWidget(report)
+        check_button = QPushButton("Run check", check_group)
+        check_layout.addWidget(check_button)
+        layout.addWidget(check_group)
 
         options_group = QGroupBox("Repair Options", dialog)
         options_layout = QFormLayout(options_group)
@@ -2777,11 +2846,21 @@ class PointPickerPanel(QWidget):
         button_row.addWidget(save_button)
         button_row.addStretch(1)
         button_row.addWidget(close_button)
-        layout.addLayout(button_row)
+        dialog_layout.addLayout(button_row)
+
+        def run_mesh_check() -> None:
+            try:
+                diagnostics = mesh_repair_diagnostics(self.model_mesh)
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Mesh check failed", str(exc))
+                return
+            report.setPlainText(format_mesh_repair_diagnostics("Current mesh", diagnostics))
+            self.status_label.setText("Mesh check complete.")
 
         def apply_repair() -> None:
             nonlocal repaired_mesh
             try:
+                before_diagnostics = mesh_repair_diagnostics(self.model_mesh)
                 repaired_mesh = repair_mesh_flat_openings(
                     self.model_mesh,
                     clean_tolerance=clean_tolerance_spin.value(),
@@ -2790,11 +2869,11 @@ class PointPickerPanel(QWidget):
                     hole_size=hole_size_spin.value(),
                     orient_normals=orient_normals_checkbox.isChecked(),
                 )
+                after_diagnostics = mesh_repair_diagnostics(repaired_mesh)
             except Exception as exc:
                 QMessageBox.critical(dialog, "Mesh repair failed", str(exc))
                 return
 
-            after_diagnostics = mesh_repair_diagnostics(repaired_mesh)
             self.set_mesh(repaired_mesh, self.mesh_path)
             self.update_parent_pick_point_mesh_state()
             save_button.setEnabled(True)
@@ -2831,10 +2910,11 @@ class PointPickerPanel(QWidget):
             self.update_parent_pick_point_mesh_state()
             self.status_label.setText(f"Saved repaired mesh to {path}.")
 
+        check_button.clicked.connect(run_mesh_check)
         repair_button.clicked.connect(apply_repair)
         save_button.clicked.connect(save_repaired_mesh)
         close_button.clicked.connect(dialog.accept)
-        resize_dialog_to_available_screen(dialog, 720, 560)
+        resize_dialog_to_available_screen(dialog, 760, 720)
         dialog.exec_()
 
     def clear_scene(self) -> None:
@@ -2909,16 +2989,21 @@ class PointPickerPanel(QWidget):
         self.update_plane_value_range()
 
     def configure_grid_defaults(self, mesh_diagonal: float) -> None:
-        grid_side = max(float(mesh_diagonal) * 0.75, 1.0)
-        grid_spacing = max(grid_side / 10.0, 0.001)
+        # A square with sides longer than the mesh bounding-box diagonal covers
+        # its projection in every plane orientation when centered on the sample.
+        grid_side = max(float(mesh_diagonal) * 1.1, 1.0)
         defaults = (
+            (self.grid_offset_u_spin, 0.0),
+            (self.grid_offset_v_spin, 0.0),
             (self.grid_u_size_spin, grid_side),
             (self.grid_v_size_spin, grid_side),
-            (self.grid_u_spacing_spin, grid_spacing),
-            (self.grid_v_spacing_spin, grid_spacing),
+            (self.grid_u_spacing_spin, 2.0),
+            (self.grid_v_spacing_spin, 2.0),
         )
         for spin_box, value in defaults:
             was_blocked = spin_box.blockSignals(True)
+            if spin_box in (self.grid_u_size_spin, self.grid_v_size_spin):
+                spin_box.setMaximum(max(spin_box.maximum(), float(value)))
             spin_box.setValue(float(value))
             spin_box.blockSignals(was_blocked)
 
@@ -3036,6 +3121,11 @@ class PointPickerPanel(QWidget):
 
     def axis_name_to_index(self, axis_name: str) -> int:
         return {"X": 0, "Y": 1, "Z": 2}[axis_name]
+
+    def show_manual_align_dialog(self) -> None:
+        self.manual_align_dialog.show()
+        self.manual_align_dialog.raise_()
+        self.manual_align_dialog.activateWindow()
 
     def sync_in_plane_axis_options(self) -> None:
         if not hasattr(self, "in_plane_axis_combo"):
@@ -4088,16 +4178,21 @@ class PointPickerPanel(QWidget):
     def is_corner_candidate_label(label: str) -> bool:
         return label.startswith("C")
 
-    def detect_corner_candidates(self) -> None:
+    def detect_corner_candidates(
+        self,
+        feature_angle_degrees: float,
+        turn_angle_degrees: float,
+        corner_scale_percent: float,
+    ) -> None:
         if self.model_mesh is None or self.model_mesh.n_points == 0:
             QMessageBox.warning(self, "No mesh", "Load a mesh before detecting surface corners.")
             return
         try:
             corners = detect_surface_corners(
                 self.model_mesh,
-                feature_angle_degrees=float(self.corner_feature_angle_spin.value()),
-                turn_angle_degrees=float(self.corner_turn_angle_spin.value()),
-                corner_scale_fraction=float(self.corner_scale_percent_spin.value()) / 100.0,
+                feature_angle_degrees=float(feature_angle_degrees),
+                turn_angle_degrees=float(turn_angle_degrees),
+                corner_scale_fraction=float(corner_scale_percent) / 100.0,
             )
         except (CornerDetectionError, RuntimeError, ValueError) as exc:
             self.status_label.setText(f"Corner detection failed: {exc}")
@@ -4238,7 +4333,7 @@ class MainWindow(QMainWindow):
             "Fit report will appear here.\n\n"
             "Workflow:\n"
             "1. Load a mesh or SAT model.\n"
-            "2. Either run Fit placement or enable Manual Sample Placement.\n"
+            "2. Run Fit placement or adjust Sample Placement manually.\n"
             "3. Adjust the live stage pose to inspect the setup.\n"
             "4. Compute the imaging map if needed."
         )
@@ -4459,7 +4554,7 @@ class MainWindow(QMainWindow):
         self.settings_dialog = self._build_settings_dialog()
 
         self.setStatusBar(QStatusBar(self))
-        self.statusBar().showMessage("Load a mesh, then use Fit placement or Manual Sample Placement.")
+        self.statusBar().showMessage("Load a mesh, then run Fit placement or adjust Sample Placement.")
 
     def _placement_form_label(self, text: str = "") -> QLabel:
         label = QLabel(text)
@@ -5017,6 +5112,7 @@ class MainWindow(QMainWindow):
         slit_width_proxy = make_spin_box(self.slit_width.value(), self.slit_width.minimum(), self.slit_width.maximum())
         slit_width_proxy.setDecimals(self.slit_width.decimals())
         slit_width_proxy.setSingleStep(self.slit_width.singleStep())
+        slit_width_proxy.setToolTip(self.slit_width.toolTip())
 
         slit_height_proxy = make_spin_box(
             self.slit_height.value(),
@@ -5025,6 +5121,7 @@ class MainWindow(QMainWindow):
         )
         slit_height_proxy.setDecimals(self.slit_height.decimals())
         slit_height_proxy.setSingleStep(self.slit_height.singleStep())
+        slit_height_proxy.setToolTip(self.slit_height.toolTip())
 
         collimator_proxy = NoWheelComboBox()
         for index in range(self.collimator.count()):
@@ -5044,6 +5141,8 @@ class MainWindow(QMainWindow):
         )
         uncertainty_proxy.setDecimals(self.target_uncertainty.decimals())
         uncertainty_proxy.setSingleStep(self.target_uncertainty.singleStep())
+        uncertainty_proxy.setSuffix(self.target_uncertainty.suffix())
+        uncertainty_proxy.setToolTip(self.target_uncertainty.toolTip())
 
         self._bind_spin_box_proxy(slit_width_proxy, self.slit_width)
         self._bind_spin_box_proxy(slit_height_proxy, self.slit_height)
@@ -5051,8 +5150,8 @@ class MainWindow(QMainWindow):
         self._bind_combo_box_proxy(material_proxy, self.count_time_material)
         self._bind_spin_box_proxy(uncertainty_proxy, self.target_uncertainty)
 
-        self._add_placement_form_row(layout, "Slit width", slit_width_proxy)
-        self._add_placement_form_row(layout, "Slit height", slit_height_proxy)
+        self._add_placement_form_row(layout, "Incident slit width", slit_width_proxy)
+        self._add_placement_form_row(layout, "Incident slit height", slit_height_proxy)
         self._add_placement_form_row(layout, "Collimator", collimator_proxy)
         self._add_placement_form_row(layout, "Material", material_proxy)
         self._add_placement_form_row(layout, "Target uncertainty", uncertainty_proxy)
@@ -5336,15 +5435,21 @@ class MainWindow(QMainWindow):
         self.slit_z = make_spin_box(0.0, -100000.0, 100000.0)
         self.slit_width = make_spin_box(4.0, 0.001, 100000.0)
         self.slit_height = make_spin_box(4.0, 0.001, 100000.0)
+        self.slit_width.setDecimals(1)
+        self.slit_height.setDecimals(1)
+        self.slit_width.setToolTip("Incident slit width, in millimetres.")
+        self.slit_height.setToolTip("Incident slit height, in millimetres.")
         self.collimator = NoWheelComboBox()
         self.collimator.addItems(["0.5", "1", "2", "3", "4"])
         self.collimator.setCurrentText("4")
         self.count_time_material = NoWheelComboBox()
         self.count_time_material.addItems(list(RIETVELD_COUNT_TIME_LAWS.keys()) + sorted(self.custom_acquisition_profiles))
         self.target_uncertainty = make_spin_box(100.0, 0.001, 1_000_000_000.0, step=10.0)
-        self.target_uncertainty.setDecimals(3)
+        self.target_uncertainty.setDecimals(0)
+        self.target_uncertainty.setSuffix(" µε")
         self.target_uncertainty.setToolTip(
-            "Used for calibrated custom materials. Built-in materials retain their reference exposure law."
+            "Enter the target uncertainty in microstrain (µε). Used for calibrated custom materials; "
+            "built-in materials retain their reference exposure law."
         )
         self.beam_length = make_spin_box(500.0, 1.0, 100000.0)
         self.detector_width_y = make_spin_box(100.0, 10.0, 200.0)
@@ -5398,8 +5503,8 @@ class MainWindow(QMainWindow):
         instrument_setup_row.addStretch(1)
         layout.addRow(instrument_setup_row)
         layout.addRow(self._separator())
-        layout.addRow("Slit width", self.slit_width)
-        layout.addRow("Slit height", self.slit_height)
+        layout.addRow("Incident slit width", self.slit_width)
+        layout.addRow("Incident slit height", self.slit_height)
         layout.addRow("Collimator", self.collimator)
         layout.addRow("Material", self.count_time_material)
         layout.addRow("Target uncertainty", self.target_uncertainty)
@@ -6117,26 +6222,19 @@ class MainWindow(QMainWindow):
         return group
 
     def _build_manual_placement_group(self) -> QGroupBox:
-        group = QGroupBox("Manual Sample Placement")
+        group = QGroupBox()
         layout = make_form_layout(group, compact_fields=True)
         manual_placement_tooltip = (
-            "Manual placement overrides the model-to-stage transform used by the viewer and point-to-pivot tools.\n\n"
-            "Model->Stage X/Y/Z translates the sample in stage coordinates. Changing these values makes the model "
-            "shift in the 3D view relative to the stage, beam, and detectors.\n\n"
-            "Local Rot X/Y/Z shows the current accumulated orientation in degrees. Editing one value applies the "
-            "change as an incremental rotation about the sample's current local triad axis, then the boxes update to "
-            "the new accumulated orientation.\n\n"
-            "When manual placement is enabled, these values are used instead of the fitted transform. "
-            "The Live Stage Pose controls still apply separately on top as the current stage readout."
+            "X/Y/Z translation uses the stage coordinate system.\n"
+            "Rotation uses the sample's local coordinate axes.\n"
+            "Live Stage Pose applies separately."
         )
 
-        self.manual_placement_enabled_checkbox = QCheckBox("Use manual placement")
-        self.manual_placement_enabled_checkbox.toggled.connect(self.on_manual_placement_mode_toggled)
         manual_help_button = QToolButton()
         manual_help_button.setText("?")
         manual_help_button.setToolTip(manual_placement_tooltip)
         manual_help_button.setToolTipDuration(10000)
-        manual_help_button.setStatusTip("Explain how manual sample placement works.")
+        manual_help_button.setStatusTip("Explain sample placement coordinates.")
         manual_help_button.setAutoRaise(True)
         manual_help_button.setCursor(Qt.WhatsThisCursor)
         manual_help_button.setFixedSize(18, 18)
@@ -6144,12 +6242,12 @@ class MainWindow(QMainWindow):
             "QToolButton { font-weight: 600; border: 1px solid #b9c2ce; border-radius: 9px; padding: 0px; }"
             "QToolButton:hover { background-color: #f3f7fb; border-color: #8da2bd; }"
         )
-        checkbox_row = QHBoxLayout()
-        checkbox_row.setContentsMargins(0, 0, 0, 0)
-        checkbox_row.setSpacing(6)
-        checkbox_row.addWidget(self.manual_placement_enabled_checkbox)
-        checkbox_row.addWidget(manual_help_button)
-        checkbox_row.addStretch(1)
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(4)
+        header_row.addWidget(self._build_section_title("Sample Placement"))
+        header_row.addWidget(manual_help_button)
+        header_row.addStretch(1)
 
         self.manual_tx = make_spin_box(0.0, -100000.0, 100000.0)
         self.manual_ty = make_spin_box(0.0, -100000.0, 100000.0)
@@ -6157,6 +6255,16 @@ class MainWindow(QMainWindow):
         self.manual_rx = make_spin_box(0.0, -3600.0, 3600.0, step=1.0)
         self.manual_ry = make_spin_box(0.0, -3600.0, 3600.0, step=1.0)
         self.manual_rz = make_spin_box(0.0, -3600.0, 3600.0, step=1.0)
+        translation_tooltip = (
+            "Translation is relative to the stage's coordinate system."
+        )
+        rotation_tooltip = (
+            "Rotation is applied about the sample's local coordinate axes."
+        )
+        for widget in (self.manual_tx, self.manual_ty, self.manual_tz):
+            widget.setToolTip(translation_tooltip)
+        for widget in (self.manual_rx, self.manual_ry, self.manual_rz):
+            widget.setToolTip(rotation_tooltip)
 
         for widget in (
             self.manual_tx,
@@ -6176,17 +6284,11 @@ class MainWindow(QMainWindow):
         reset_button.clicked.connect(self.reset_manual_placement)
         reset_button.setMaximumWidth(90)
         reset_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        load_fit_button = QPushButton("Load transform")
-        load_fit_button.setToolTip("Copy the current fitted transform into the manual placement fields and enable manual placement.")
-        load_fit_button.clicked.connect(self.load_fit_into_manual)
-        load_fit_button.setMaximumWidth(130)
-        load_fit_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         button_row = QHBoxLayout()
         button_row.addWidget(reset_button)
-        button_row.addWidget(load_fit_button)
         button_row.addStretch(1)
 
-        self._add_placement_form_layout_row(layout, checkbox_row)
+        self._add_placement_form_layout_row(layout, header_row)
         self._add_placement_form_row(layout, "Model->Stage X", self.manual_tx)
         self._add_placement_form_row(layout, "Model->Stage Y", self.manual_ty)
         self._add_placement_form_row(layout, "Model->Stage Z", self.manual_tz)
@@ -6531,10 +6633,7 @@ class MainWindow(QMainWindow):
             was_blocked = self.prediction_table.blockSignals(True)
             self.prediction_table.clearSelection()
             self.prediction_table.blockSignals(was_blocked)
-        if (
-            self.auto_move_to_pivot_enabled()
-            and (self.fit_transform is not None or self.manual_placement_enabled_checkbox.isChecked())
-        ):
+        if self.auto_move_to_pivot_enabled():
             self.move_selected_point_to_pivot(show_error=False)
         self.update_scene(reset_camera=False)
 
@@ -6619,12 +6718,8 @@ class MainWindow(QMainWindow):
                 box.blockSignals(previous_state)
 
     def current_model_to_stage_transform(self) -> Tuple[np.ndarray, np.ndarray, str]:
-        if self.manual_placement_enabled_checkbox.isChecked():
-            rotation, translation = self.manual_model_to_stage_transform()
-            return rotation, translation, "manual"
-        if self.fit_transform is not None:
-            return np.array(self.fit_transform.rotation, dtype=float), np.array(self.fit_transform.translation, dtype=float), "fit"
-        return np.eye(3, dtype=float), np.zeros(3, dtype=float), "as-is"
+        rotation, translation = self.manual_model_to_stage_transform()
+        return rotation, translation, "manual"
 
     def stage_readout_for_model_point(self, model_point: np.ndarray) -> np.ndarray:
         rotation, translation, _source = self.current_model_to_stage_transform()
@@ -6647,19 +6742,14 @@ class MainWindow(QMainWindow):
 
     def placement_summary_lines(self) -> List[str]:
         lines: List[str] = []
-        if self.manual_placement_enabled_checkbox.isChecked():
-            rotation, translation, _source = self.current_model_to_stage_transform()
-            lines.append("Placement: Manual placement active")
-            lines.append(f"Translation: {pretty_vector(translation)}")
-            lines.append(f"Euler ZYX: {pretty_vector(rotation_matrix_to_euler_zyx_deg(rotation))}")
-        elif self.fit_transform is not None:
-            lines.append(f"Placement: Fit placement active with {len(self.residual_rows)} point pairs")
-            lines.append(f"Translation: {pretty_vector(self.fit_transform.translation)}")
-            lines.append(f"Euler ZYX: {pretty_vector(rotation_matrix_to_euler_zyx_deg(self.fit_transform.rotation))}")
+        rotation, translation, _source = self.current_model_to_stage_transform()
+        lines.append("Placement: Sample placement active")
+        lines.append(f"Translation: {pretty_vector(translation)}")
+        lines.append(f"Euler ZYX: {pretty_vector(rotation_matrix_to_euler_zyx_deg(rotation))}")
+        if self.fit_transform is not None:
+            lines.append(f"Last fit: {len(self.residual_rows)} point pairs")
             lines.append(f"RMS error: {format_decimal(self.fit_transform.rms_error)}")
             lines.append(f"Max error: {format_decimal(self.fit_transform.max_error)}")
-        else:
-            lines.append("Placement: No placement transform; model shown as imported")
 
         if self.detector_map_state is not None:
             lines.append(f"Imaging path: {format_decimal(self.detector_map_state['average_length'])}")
@@ -7782,7 +7872,7 @@ class MainWindow(QMainWindow):
                 "omega": self.pose_omega.value(),
             },
             "manual_placement": {
-                "enabled": self.manual_placement_enabled_checkbox.isChecked(),
+                "enabled": True,
                 "tx": self.manual_tx.value(),
                 "ty": self.manual_ty.value(),
                 "tz": self.manual_tz.value(),
@@ -7888,6 +7978,7 @@ class MainWindow(QMainWindow):
         setup = payload.get("setup", {})
         stage_pose = payload.get("stage_pose", {})
         manual_placement = payload.get("manual_placement", {})
+        manual_placement_was_enabled = bool(manual_placement.get("enabled", True))
         fit_payload = payload.get("fit_transform")
         view = payload.get("view", {})
 
@@ -7983,7 +8074,6 @@ class MainWindow(QMainWindow):
                 combo.blockSignals(previous_state)
 
         checkbox_values = (
-            (self.manual_placement_enabled_checkbox, manual_placement.get("enabled")),
             (self.auto_move_to_pivot_action, view.get("auto_move_to_pivot")),
             (self.parallel_projection_checkbox, view.get("parallel_projection_enabled")),
             (self.show_stage_checkbox, view.get("show_stage")),
@@ -8078,8 +8168,17 @@ class MainWindow(QMainWindow):
         else:
             self.set_report_body(
                 "Project loaded.\n\nNo saved fit transform was present.\n"
-                "Run Fit placement or enable Manual Sample Placement to establish a transform."
+                "Adjust Sample Placement manually or run Fit placement to align the sample."
             )
+
+        if not manual_placement_was_enabled:
+            if self.fit_transform is not None:
+                self._set_manual_placement_transform(
+                    self.fit_transform.rotation,
+                    self.fit_transform.translation,
+                )
+            else:
+                self._set_manual_placement_transform(np.eye(3, dtype=float), np.zeros(3, dtype=float))
 
         self.update_placement_status()
         self.update_placement_summary_fields()
@@ -8341,6 +8440,7 @@ class MainWindow(QMainWindow):
             transform, residual_rows = fit_from_measurements(measurements)
             self.fit_transform = transform
             self.residual_rows = residual_rows
+            self._set_manual_placement_transform(transform.rotation, transform.translation)
             self.clear_prediction_generated_values()
             self.update_placement_status()
             self.update_placement_summary_fields()
@@ -8640,18 +8740,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.show_error("Create scan file failed", str(exc))
 
-    def on_manual_placement_mode_toggled(self, checked: bool) -> None:
-        self.clear_prediction_generated_values()
-        self.update_placement_status()
-        self.update_placement_summary_fields()
-        self.invalidate_detector_map(update_scene=False)
-        mode_text = "enabled" if checked else "disabled"
-        self.statusBar().showMessage(f"Manual placement {mode_text}.", 5000)
-        self.update_scene(reset_camera=False)
-
     def on_manual_placement_changed(self) -> None:
-        if not self.manual_placement_enabled_checkbox.isChecked():
-            return
         self.clear_prediction_generated_values()
         self.update_placement_status()
         self.update_placement_summary_fields()
@@ -8679,8 +8768,6 @@ class MainWindow(QMainWindow):
         self.manual_rotation_display_values = new_values
         self.sync_manual_rotation_spin_boxes_from_matrix()
 
-        if not self.manual_placement_enabled_checkbox.isChecked():
-            return
         self.clear_prediction_generated_values()
         self.update_placement_status()
         self.update_placement_summary_fields()
@@ -8688,83 +8775,42 @@ class MainWindow(QMainWindow):
         self.update_scene(reset_camera=False)
 
     def reset_manual_placement(self) -> None:
-        translation_boxes = (
-            self.manual_tx,
-            self.manual_ty,
-            self.manual_tz,
-        )
-        previous_states = [box.blockSignals(True) for box in translation_boxes]
-        for box in translation_boxes:
-            box.setValue(0.0)
-        for box, previous in zip(translation_boxes, previous_states):
-            box.blockSignals(previous)
-        self.manual_rotation_matrix = np.eye(3, dtype=float)
-        self.manual_rotation_display_values = np.zeros(3, dtype=float)
-        self.sync_manual_rotation_spin_boxes_from_matrix()
+        self._set_manual_placement_transform(np.eye(3, dtype=float), np.zeros(3, dtype=float))
         self.clear_prediction_generated_values()
         self.update_placement_status()
         self.update_placement_summary_fields()
         self.invalidate_detector_map(update_scene=False)
         self.update_scene(reset_camera=False)
 
-    def load_fit_into_manual(self) -> None:
-        if self.fit_transform is None:
-            self.show_error("No fit available", "Run Fit placement before loading fit values into manual placement.")
-            return
-        translation = np.array(self.fit_transform.translation, dtype=float)
+    def _set_manual_placement_transform(self, rotation: np.ndarray, translation: np.ndarray) -> None:
+        translation = np.asarray(translation, dtype=float)
         translation_boxes = (
             self.manual_tx,
             self.manual_ty,
             self.manual_tz,
         )
         previous_states = [box.blockSignals(True) for box in translation_boxes]
-        self.manual_tx.setValue(float(translation[0]))
-        self.manual_ty.setValue(float(translation[1]))
-        self.manual_tz.setValue(float(translation[2]))
+        for box, value in zip(translation_boxes, translation):
+            box.setValue(float(value))
         for box, previous in zip(translation_boxes, previous_states):
             box.blockSignals(previous)
-        self.manual_rotation_matrix = orthonormalize_rotation_matrix(np.array(self.fit_transform.rotation, dtype=float))
+        self.manual_rotation_matrix = orthonormalize_rotation_matrix(np.asarray(rotation, dtype=float))
         self.manual_rotation_display_values = np.array(
-            rotation_matrix_to_euler_xyz_deg(np.array(self.fit_transform.rotation, dtype=float)),
+            rotation_matrix_to_euler_xyz_deg(self.manual_rotation_matrix),
             dtype=float,
         )
         self.sync_manual_rotation_spin_boxes_from_matrix()
-        previous_toggle_state = self.manual_placement_enabled_checkbox.blockSignals(True)
-        self.manual_placement_enabled_checkbox.setChecked(True)
-        self.manual_placement_enabled_checkbox.blockSignals(previous_toggle_state)
-        self.clear_prediction_generated_values()
-        self.update_placement_status()
-        self.update_placement_summary_fields()
-        self.invalidate_detector_map(update_scene=False)
-        self.statusBar().showMessage("Loaded fit transform into manual placement.", 5000)
-        self.update_scene(reset_camera=False)
 
     def clear_placement(self) -> None:
-        translation_boxes = (
-            self.manual_tx,
-            self.manual_ty,
-            self.manual_tz,
-        )
-        previous_states = [box.blockSignals(True) for box in translation_boxes]
-        for box in translation_boxes:
-            box.setValue(0.0)
-        for box, previous in zip(translation_boxes, previous_states):
-            box.blockSignals(previous)
-        self.manual_rotation_matrix = np.eye(3, dtype=float)
-        self.manual_rotation_display_values = np.zeros(3, dtype=float)
-        self.sync_manual_rotation_spin_boxes_from_matrix()
-
-        previous_toggle_state = self.manual_placement_enabled_checkbox.blockSignals(True)
-        self.manual_placement_enabled_checkbox.setChecked(False)
-        self.manual_placement_enabled_checkbox.blockSignals(previous_toggle_state)
+        self._set_manual_placement_transform(np.eye(3, dtype=float), np.zeros(3, dtype=float))
 
         self.fit_transform = None
         self.residual_rows = []
         self.clear_prediction_generated_values()
         self.set_report_body(
             "Placement cleared.\n\n"
-            "The model is now shown as imported.\n"
-            "Run Fit placement or enable Manual Sample Placement to establish a new transform."
+            "The sample translation and rotation have been reset to the imported model coordinates.\n"
+            "Adjust Sample Placement manually or run Fit placement to align the sample."
         )
         self.update_placement_status()
         self.update_placement_summary_fields()
@@ -8867,8 +8913,6 @@ class MainWindow(QMainWindow):
 
     def move_selected_point_to_pivot(self, show_error: bool = True) -> None:
         try:
-            if self.fit_transform is None and not self.manual_placement_enabled_checkbox.isChecked():
-                raise ValueError("Run Fit placement or enable manual placement before moving a point to the pivot.")
             measurement = self.selected_measurement()
             if measurement is None:
                 raise ValueError("Select a measurement row first.")
