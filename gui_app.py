@@ -2238,6 +2238,8 @@ class PointPickerPanel(QWidget):
         self._surface_picking_initialized = False
         self._right_pick_press_pos: Optional[QPointF] = None
         self._right_pick_dragged = False
+        self._scene_reset_camera_pending = False
+        self._scene_plane_view_pending = False
 
         self._build_ui()
 
@@ -2671,6 +2673,26 @@ class PointPickerPanel(QWidget):
         super().showEvent(event)
         if self.enable_3d:
             self.initialize_surface_point_picking()
+            # QVTK widgets can be shown before their native render window is
+            # ready. Refresh on the next event-loop turn, after the tab has
+            # become visible and Qt has laid out the interactor.
+            QTimer.singleShot(0, self.refresh_scene_after_show)
+
+    def refresh_scene_after_show(self) -> None:
+        if not self.enable_3d or self.plotter is None or not self.isVisible():
+            return
+        if self.model_mesh is None or self.model_mesh.n_points == 0:
+            return
+        reset_camera = self._scene_reset_camera_pending
+        show_plane_normal = self._scene_plane_view_pending
+        self._scene_reset_camera_pending = False
+        self._scene_plane_view_pending = False
+        try:
+            self.refresh_scene(reset_camera=reset_camera, rebuild_actors=True)
+            if show_plane_normal:
+                self.view_plane_normal()
+        except ValueError as exc:
+            self.status_label.setText(str(exc))
 
     def closeEvent(self, event) -> None:
         self.cleanup_plotter()
@@ -2741,7 +2763,10 @@ class PointPickerPanel(QWidget):
         self.configure_coordinate_ranges()
         if self.plotter is not None:
             self.refresh_scene(reset_camera=True)
-            self.view_plane_normal()
+            if self.isVisible():
+                self.view_plane_normal()
+            else:
+                self._scene_plane_view_pending = True
 
     def update_parent_pick_point_mesh_state(self) -> None:
         parent = self.parent()
@@ -3792,12 +3817,20 @@ class PointPickerPanel(QWidget):
                 )
         self.live_coordinate_label.setText(coordinate_text)
 
-    def refresh_scene(self, reset_camera: bool = False) -> None:
+    def refresh_scene(self, reset_camera: bool = False, *, rebuild_actors: bool = False) -> None:
         if self.plotter is None or self.model_mesh is None or self.model_mesh.n_points == 0:
             return
+        if not self.isVisible():
+            self._scene_reset_camera_pending = self._scene_reset_camera_pending or reset_camera
+            return
+        self._scene_reset_camera_pending = False
         camera_state = None
         if not reset_camera and self.plotter.renderer is not None:
             camera_state = capture_camera_state(self.plotter)
+        if reset_camera or rebuild_actors:
+            # Reattach every actor when resetting the view. This also recovers
+            # when the render window was first populated before it was shown.
+            self.clear_scene()
 
         origin, normal, plane_size = self.current_plane_definition()
         plane = pv.Plane(center=origin, direction=normal, i_size=plane_size, j_size=plane_size)
