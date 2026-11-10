@@ -2240,6 +2240,7 @@ class PointPickerPanel(QWidget):
         self._right_pick_dragged = False
         self._scene_reset_camera_pending = False
         self._scene_plane_view_pending = False
+        self._awaiting_visible_interactor_paint = False
 
         self._build_ui()
 
@@ -2673,10 +2674,25 @@ class PointPickerPanel(QWidget):
         super().showEvent(event)
         if self.enable_3d:
             self.initialize_surface_point_picking()
-            # QVTK widgets can be shown before their native render window is
-            # ready. Refresh on the next event-loop turn, after the tab has
-            # become visible and Qt has laid out the interactor.
-            QTimer.singleShot(0, self.refresh_scene_after_show)
+            self.schedule_scene_refresh_after_show()
+
+    def schedule_scene_refresh_after_show(self) -> None:
+        if not self.enable_3d or self.plotter is None:
+            return
+        if self.model_mesh is None or self.model_mesh.n_points == 0:
+            return
+        self._awaiting_visible_interactor_paint = True
+        self.plotter.interactor.update()
+        # Some drivers do not deliver a useful paint event until a render is
+        # requested. Keep a delayed fallback, while preferring the first
+        # visible paint as the signal that the native widget has been exposed.
+        QTimer.singleShot(250, self.refresh_scene_after_show_fallback)
+
+    def refresh_scene_after_show_fallback(self) -> None:
+        if not self._awaiting_visible_interactor_paint:
+            return
+        self._awaiting_visible_interactor_paint = False
+        self.refresh_scene_after_show()
 
     def refresh_scene_after_show(self) -> None:
         if not self.enable_3d or self.plotter is None or not self.isVisible():
@@ -3713,6 +3729,10 @@ class PointPickerPanel(QWidget):
 
     def eventFilter(self, watched, event) -> bool:
         if self.plotter is not None and watched is self.plotter.interactor:
+            if event.type() == QEvent.Paint and self._awaiting_visible_interactor_paint:
+                self._awaiting_visible_interactor_paint = False
+                QTimer.singleShot(0, self.refresh_scene_after_show)
+                return super().eventFilter(watched, event)
             if event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
                 try:
                     self._right_pick_press_pos = event.position()
@@ -4031,6 +4051,7 @@ class PointPickerPanel(QWidget):
 
         if camera_state is not None:
             restore_camera_state(self.plotter, camera_state)
+            self.plotter.reset_camera_clipping_range()
         else:
             self.plotter.reset_camera()
             self.plotter.enable_parallel_projection()
@@ -4816,6 +4837,13 @@ class MainWindow(QMainWindow):
             return
         if 0 <= index < self.tab_menu_stack.count():
             self.tab_menu_stack.setCurrentIndex(index)
+        if (
+            self.main_tabs is not None
+            and 0 <= index < self.main_tabs.count()
+            and self.main_tabs.tabText(index) == "Pick Point"
+            and self.point_picker_panel is not None
+        ):
+            self.point_picker_panel.schedule_scene_refresh_after_show()
 
     def _build_tab_menu_bar(self, tab_name: str) -> QMenuBar:
         menu_bar = QMenuBar()
