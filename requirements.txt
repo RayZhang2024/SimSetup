@@ -1,7 +1,10 @@
 numpy
-PyQt5
-pyvista
-pyvistaqt
+# Windows Qt/VTK stack confirmed on tested tree c35cde5 with Intel Iris Xe.
+# Upgrade these together only after the Pick Point viewer is checked again.
+PyQt5==5.15.11
+pyvista==0.47.1
+pyvistaqt==0.11.3
+vtk==9.6.1
 trimesh
 astropy
 tifffile

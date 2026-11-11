@@ -2,15 +2,26 @@
 
 ## Environment setup
 
-Create and use the repo-local virtual environment:
+Create a clean virtual environment (verified with Python 3.11 on Windows) and
+install the requirements:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python --version  # optional interpreter check
 python -m pip install -r .\requirements.txt
+python -m pip check
+python -c "import importlib.metadata as m; print(*(f'{p}=={m.version(p)}' for p in ('PyQt5', 'pyvista', 'pyvistaqt', 'vtk')), sep='\n')"
 ```
 
 All commands below should be run from that virtual environment.
+
+The PyVista, PyVistaQt, VTK, and PyQt5 versions are pinned as a set. This exact
+stack rendered the same model and slice plane on the affected Windows 10 / Intel
+Iris Xe laptop. The tested checkout was `097bdf4`; its tree is identical to
+`c35cde5`. The newer stack rendered the Placement viewer but left Pick Point
+blank. Keep these pins together until a newer combination has been checked on
+that machine.
 
 The GUI implementation targets this environment and uses:
 
